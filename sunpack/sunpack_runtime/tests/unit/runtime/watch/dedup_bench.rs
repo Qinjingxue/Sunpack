@@ -61,7 +61,7 @@ fn measure_watch_dedup_index() {
     index
         .reconcile_journals(&[("benchmark-scope".into(), "benchmark-volume".into(), 1)])
         .unwrap();
-    let generation = baseline.then(|| index.generation());
+    let generation = index.generation();
     let index = Mutex::new(index);
     let mut times = Vec::with_capacity(count);
     let before = memory();
@@ -76,7 +76,7 @@ fn measure_watch_dedup_index() {
         );
         let start = Instant::now();
         duplicates += usize::from(
-            consider(&index, &input.entry_path, "benchmark-scope", &[&input], generation).unwrap(),
+            consider(&index, &input.entry_path, "benchmark-scope", &[&input], generation, baseline).unwrap(),
         );
         times.push(start.elapsed().as_nanos() as u64);
     }

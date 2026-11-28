@@ -848,6 +848,13 @@ pub(crate) struct PhysicalFileGeneration {
 }
 
 impl PhysicalFileGeneration {
+    #[cfg(windows)]
+    pub(crate) fn worker_stamp(&self) -> [u64; 4] {
+        let id = self.windows.file_id;
+        [self.windows.volume, u64::from_le_bytes(id[..8].try_into().unwrap()),
+            u64::from_le_bytes(id[8..].try_into().unwrap()), self.windows.write_time as u64]
+    }
+
     pub(crate) fn object_id(&self) -> Option<(u64, [u8; 16])> {
         #[cfg(windows)]
         {

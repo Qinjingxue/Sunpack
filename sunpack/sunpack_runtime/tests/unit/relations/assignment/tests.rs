@@ -51,12 +51,13 @@ fn shared_carrier_keeps_unique_terminal_and_fixed_heads_in_either_slice_order() 
         rows.extend(shared);
         let groups = resolve(&rows);
         assert_eq!(groups.len(), 2);
+        assert!(Arc::ptr_eq(&groups[0].facts, &groups[1].facts));
         for group in groups {
             if group.proposal.volumes[0].0 == "same.game.part1.rar" {
                 assert_eq!(group.proposal.logical_name, "same.game");
             }
             let plan = group.attempts.as_ref().unwrap();
-            let head = &group.facts.anchors[&path_key(&group.proposal.volumes[0].0)];
+            let head = group.anchor(&path_key(&group.proposal.volumes[0].0)).unwrap();
             let mut physical = HashSet::new();
             assert!(plan.base_sources().iter().all(|source| physical.insert(&source.path)));
             assert_eq!(group.parts_len(), physical.len());

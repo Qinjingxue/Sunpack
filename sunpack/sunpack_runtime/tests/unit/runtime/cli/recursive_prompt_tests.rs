@@ -629,7 +629,7 @@ fn scan_sparse_layout_is_shared_by_text_and_json() {
             archive.end_offset = Some(100);
             archive.source_paths.push("carrier.bin".into());
             archive.volume_completeness = Some(complete);
-            archive.scan_layout = crate::pipeline::ScanLayout::from_input(&descriptor);
+            archive.scan_layout = crate::pipeline::ScanLayout::from_input(&descriptor, crate::pipeline::Mode::Scan);
             let mut outcome = Outcome::default();
             outcome.archives.push(archive);
             let mut options = Options::parse(&["scan".into(), "carrier.bin".into()], &Language::default).unwrap();

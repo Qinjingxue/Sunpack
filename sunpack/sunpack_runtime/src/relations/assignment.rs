@@ -3,6 +3,7 @@ use super::structural::{NumberingStyle, SfxRole, StructuralFacts};
 use super::*;
 #[cfg(test)]
 use crate::analysis_native::volume_anchor::RAR_VERSION_5;
+use std::cell::OnceCell;
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,9 +43,21 @@ pub(super) struct BucketView<'a> {
     pub(super) features: &'a HashMap<usize, NameFeatures>,
     pub(super) format: &'static str,
     pub(super) loose_numeric_allowed: bool,
+    spanned: OnceCell<bool>,
 }
 
-impl BucketView<'_> {
+impl<'a> BucketView<'a> {
+    pub(super) fn new(
+        rows: &'a [RelationInput],
+        indexes: &'a [usize],
+        facts: &'a HashMap<usize, StructuralFacts>,
+        features: &'a HashMap<usize, NameFeatures>,
+        format: &'static str,
+        loose_numeric_allowed: bool,
+    ) -> Self {
+        Self { rows, indexes, facts, features, format, loose_numeric_allowed, spanned: OnceCell::new() }
+    }
+
     pub(super) fn channel_offset(
         &self,
         head: Option<usize>,
@@ -110,10 +123,9 @@ impl BucketView<'_> {
 
     pub(super) fn spanned(&self) -> bool {
         self.format == "zip"
-            && self.indexes.iter().any(|i| {
-                self.rows[*i].anchor.as_ref().is_some_and(|a| {
-                    a.has_any(ZIP_SPLIT_START)
-                        || a.has_any(ZIP_SPLIT_END)
+            && *self.spanned.get_or_init(|| {
+                self.indexes.iter().any(|&i| {
+                    self.rows[i].anchor.as_ref().is_some_and(|a| a.has_any(ZIP_SPLIT_START | ZIP_SPLIT_END))
                 })
             })
     }
@@ -643,8 +655,10 @@ fn raw_embedded_zip(
         let mut keys = Vec::new();
         for i in heads {
             let a = anchor(i)?;
-            if let Some(key) = structural::zip_local_key(a, a.structure_offset.unwrap_or(0), locals_cache).ok()? {
-                keys.push((i, key));
+            match structural::zip_local_key(a, a.structure_offset.unwrap_or(0), locals_cache) {
+                Ok(Some(key)) => keys.push((i, key)),
+                Err(error) if crate::io::cancellation::is_cancellation(&error) => return None,
+                _ => {}
             }
         }
         if keys.is_empty() {
@@ -717,10 +731,10 @@ fn raw_embedded_zip(
     }
     let mut facts = view.facts.clone();
     for &i in &candidates { facts.get_mut(&i)?.exact_slot = Some(1); }
-    let view = BucketView { facts: &facts, features, loose_numeric_allowed: false, ..*view };
+    let view = BucketView::new(view.rows, view.indexes, &facts, features, view.format, false);
     let logical = filename::logical_name(view.rows[head].name(), &view.features[&head], "zip");
     if alternatives {
-        let mut attempts = attempts::build(&view, Some(&logical), Some(minimum_total?));
+        let mut attempts = attempts::build(&view, Some(&logical), Some(minimum_total?), locals_cache);
         if !attempts.is_empty() && (!interior_heads.is_empty() || attempts.len() < candidates.len()) {
             let surviving: HashSet<_> = attempts.iter().filter_map(|v| v.attempts.as_ref())
                 .flat_map(|p| p.layouts.iter().filter_map(|l| l.slots.first()).flat_map(|(_, d)| d.iter())
@@ -755,7 +769,7 @@ fn raw_embedded_zip(
         }) == Some(total)
     });
     if !complete_geometry {
-        let attempts = attempts::build(&view, Some(&logical), Some(minimum_total?));
+        let attempts = attempts::build(&view, Some(&logical), Some(minimum_total?), locals_cache);
         return (!attempts.is_empty()).then_some(attempts);
     }
     let extend_head = anchor(head)?.carrier_limit.is_some() && fixed_tail.is_some();
@@ -803,10 +817,7 @@ fn directory_identity(anchor: &VolumeAnchor) -> Option<String> {
 fn competing_zip_directories(
     rows: &[RelationInput], members: &[usize], stem: &str, cached: Option<&RelationCache>,
 ) -> Option<Vec<ProposalValidation>> {
-    let terminal = |i: usize| {
-        let a = rows[i].anchor.as_ref()?;
-        a.zip_directory.as_deref().filter(|_| a.has_any(TERMINAL))
-    };
+    let terminal = |i: usize| structural::zip_terminal_directory(&rows[i]);
     if members.iter().filter(|&&i| terminal(i).is_some()).take(2).count() < 2 {
         return None;
     }
@@ -815,10 +826,7 @@ fn competing_zip_directories(
     let mut shared = Vec::new();
     for &i in members {
         let Some(dir) = terminal(i) else { shared.push(i); continue };
-        let a = rows[i].anchor.as_ref()?;
-        let start = if dir.disk == dir.cd_disk { dir.end.saturating_sub(dir.size) } else { 0 };
-        let runs = crate::io::archive_state::PhysicalRanges::new(a.view.as_deref(), start, Some(dir.end));
-        let id = identities.entry((&rows[i].path_key, *dir, runs)).or_insert_with(|| {
+        let id = identities.entry(structural::zip_directory_key(&rows[i], *dir)).or_insert_with(|| {
             domains.push(Vec::new());
             domains.len() - 1
         });
@@ -837,13 +845,21 @@ fn competing_zip_directories(
     // Prefix variants share their local record. Read each logical address
     // once across all competing directories, independently of disk choices.
     let mut locals_cache = structural::ZipLocalKeys::new();
+    let split_heads: HashSet<_> = shared.iter().filter_map(|&i| {
+        let a = rows[i].anchor.as_ref().filter(|a| a.has_any(ZIP_SPLIT_START))?;
+        Some((&rows[i].path_key, a.structure_offset))
+    }).collect();
     for &i in &shared {
-        let Some(a) = rows[i].anchor.as_ref().filter(|a| a.has_any(ZIP_LOCAL_HEADER)) else { continue };
+        let Some(a) = rows[i].anchor.as_ref().filter(|a| a.format == "zip") else { continue };
         let offset = a.structure_offset.unwrap_or(0);
-        if let std::collections::hash_map::Entry::Vacant(entry) =
-            locals_cache.entry((a.path.as_str(), a.view.as_deref(), offset))
-        {
-            if let Ok(key) = structural::zip_local_key(a, offset, None) { entry.insert(key); }
+        let local = a.has_any(ZIP_LOCAL_HEADER).then_some(offset);
+        let split = offset.checked_add(4).filter(|_| split_heads.contains(&(&rows[i].path_key, a.structure_offset)));
+        for at in local.into_iter().chain(split) {
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                locals_cache.entry((a.path.as_str(), a.view.as_deref(), at))
+            {
+                if let Ok(key) = structural::zip_local_key(a, at, None) { entry.insert(key); }
+            }
         }
     }
     let mut output = Vec::<ProposalValidation>::new();
@@ -851,8 +867,14 @@ fn competing_zip_directories(
     let mut alternatives = HashMap::<usize, Vec<attempts::VolumeAttempts>>::new();
     for tails in domains {
         let terminal = rows[tails[0]].anchor.as_ref()?;
+        let raw = terminal.zip_directory.as_ref()?.disk == 0;
         let directory_id = std::cell::OnceCell::<Option<Arc<str>>>::new();
-        let mut scoped: Vec<_> = shared.iter().chain(&tails).map(|&i| rows[i].clone()).collect();
+        // A byte-sliced ZIP has a single-disk EOCD. A positive PKZIP disk
+        // marker in another view or file does not turn it into a native set.
+        let compatible = |&&i: &&usize| !raw || !rows[i].anchor.as_ref().is_some_and(|a|
+            a.has_any(ZIP_SPLIT_START | ZIP_SPLIT_END | ZIP_DIRECTORY_MEMBER));
+        let mut scoped: Vec<_> = shared.iter().filter(compatible).chain(&tails)
+            .map(|&i| rows[i].clone()).collect();
         let indexes = (0..scoped.len()).collect::<Vec<_>>();
         let mut interiors = HashMap::<_, Vec<_>>::new();
         structural::refine_zip_members(&mut scoped, &indexes, Some(&locals_cache), |a, base| {
@@ -860,10 +882,12 @@ fn competing_zip_directories(
         });
         let index = BucketIndex { rows_by_stem: HashMap::from([(stem.to_owned(), indexes)]) };
         for mut validation in resolve_buckets_inner(&scoped, &index, cached, Some(&locals_cache)) {
-            if let Some(plan) = &mut validation.attempts {
+            if validation.attempts.is_some() {
                 let path = path_key(validation.proposal.entry_path());
-                let head = &validation.facts.anchors[&path];
-                if let Some(local) = interiors.get(&(path.clone(), head.structure_offset.unwrap_or(0))) {
+                let head = validation.anchor(&path).unwrap();
+                let (offset, view) = (head.structure_offset, head.view.clone());
+                let plan = validation.attempts.as_mut().unwrap();
+                if let Some(local) = interiors.get(&(path.clone(), offset.unwrap_or(0))) {
                     let mut excluded = std::mem::take(&mut plan.excluded_heads).into_vec();
                     excluded.extend(local.iter().cloned());
                     plan.excluded_heads = excluded.into_boxed_slice();
@@ -886,7 +910,7 @@ fn competing_zip_directories(
                     })
                 });
                 plan.directory_id.clone_from(id);
-                let key = (path, head.structure_offset, head.view.clone(), validation.proposal.style, id.clone());
+                let key = (path, offset, view, validation.proposal.style, id.clone());
                 let index = *heads.entry(key).or_insert(output.len());
                 if index < output.len() {
                     alternatives.entry(index).or_insert_with(|| vec![output[index].attempts.take().unwrap()])
@@ -942,6 +966,7 @@ fn resolve_buckets_inner(
             let mut members = Vec::new();
             let mut companions = Vec::new();
             let mut facts = HashMap::new();
+            let mut zip_terminal_kinds = (false, false);
             for &i in bucket {
                 let row = &rows[i];
                 if !row.relation_member_eligible {
@@ -973,6 +998,12 @@ fn resolve_buckets_inner(
                         continue;
                     }
                 }
+                if format == "zip" && !view_bucket {
+                    if let Some(directory) = structural::zip_terminal_directory(row) {
+                        if directory.disk == 0 { zip_terminal_kinds.0 = true; }
+                        else { zip_terminal_kinds.1 = true; }
+                    }
+                }
                 members.push(i);
                 facts.insert(i, f);
             }
@@ -997,8 +1028,7 @@ fn resolve_buckets_inner(
                         // A representative is not a proven first volume. Keep
                         // every role unknown and block execution until retry.
                         members.sort_unstable_by(|a, b| rows[*a].path_key.cmp(&rows[*b].path_key));
-                        let view = BucketView { rows, indexes: &members, facts: &facts,
-                            features: &features, format, loose_numeric_allowed: false };
+                        let view = BucketView::new(rows, &members, &facts, &features, format, false);
                         output.push(ProposalValidation {
                             status: ProposalStatus::NeedsPassword,
                             proposal: RelationProposal {
@@ -1007,6 +1037,7 @@ fn resolve_buckets_inner(
                                 companions: Vec::new(),
                             },
                             facts: proposal_facts(&view, &[]),
+                            head_override: None,
                             reason: Some(RelationFailureReason::NeedsPassword),
                             unresolved: Vec::new(), attempts: None,
                         });
@@ -1026,14 +1057,14 @@ fn resolve_buckets_inner(
                     continue;
                 }
                 if format == "zip" {
-                    if view_bucket && locals_cache.is_none() {
+                    if (view_bucket || zip_terminal_kinds == (true, true)) && locals_cache.is_none() {
                         if let Some(validations) = competing_zip_directories(rows, &members, stem, cached) {
                             output.extend(validations);
                             continue;
                         }
                     }
-                    let view = BucketView { rows, indexes: &members, facts: &facts,
-                        features: &HashMap::new(), format, loose_numeric_allowed: false };
+                    let no_features = HashMap::new();
+                    let view = BucketView::new(rows, &members, &facts, &no_features, format, false);
                     if let Some(validations) = raw_embedded_zip(&view, cached, &mut features, locals_cache) {
                         output.extend(validations);
                         continue;
@@ -1108,22 +1139,15 @@ fn resolve_buckets_inner(
                             .and_then(|cache| cache.names.get(&rows[i].path_key)).cloned()
                             .unwrap_or_else(|| NameFeatures::parse(rows[i].name())));
                     }
-                    let view = BucketView { rows, indexes: &members, facts: &facts,
-                        features: &features, format, loose_numeric_allowed: true };
-                    let candidates = attempts::build(&view, None, None);
+                    let view = BucketView::new(rows, &members, &facts, &features, format, true);
+                    let candidates = attempts::build(&view, None, None, locals_cache);
                     if !candidates.is_empty() {
                         output.extend(candidates);
                         continue;
                     }
                 }
-                let mut initial_fixed = (heads <= 1).then(|| BucketView {
-                    rows,
-                    indexes: &members,
-                    facts: &facts,
-                    features: &features,
-                    format,
-                    loose_numeric_allowed: false,
-                }.fixed());
+                let mut initial_fixed = (heads <= 1)
+                    .then(|| BucketView::new(rows, &members, &facts, &features, format, false).fixed());
                 let need_names = !matches!(&initial_fixed, Some(Ok(a)) if a.unresolved.is_empty());
                 if need_names {
                     for &i in &members {
@@ -1197,14 +1221,7 @@ fn resolve_buckets_inner(
                         let mut complete = HashSet::new();
                         let mut local_families = Vec::new();
                         for indexes in local.into_values() {
-                            let view = BucketView {
-                                rows,
-                                indexes: &indexes,
-                                facts: &facts,
-                                features: &features,
-                                format,
-                                loose_numeric_allowed: true,
-                            };
+                            let view = BucketView::new(rows, &indexes, &facts, &features, format, true);
                             let (assignment, reason) = view.solve(view.fixed());
                             if reason.is_none() && view.complete(&assignment) {
                                 complete.extend(indexes.iter().copied());
@@ -1263,15 +1280,9 @@ fn resolve_buckets_inner(
                     if indexes.is_empty() {
                         continue;
                     }
-                    let view = BucketView {
-                        rows,
-                        loose_numeric_allowed: !competing_families
-                            && indexes.iter().filter(|i| head_indexes.contains(i)).count() == 1,
-                        indexes: &indexes,
-                        facts: &facts,
-                        features: &features,
-                        format,
-                    };
+                    let loose_numeric_allowed = !competing_families
+                        && indexes.iter().filter(|i| head_indexes.contains(i)).count() == 1;
+                    let view = BucketView::new(rows, &indexes, &facts, &features, format, loose_numeric_allowed);
                     let (mut assignment, reason) =
                         if let Some(assignment) = local_assignments.remove(&view.indexes[0]) {
                             (assignment, None)
@@ -1304,7 +1315,7 @@ fn resolve_buckets_inner(
                     // A filename solve may leave native ZIP slots empty or assign
                     // them ahead of opaque data disks. Preserve those alternatives.
                     if reason.is_some() || view.needs_spanned_attempts(&assignment) {
-                        let candidates = attempts::build(&view, Some(&logical), None);
+                        let candidates = attempts::build(&view, Some(&logical), None, locals_cache);
                         if !candidates.is_empty() {
                             output.extend(candidates);
                             continue;
@@ -1403,11 +1414,17 @@ pub(super) fn materialize(
         Some(facts) => Arc::clone(facts),
         None => proposal_facts(view, &assignment.companions),
     };
-    for &row in assignment.slots.values() {
-        let row=&rows[row];
-        if let Some(anchor)=&row.anchor {
-            if !facts.anchors.get(&row.path_key).is_some_and(|saved| Arc::ptr_eq(saved,anchor)) {
-                Arc::make_mut(&mut facts).anchors.insert(row.path_key.clone(),anchor.clone());
+    let mut head_override = None;
+    for (&number, &index) in &assignment.slots {
+        let row = &rows[index];
+        if let Some(anchor) = row.anchor.as_ref().filter(|anchor|
+            !facts.anchors.get(&row.path_key).is_some_and(|saved| Arc::ptr_eq(saved, anchor)))
+        {
+            if shared_facts.is_some() {
+                debug_assert_eq!(number, 1);
+                head_override = Some((row.path_key.clone(), anchor.clone()));
+            } else {
+                Arc::make_mut(&mut facts).anchors.insert(row.path_key.clone(), anchor.clone());
             }
         }
     }
@@ -1427,6 +1444,7 @@ pub(super) fn materialize(
                 .collect(),
         },
         facts,
+        head_override,
         reason,
         unresolved,
     })

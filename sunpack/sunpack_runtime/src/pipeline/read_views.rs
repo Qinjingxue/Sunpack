@@ -1,6 +1,7 @@
 use super::*;
 use crate::analysis_native::volume_anchor::{
-    cheap_fast_probe_pool, VolumeAnchor, EMBEDDED_VOLUME,
+    cheap_fast_probe_pool, VolumeAnchor, BOUNDED_SOURCE, EMBEDDED_VOLUME,
+    SEVEN_ZIP_CARRIER_INTERRUPTED,
 };
 use crate::io::cancellation::Cancellation;
 use crate::io::reader::{ManagedReader, PhysicalFileGeneration};
@@ -62,6 +63,7 @@ fn inspect(
     passwords: &CandidateSet,
     found: &mut Findings,
     mut shared_empty: Option<&mut std::ops::Range<u64>>,
+    mask_ends: &[u64],
 ) -> io::Result<()> {
     let path = session.path();
     let prepared = match prepared {
@@ -137,6 +139,11 @@ fn inspect(
         && !embedded
         && !request.deep
         && crate::formats::supports_volume_relations(root.format)
+        && !(root.format == "7z" && !seven_zip_mask_ends(&root, mask_ends).is_empty()
+            && scan.as_ref().is_some_and(|s| s.candidates().iter().any(|c| {
+                c.offset == root.structure_offset.unwrap_or(0) && c.volume_anchor.as_ref()
+                    .is_some_and(|a| a.has_any(SEVEN_ZIP_CARRIER_INTERRUPTED))
+            })))
         && scan.as_ref().is_none_or(|s| {
             !s.has_independent_archive() || s.candidates().iter().all(|c| c.awaits_zip_tail())
         })
@@ -174,6 +181,7 @@ fn inspect(
         request,
         passwords,
         found,
+        mask_ends,
     )
 }
 
@@ -186,13 +194,32 @@ fn record_scan(
     request: &Request,
     passwords: &CandidateSet,
     found: &mut Findings,
+    mask_ends: &[u64],
 ) -> io::Result<()> {
     let path = session.path();
     let view = reader.read_view();
     let mut resolutions = HashMap::new();
     let mut anchors = scan.as_ref().map_or_else(Vec::new, |scan| scan.relation_anchors(path, view));
     for anchor in &mut anchors { anchor.flags |= EMBEDDED_VOLUME; }
+    if !mask_ends.is_empty() {
+        for anchor in anchors.iter().filter(|a| a.has_any(SEVEN_ZIP_CARRIER_INTERRUPTED)) {
+            add_seven_zip_prefixes(anchor, mask_ends, &mut found.anchors);
+        }
+        if let Some(proof) = scan.as_ref().and_then(|s| s.seven_zip_view_evidence.as_deref())
+            .filter(|p| reader.physical_generation() == Some(&p.generation))
+        {
+            for a in &proof.interrupted {
+                let mut anchor = a.clone();
+                anchor.path = path.to_owned();
+                anchor.view = view.cloned();
+                add_seven_zip_prefixes(&anchor, mask_ends, &mut found.anchors);
+            }
+        }
+    }
     if let Some(mut root) = root {
+        if let Some(scan) = &scan {
+            scan.apply_zip_eocd_evidence(&mut root);
+        }
         if !root.multivolume
             && scan.as_ref().is_some_and(|s| {
                 s.candidates().iter().any(|c| {
@@ -232,7 +259,7 @@ fn record_scan(
         scan.filter(|s| s.has_candidates() && (selected || s.has_independent_archive()))
     {
         let seed = project_file(path, "", Some(reader), false, DiscoverySource::Embedded);
-        if let Some(task) = project_segments(seed, &scan, resolutions, passwords)? {
+        if let Some(task) = project_segments(seed, &scan, resolutions, passwords, Some(reader))? {
             found.tasks.push(task);
         }
     }
@@ -265,6 +292,10 @@ fn head_key(input: &ArchiveInput) -> (String, String, u64, Option<Arc<ReadView>>
         &input.format_hint,
         input.parts.first().map(|p| &p.extent),
     )
+}
+
+fn zip_end(view: Option<&ReadView>, start: u64) -> crate::io::archive_state::PhysicalRanges {
+    crate::io::archive_state::PhysicalRanges::new(view, start, Some(start.saturating_add(22)))
 }
 
 // Another view can cut a known single-disk ZIP inside its EOCD and
@@ -363,7 +394,11 @@ fn stream_mask_ends(
     ends.clear();
     let Some(format) = StreamFormat::from_name(&input.format_hint) else { return Ok(()); };
     let external = format.uses_external_end();
-    if deep && !external { return Ok(()); }
+    if !external && (deep || input.analysis.origin == AnalysisOrigin::Embedded
+        && input.analysis.volume_completeness == Some(VolumeCompleteness::Complete))
+    {
+        return Ok(());
+    }
     let extent = input.parts.first().map(|p| &p.extent);
     let start = extent.map_or(0, |e| e.start);
     let view = extent.and_then(|e| e.view.as_ref());
@@ -455,17 +490,6 @@ struct FileViews {
     masks: FileMasks,
 }
 
-pub(super) fn could_derive(snapshot: &NativeDirectorySnapshot, row: usize, probes: ViewProbes) -> bool {
-    let table = &snapshot.table;
-    !table.is_dir(row)
-        && probes.could_derive(
-            table.sizes[row],
-            table.relation_anchors[row]
-                .as_ref()
-                .map_or(0, |a| a.reject_mask()),
-        )
-}
-
 fn open_views(
     scope: &ReadScope,
     row: usize,
@@ -481,10 +505,13 @@ fn open_views(
         Some(size) => size,
         None => file.metadata()?.len(),
     };
-    // Reject ordinary files cheaply. Once admitted, derive every coordinate
-    // from the generation that will also supply the archive bytes.
+    // Reuse a directory rejection only for screening. Mapping bytes are
+    // sourced after the reader has captured the generation they belong to.
     let probes = request.config.filesystem.read_views.probes();
-    if !probes.could_derive(Some(size), probes.rejections(&file, size, &[])) {
+    let screened = scope.raw.table.relation_anchors[row]
+        .as_ref()
+        .is_some_and(|anchor| ViewProbes::was_probed(anchor.reject_mask()));
+    if !screened && !probes.could_derive(Some(size), probes.probe_evidence(&file, size, &[])) {
         return Ok(None);
     }
     let session = NativeArchiveSession::from_open_file(path, file)?;
@@ -496,7 +523,7 @@ fn open_views(
         .clone();
     let mut boundaries = MaskBoundaries::default();
     let views = request.config.filesystem.read_views.derive_views(session.reader(), &mut boundaries)?;
-    if views.is_empty() {
+    if views.is_empty() && boundaries.is_empty() {
         return Ok(None);
     }
     Ok(Some((
@@ -518,6 +545,21 @@ fn verify_unchanged(session: &NativeArchiveSession) -> io::Result<()> {
         return Err(io::Error::other("file changed during read view discovery"));
     }
     Ok(())
+}
+
+fn seven_zip_mask_ends<'a>(anchor: &VolumeAnchor, limits: &'a [u64]) -> &'a [u64] {
+    if anchor.seven_zip_next_header.as_ref().is_none_or(|header| header.size == 0) {
+        return &[];
+    }
+    let Some((start, end)) = anchor.structure_offset.zip(anchor.expected_logical_size) else { return &[]; };
+    let limits = &limits[limits.partition_point(|&limit| limit < start.saturating_add(32))..];
+    &limits[..limits.partition_point(|&limit| limit < end)]
+}
+
+fn add_seven_zip_prefixes(anchor: &VolumeAnchor, limits: &[u64], output: &mut Vec<Arc<VolumeAnchor>>) {
+    output.extend(seven_zip_mask_ends(anchor, limits).iter().filter_map(|&limit| {
+        anchor.bounded_prefix(limit).map(Arc::new)
+    }));
 }
 
 fn read_guard(scope: &ReadScope, rows: &[usize], origin: Origin) -> Option<NativeReadScope> {
@@ -545,7 +587,7 @@ impl RecursiveViews {
         let rows: Vec<_> = scope
             .selected
             .rows()
-            .filter(|&r| could_derive(&scope.raw, r, request.config.filesystem.read_views.probes()))
+            .filter(|&r| scope.raw.table.could_derive_view(r, scope.probes))
             .collect();
         Self(cheap_fast_probe_pool().install(|| {
             let guard = read_guard(scope, &rows, request.origin);
@@ -589,6 +631,7 @@ impl RecursiveViews {
     ) -> impl Iterator<Item = (&'a str, u64, bool)> {
         self.0.iter().filter_map(|(row, file)| {
             let file = file.as_ref().ok()?;
+            if file.views.is_empty() { return None; }
             let resolved = file
                 .roots
                 .iter()
@@ -682,6 +725,27 @@ pub(super) fn discover<'a>(
         let primary = is_selected(row) && (!request.deep || eligible);
         let full_scan = embedded && (eligible || deep_filter || !is_selected(row));
         let mut found = Findings::default();
+        let plain_ends = file.masks.boundaries.ends(None);
+        if !plain_ends.is_empty() {
+            if let Some(proof) = table.seven_zip_view_evidence.get(session.path())
+                .filter(|p| p.generation == file.masks.generation) {
+                for a in &proof.interrupted {
+                    let mut anchor = a.clone();
+                    anchor.path = session.path().to_owned();
+                    add_seven_zip_prefixes(&anchor, plain_ends, &mut found.anchors);
+                }
+            } else if let Some(root) = raw.table.relation_anchors[row].as_ref().and_then(|a| a.anchor())
+                .filter(|_| !request.deep || !primary) {
+                if let Some(&first) = seven_zip_mask_ends(root, plain_ends).first() {
+                    match root.interrupted_seven_zip(session.reader(), first) {
+                        Ok(Some(anchor)) => add_seven_zip_prefixes(&anchor, plain_ends, &mut found.anchors),
+                        Ok(None) => {},
+                        Err(error) if crate::io::cancellation::is_cancellation(&error) => return Err(error),
+                        Err(error) => found.error = Some(error),
+                    }
+                }
+            }
+        }
         let mut empty = if table.empty_middles.is_empty() {
             None
         } else {
@@ -715,18 +779,21 @@ pub(super) fn discover<'a>(
                 found.residual_views.push(view.clone());
             }
             let before = found.tasks.len();
-            let result = inspect(
-                session,
-                &view.bind(session.reader())?,
-                prepared,
-                primary,
-                full_scan,
-                parallel_files,
-                request,
-                passwords,
-                &mut found,
-                shared.then_some(&mut empty),
-            );
+            let result = view.bind(session.reader()).and_then(|reader| {
+                inspect(
+                    session,
+                    &reader,
+                    prepared,
+                    primary,
+                    full_scan,
+                    parallel_files,
+                    request,
+                    passwords,
+                    &mut found,
+                    shared.then_some(&mut empty),
+                    file.masks.boundaries.ends(Some(&view)),
+                )
+            });
             if !primary {
                 found.peer_tasks.extend(found.tasks.drain(before..));
             }
@@ -757,7 +824,7 @@ pub(super) fn discover<'a>(
         let fresh = rows
             .par_iter()
             .copied()
-            .filter(|&r| (!prepared || !is_selected(r)) && could_derive(raw, r, options.probes()) && wanted(r))
+            .filter(|&r| (!prepared || !is_selected(r)) && raw.table.could_derive_view(r, read_scope.probes) && wanted(r))
             .filter_map(|row| {
                 request
                     .cancel
@@ -829,6 +896,7 @@ pub(super) fn discover<'a>(
     let mut groups = BTreeMap::<String, (Vec<usize>, Vec<Arc<VolumeAnchor>>)>::new();
     let mut peers = Vec::new();
     let mut primary_roots = HashSet::new();
+    let mut interrupted_seven_zip_heads = HashSet::new();
     let below_threshold = |r: usize| {
         matches!(admission, EmbeddedAdmission::MinimumBytes(_))
             && !admission.accepts(raw.table.sizes[r].unwrap_or(0))
@@ -847,7 +915,7 @@ pub(super) fn discover<'a>(
                 if !found.peer_tasks.is_empty() {
                     peer_tasks.insert(path_key(path), found.peer_tasks);
                 }
-                if !nominated.is_empty() && !found.anchors.is_empty() {
+                if !nominated.is_empty() && (!found.anchors.is_empty() || !masks.boundaries.is_empty()) {
                     let stem = catalog_stem(path);
                     if nominated.contains(&stem) {
                         if below_threshold(row) && found.anchors.iter().any(|a| needs_peers(a)) {
@@ -861,6 +929,9 @@ pub(super) fn discover<'a>(
                             ));
                         }
                         verified.extend(found.verified);
+                        interrupted_seven_zip_heads.extend(found.anchors.iter().filter(|a| {
+                            a.has_any(BOUNDED_SOURCE) && a.has_any(SEVEN_ZIP_CARRIER_INTERRUPTED)
+                        }).map(|a| (path_key(path), a.structure_offset.unwrap_or(0), a.view.clone())));
                         groups.entry(stem).or_default().1.extend(found.anchors);
                     }
                 }
@@ -911,7 +982,7 @@ pub(super) fn discover<'a>(
             }
             if let Some(Some(scan)) = cached.filter(|_| supplemental) {
                 let seed = project_file(path, "", None, false, DiscoverySource::Embedded);
-                if let Some(task) = project_segments(seed, scan, HashMap::new(), passwords)? {
+                if let Some(task) = project_segments(seed, scan, HashMap::new(), passwords, None)? {
                     peer_tasks.entry(key).or_default().push(task);
                 }
             }
@@ -941,6 +1012,9 @@ pub(super) fn discover<'a>(
                     let result = request.cancel.run(|| {
                         let session = NativeArchiveSession::new(path.clone())?;
                         let mut found = Findings::default();
+                        let boundaries = mask_ends.get(path.as_str()).filter(|m| {
+                            session.reader().physical_generation() == Some(&m.generation)
+                        }).map(|m| &m.boundaries);
                         if let Some((generation, views)) = mapped {
                             if session.reader().physical_generation() != Some(&generation) {
                                 return Err(io::Error::other(
@@ -953,26 +1027,41 @@ pub(super) fn discover<'a>(
                                 .filter(|(g, _)| *g == generation)
                                 .map(|(_, range)| range.clone())
                                 .unwrap_or(0..0);
+                            let mut success = false;
+                            let mut first_error = None;
                             for view in views {
-                                let reader = view.bind(session.reader())?;
-                                let scan = scan_embedded_view(
-                                    reader.clone(),
-                                    parallel_files,
-                                    None,
-                                    Some(&mut empty),
-                                )?;
-                                record_scan(
-                                    &session,
-                                    &reader,
-                                    None,
-                                    Some(scan),
-                                    false,
-                                    request,
-                                    passwords,
-                                    &mut found,
-                                )?;
+                                let result = (|| {
+                                    let reader = view.bind(session.reader())?;
+                                    let scan = scan_embedded_view(
+                                        reader.clone(),
+                                        parallel_files,
+                                        None,
+                                        Some(&mut empty),
+                                    )?;
+                                    record_scan(
+                                        &session,
+                                        &reader,
+                                        None,
+                                        Some(scan),
+                                        false,
+                                        request,
+                                        passwords,
+                                        &mut found,
+                                        boundaries.map_or(&[], |m| m.ends(Some(&view))),
+                                    )
+                                })();
+                                match result {
+                                    Ok(()) => success = true,
+                                    Err(error) if crate::io::cancellation::is_cancellation(&error) => {
+                                        return Err(error);
+                                    }
+                                    Err(error) => { first_error.get_or_insert(error); }
+                                }
                             }
                             verify_unchanged(&session)?;
+                            if !success {
+                                if let Some(error) = first_error { return Err(error); }
+                            }
                         } else {
                             inspect(
                                 &session,
@@ -985,6 +1074,7 @@ pub(super) fn discover<'a>(
                                 passwords,
                                 &mut found,
                                 None,
+                                boundaries.map_or(&[], |m| m.ends(None)),
                             )?;
                         }
                         Ok(found)
@@ -1027,6 +1117,7 @@ pub(super) fn discover<'a>(
     // the head disk. Retire that fixed guess once the full domain owns it.
     let mut plain_zip_tails = HashSet::new();
     let mut required_zip_paths = HashSet::new();
+    let mut proven_zip_ends = HashMap::<String, HashSet<_>>::new();
     let mut has_fixed_zip = false;
     let mut has_missing = false;
     let mut has_pending = false;
@@ -1039,33 +1130,32 @@ pub(super) fn discover<'a>(
         if has_fixed_zip && has_missing && has_pending { break; }
     }
     let mut continuations = HashSet::new();
-    let mut record_continuation = |extent: &InputExtent| {
-        continuations.insert(source_key(&extent.path, "zip", Some(extent)));
-        let key = path_key(&extent.path);
-        for a in plain_anchors.get(&key).into_iter().flatten() {
-            if a.format != "zip"
-                || a.strong
-                || !a.has_any(crate::analysis_native::volume_anchor::ZIP_LOCAL_HEADER)
-            {
-                continue;
-            }
-            let Some(start) = a.structure_offset.filter(|&at| at >= extent.start) else {
-                continue;
-            };
-            let Some(end) = start
-                .checked_add(30)
-                .filter(|&end| extent.end.is_none_or(|limit| end <= limit))
-            else {
-                continue;
-            };
-            // Embedded can nominate a later local header on a mandatory
-            // continuation. The same physical header in the selected bytes
-            // accounts for that plain missing marker.
-            if extent.view.as_ref().is_none_or(|v| v.unchanged(start, end)) {
-                continuations.insert((key.clone(), "zip".to_owned(), start, None));
-            }
-        }
+    let plain_zip_locals = |key: &str| {
+        plain_anchors
+            .get(key)
+            .into_iter()
+            .flatten()
+            .filter(|a| {
+                a.format == "zip"
+                    && !a.strong
+                    && a.has_any(crate::analysis_native::volume_anchor::ZIP_LOCAL_HEADER)
+            })
+            .filter_map(|a| a.structure_offset)
     };
+    // Embedded can nominate a later local header on a mandatory continuation.
+    // Its physical bytes must be present in every eligible view of that disk.
+    let contains_plain_local = |extent: &InputExtent, start: u64| {
+        start >= extent.start
+            && start.checked_add(30).is_some_and(|end| {
+                extent.end.is_none_or(|limit| end <= limit)
+                    && extent.view.as_ref().is_none_or(|v| v.unchanged(start, end))
+            })
+    };
+    #[derive(Eq, Hash, PartialEq)]
+    enum Continuation<'a> {
+        Source(usize),
+        Plain(&'a str, u64),
+    }
     let mut excluded_heads = HashSet::new();
     // Root discovery can admit a small physical file independently. A disk found
     // only by a supplemental scan must connect to an admitted file.
@@ -1100,23 +1190,7 @@ pub(super) fn discover<'a>(
                 .filter_map(|&end| a.bounded_prefix(end).map(Arc::new))).collect();
             facts.extend(prefixes);
         }
-        if options.plain {
-            let plain: HashSet<_> = facts
-                .iter()
-                .filter(|a| a.view.is_none() && a.structure_offset.is_some())
-                .map(|a| (a.path.clone(), a.format, a.structure_offset))
-                .collect();
-            facts.retain(|a| {
-                !a.view.as_ref().is_some_and(|v| {
-                    a.structure_offset
-                        .zip(a.proven_extent_end().or(a.carrier_limit))
-                        .is_some_and(|(start, end)| {
-                            v.unchanged(start, end)
-                                && plain.contains(&(a.path.clone(), a.format, Some(start)))
-                        })
-                })
-            });
-        }
+        if options.plain { retain_distinct_view_anchors(&mut facts); }
         // Every mapped anchor of this family may describe bytes that the
         // physical pass already owns. With no new range or pending ownership
         // to settle, the original result is final.
@@ -1184,7 +1258,10 @@ pub(super) fn discover<'a>(
             if has_missing {
                 // A competing, directory-confirmed tail can be optional across
                 // layouts. It still accounts for its own headless missing marker.
-                for path in group.proven_zip_tails() {
+                for (path, view, eocd) in group.proven_zip_tails() {
+                    if let Some(at) = eocd {
+                        proven_zip_ends.entry(path_key(path)).or_default().insert(zip_end(view, at));
+                    }
                     if let Some(&row) = zip_rows.get(path) {
                         let root = raw.table.relation_anchors[row]
                             .as_ref()
@@ -1272,7 +1349,7 @@ pub(super) fn discover<'a>(
             // that fallback when every surviving layout requires this source.
             if has_missing && task.inputs[0].failure.is_none() && input.format_hint == "zip" {
                 if let Some(plan) = &input.volume_attempts {
-                    let mut common: Option<HashSet<usize>> = None;
+                    let mut common: Option<HashSet<Continuation<'_>>> = None;
                     let mut common_paths: Option<HashSet<&str>> = None;
                     let mut domain_paths = HashMap::new();
                     for layout in &plan.layouts {
@@ -1290,19 +1367,34 @@ pub(super) fn discover<'a>(
                             .chain(layout.slots.last())
                         {
                             let choices = &plan.domains[slot.domain].choices;
-                            let path = domain_paths.entry(slot.domain).or_insert_with(|| {
-                                let first = plan.sources[*choices.first()?].path.as_str();
-                                choices
-                                    .iter()
-                                    .all(|&i| plan.sources[i].path == first)
-                                    .then_some(first)
-                            });
-                            if let Some(path) = *path {
-                                paths.insert(path);
+                            let proof = domain_paths
+                                .entry(slot.domain)
+                                .or_insert_with(|| {
+                                    let first = plan.sources[*choices.first()?].path.as_str();
+                                    if !choices.iter().all(|&i| plan.sources[i].path == first) {
+                                        return None;
+                                    }
+                                    let offsets = plain_zip_locals(&path_key(first))
+                                        .filter(|&start| {
+                                            choices.iter().all(|&i| {
+                                                contains_plain_local(&plan.sources[i], start)
+                                            })
+                                        })
+                                        .collect::<Vec<_>>();
+                                    Some((first, offsets))
+                                })
+                                .as_ref();
+                            if let Some((path, _)) = proof {
+                                paths.insert(*path);
                             }
                             if slot.number > 1 {
                                 if let [i] = choices.as_slice() {
-                                    fixed.insert(*i);
+                                    fixed.insert(Continuation::Source(*i));
+                                }
+                                if let Some((path, offsets)) = proof {
+                                    fixed.extend(
+                                        offsets.iter().map(|&start| Continuation::Plain(*path, start)),
+                                    );
                                 }
                             }
                         }
@@ -1338,9 +1430,17 @@ pub(super) fn discover<'a>(
                             }
                         }
                     }
-                    for i in common.into_iter().flatten() {
-                        let source = &plan.sources[i];
-                        record_continuation(source);
+                    for proof in common.into_iter().flatten() {
+                        let key = match proof {
+                            Continuation::Source(i) => {
+                                let source = &plan.sources[i];
+                                source_key(&source.path, "zip", Some(source))
+                            }
+                            Continuation::Plain(path, start) => {
+                                (path_key(path), "zip".to_owned(), start, None)
+                            }
+                        };
+                        continuations.insert(key);
                     }
                 } else {
                     for part in input
@@ -1348,7 +1448,14 @@ pub(super) fn discover<'a>(
                         .iter()
                         .filter(|p| p.volume_number.is_some_and(|n| n > 1))
                     {
-                        record_continuation(&part.extent);
+                        let extent = &part.extent;
+                        continuations.insert(source_key(&extent.path, "zip", Some(extent)));
+                        let key = path_key(&extent.path);
+                        continuations.extend(
+                            plain_zip_locals(&key)
+                                .filter(|&start| contains_plain_local(extent, start))
+                                .map(|start| (key.clone(), "zip".to_owned(), start, None)),
+                        );
                     }
                 }
             }
@@ -1362,7 +1469,9 @@ pub(super) fn discover<'a>(
             let count = task.inputs.len();
             task.inputs.retain(|logical| {
                 let input = &logical.input;
-                if !input.mode.structured() && logical.failure.is_none() {
+                if !input.mode.structured() && logical.failure.is_none()
+                    && !(input.format_hint == "7z" && interrupted_seven_zip_heads.contains(&input_head_key(input)))
+                {
                     return true;
                 }
                 if !plain_zip_tails.is_empty()
@@ -1395,6 +1504,14 @@ pub(super) fn discover<'a>(
                         .as_ref()
                         .is_some_and(|f| f.kind == FailureKind::MissingVolume)
                         && (excluded_heads.contains(&key)
+                            || input.format_hint == "zip" && input.mode == OpenMode::FileRange
+                                && input.volume_attempts.is_none()
+                                && proven_zip_ends.get(&key.0).is_some_and(|ends|
+                                    input.parts.first().is_some_and(|part| {
+                                        let extent = &part.extent;
+                                        input.analysis.zip_eocd_offset.and_then(|offset| extent.start.checked_add(offset))
+                                            .is_some_and(|at| ends.contains(&zip_end(extent.view.as_deref(), at)))
+                                    }))
                             || input.format_hint == "zip"
                                 && required_zip_paths.contains(&key.0)
                                 && (input.mode == OpenMode::File
@@ -1421,4 +1538,22 @@ pub(super) fn discover<'a>(
     added_tasks |= !proposals.is_empty();
     out.tasks.extend(proposals);
     Ok(added_tasks)
+}
+
+pub(super) fn retain_distinct_view_anchors(facts: &mut Vec<Arc<VolumeAnchor>>) {
+    fn range(anchor: &VolumeAnchor) -> Option<(u64, u64)> {
+        anchor.structure_offset.zip(anchor.proven_extent_end().or(anchor.carrier_limit))
+    }
+    let plain: HashSet<_> = facts.iter()
+        .filter(|anchor| anchor.view.is_none())
+        .filter_map(|anchor| Some((anchor.path.clone(), anchor.format, range(anchor)?)))
+        .collect();
+    if plain.is_empty() { return; }
+    // Equal heads may still nominate independent boundaries in different views.
+    facts.retain(|anchor| {
+        !anchor.view.as_ref().zip(range(anchor)).is_some_and(|(view, (start, end))| {
+            view.unchanged(start, end)
+                && plain.contains(&(anchor.path.clone(), anchor.format, (start, end)))
+        })
+    });
 }

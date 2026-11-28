@@ -656,6 +656,7 @@ fn encrypted_header_alternative_ciphertexts_share_candidate_kdf_and_confirm() {
         "an earlier explicit boundary is a different logical head"
     );
     earlier_head.view = Some(Arc::new(crate::io::view::ReadView {
+        generation: None,
         method: crate::io::view::ViewMethod::Apate, depth: 1, physical_size: 48,
         spans: vec![crate::io::view::Span { start: 0, end: 48, reverse: true }],
     }));

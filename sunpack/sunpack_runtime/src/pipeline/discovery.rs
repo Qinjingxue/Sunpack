@@ -7,7 +7,7 @@ use crate::io::archive_state::{
     AnalysisOrigin, ArchiveInput, InputExtent, InputPart, OpenMode, VolumeCompleteness,
 };
 use crate::io::directory_errors::{DirectoryReadError, DirectoryReadErrors};
-use crate::io::reader::NativeArchiveSession;
+use crate::io::reader::{ManagedReader, NativeArchiveSession};
 use crate::password::rar::resolve_embedded_rar_boundaries;
 use crate::path_keys::{path_ancestors, path_key};
 use crate::scan::directory::{
@@ -904,7 +904,7 @@ fn configured_table(
     // A rejection is already attached to the cheap directory snapshot. Keep the
     // ordinary batch and its IOCP scan free of view evidence when all rows reject.
     let probes = config.probes();
-    let mapped = config.has_mapped_views() && raw.rows().any(|r| read_views::could_derive(raw, r, probes));
+    let mapped = probes.enabled() && raw.rows().any(|row| raw.table.could_derive_view(row, probes));
     let mut table = if config.plain {
         NativeCandidateTable::from_directory_with_shared_zip_scan(
             raw,
@@ -918,7 +918,7 @@ fn configured_table(
         NativeCandidateTable::default()
     };
     if mapped {
-        table.read_scopes.push(crate::scan::discovery::ReadScope::new(root, raw, filtered, targets));
+        table.read_scopes.push(crate::scan::discovery::ReadScope::new(root, raw, filtered, targets, probes));
     }
     table
 }
@@ -1168,7 +1168,7 @@ impl Discovered {
                 }
             };
             let task = project_task(table.project(row.index)?, DiscoverySource::Embedded, verified);
-            if let Some(task) = project_segments(task, &scan, HashMap::new(), candidates)? {
+            if let Some(task) = project_segments(task, &scan, HashMap::new(), candidates, None)? {
                 embedded_tasks.push(task);
             }
         }
@@ -1197,7 +1197,7 @@ impl Discovered {
                         verified,
                     );
                     if let Some(task) =
-                        project_segments(task, &scan.scan, scan.resolutions, candidates)?
+                        project_segments(task, &scan.scan, scan.resolutions, candidates, None)?
                     {
                         embedded_tasks.push(task);
                     }
@@ -1252,7 +1252,7 @@ impl Discovered {
 }
 
 fn project_file(
-    path: &str, format: &str, reader: Option<&crate::io::reader::ManagedReader>,
+    path: &str, format: &str, reader: Option<&ManagedReader>,
     truncated: bool, source: DiscoverySource,
 ) -> Task {
     let size = reader.map_or(0, |r| r.len());
@@ -1310,6 +1310,7 @@ fn project_segments(
     scan: &NativeScanResult,
     mut resolutions: HashMap<u64, RarInputResolution>,
     candidates: &CandidateSet,
+    reader: Option<&ManagedReader>,
 ) -> io::Result<Option<Task>> {
     let path = task.entry().entry_path.clone();
     let name = task.entry().logical_name.clone();
@@ -1329,7 +1330,11 @@ fn project_segments(
         .collect();
     if !unresolved.is_empty() {
         let passwords = candidates.for_embedded(&path);
-        for result in resolve_embedded_rar_boundaries(path.clone(), view.as_ref(), unresolved, &passwords)? {
+        let open = || match reader {
+            Some(reader) => Ok(reader.clone()),
+            None => ManagedReader::open(&path).and_then(|reader| reader.with_view(view.as_ref())),
+        };
+        for result in resolve_embedded_rar_boundaries(open, unresolved, &passwords)? {
             let reason = match result.status {
                 "ok" => None,
                 "password_required" => Some("embedded_password_required"),

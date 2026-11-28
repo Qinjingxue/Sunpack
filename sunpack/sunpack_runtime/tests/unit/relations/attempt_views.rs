@@ -9,7 +9,7 @@ fn zip_disk_matching_counts_equivalent_views_only_once() {
     };
     let source = |path: &str| AttemptSource {
         path: path.into(), view: None, start: 2, end: 8, terminal: path == "tail",
-        proven_end: None, head_size: None,
+        proven_end: None, head_size: None, zip_eocd_offset: None,
     };
     let middle = Arc::new(vec![1, 3]);
     let mut attempts = VolumeAttempts {
@@ -26,6 +26,7 @@ fn zip_disk_matching_counts_equivalent_views_only_once() {
         attempts.sources[3].start = offset;
         attempts.sources[3].end = offset + 6;
         attempts.sources[3].view = Some(Arc::new(ReadView {
+            generation: None,
             method: ViewMethod::Apate, depth: 1, physical_size: 16,
             spans: vec![Span { start: 10, end: 10 + offset, reverse: true },
                         Span { start: 2, end: 8, reverse }],
@@ -67,6 +68,7 @@ fn raw_zip_disk_bound_counts_distinct_physical_extents() {
         row(middle.clone()),
         row(VolumeAnchor { size: 5, ..middle.clone() }),
         row(VolumeAnchor { view: Some(Arc::new(ReadView {
+            generation: None,
             method: ViewMethod::Apate, depth: 1, physical_size: 8,
             spans: vec![Span { start: 0, end: 4, reverse: false }],
         })), ..middle }),
@@ -74,8 +76,8 @@ fn raw_zip_disk_bound_counts_distinct_physical_extents() {
     let facts = rows.iter().enumerate().map(|(i, row)| {
         (i, super::super::structural::StructuralFacts::from_row(row, "zip"))
     }).collect();
-    let view = BucketView { rows: &rows, indexes: &[], facts: &facts,
-        features: &HashMap::new(), format: "zip", loose_numeric_allowed: false };
+    let features = HashMap::new();
+    let view = BucketView::new(&rows, &[], &facts, &features, "zip", false);
     assert_eq!(raw_zip_disk_bound(&view, &[0, 1, 2, 3], [&0].into_iter()), Some(4));
     assert_eq!(raw_zip_disk_bound(&view, &[0, 1, 2, 4], [&0].into_iter()), Some(3));
 }

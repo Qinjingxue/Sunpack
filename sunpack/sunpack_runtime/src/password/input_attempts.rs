@@ -82,7 +82,7 @@ impl AttemptSource {
         match &self.view {
             None => EvidenceAddress::Physical { file, offset, reverse: false },
             Some(view) => {
-                if self.file.open().is_ok_and(|r| r.len() == view.physical_size) {
+                if self.file.open().is_ok_and(|reader| view.validate_source(reader).is_ok()) {
                     if let Some(run) = view.single_run(offset, len) {
                         return EvidenceAddress::Physical { file, offset: run.start, reverse: run.reverse };
                     }
@@ -94,8 +94,10 @@ impl AttemptSource {
 
     fn read(&self, reader: &ManagedReader, offset: u64, dest: &mut [u8]) -> io::Result<usize> {
         match &self.view {
-            Some(view) if view.physical_size != reader.len() => Err(io::Error::other("volume view source changed")),
-            Some(view) => view.read(reader, offset, dest, true),
+            Some(view) => {
+                view.validate_source(reader)?;
+                view.read(reader, offset, dest, true)
+            }
             None => reader.read_direct_into_at(offset, dest),
         }
     }

@@ -2286,15 +2286,14 @@ pub(crate) struct RarBoundaryResolution {
 }
 
 pub(crate) fn resolve_embedded_rar_boundaries(
-    archive_path: String,
-    view: Option<&Arc<crate::io::view::ReadView>>,
+    open: impl FnOnce() -> io::Result<ManagedReader>,
     offsets: Vec<u64>,
     passwords: &[Arc<str>],
 ) -> io::Result<Vec<RarBoundaryResolution>> {
     // A failed segment must not discard earlier facts or classify the
     // unvisited remainder.
     Cancellation::check_current_io()?;
-    let reader = match ManagedReader::open(&archive_path).and_then(|r| r.with_view(view)) {
+    let reader = match open() {
         Ok(reader) => reader.windowed_probe_reader(),
         Err(error) if is_cancellation(&error) => return Err(error),
         Err(error) => {

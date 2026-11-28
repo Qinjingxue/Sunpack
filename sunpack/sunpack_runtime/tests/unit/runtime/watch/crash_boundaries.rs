@@ -174,7 +174,7 @@ fn hard_death_replays_delete_receipt_without_reissuing_wal_or_deleting_replaceme
         ))).unwrap();
         let catalog = Arc::new(NativeWatchCatalog::new(journal.state(), None));
         let observer = WatchObserver {
-            deep: false, dedup_enabled: false,
+            deep: false, dedup_generation: None,
             dedup: Arc::new(Mutex::new(dedup::Index::open(&base.join("state"),
                 config::WatchDeduplication::None, config::WatchDeduplicationScope::Root, Default::default()).unwrap())),
             dedup_scope: NativeDiscoveryScope::new(base.to_string_lossy().into_owned(), None, Vec::new()),
@@ -359,7 +359,7 @@ fn claimed_release_reobserves_cancelled_replacement_and_remembers_late_sibling()
             let generations: SourceGenerations = [&head, &tail].into_iter().map(|path|
                 (key(path), capture_file_generation(path).unwrap())).collect();
             let observer = WatchObserver {
-                dedup_enabled: false,
+                dedup_generation: None,
                 dedup: Arc::new(Mutex::new(dedup::Index::open(&base.join("state"), crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root, Default::default()).unwrap())),
                 dedup_scope: NativeDiscoveryScope::new(base.join("state").to_string_lossy().into_owned(), None, Vec::new()),
                 catalog: Arc::clone(&scheduler.catalog),
@@ -370,8 +370,8 @@ fn claimed_release_reobserves_cancelled_replacement_and_remembers_late_sibling()
                 groups: Arc::default(), claimed: Arc::default(),
             };
             // Main remembers complete source output even if a child failed.
-            observer.sources_processed(generations.clone(), Some(&output)).unwrap();
-            assert_eq!(observer.completed_sources(&generations).unwrap(), Some(output.clone()));
+            observer.sources_processed(generations.clone(), 1, Some(&output), None).unwrap();
+            assert_eq!(observer.completed_sources(&generations, 1).unwrap(), Some(output.clone()));
             let mut outcome = Outcome::default();
             outcome.archives.push(old);
             scheduler.apply_completion("late-old-failure", CompletionContext {

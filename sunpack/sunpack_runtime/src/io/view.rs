@@ -2,7 +2,9 @@
 use super::reader::{
     ByteSource, FileIdentity, ManagedReader, PhysicalFileGeneration, ReaderConfig,
 };
+use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize};
+use std::hash::{Hash, Hasher};
 use std::{fs::File, io, sync::Arc};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -29,7 +31,7 @@ impl Span {
         false
     }
 
-    fn normalize(&mut self) {
+    pub(super) fn normalize(&mut self) {
         self.reverse &= self.end - self.start > 1;
     }
 
@@ -79,15 +81,56 @@ macro_rules! mapped_methods {
 }
 include!(concat!(env!("OUT_DIR"), "/read_view_methods.rs"));
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub(crate) struct ReadView {
     pub method: ViewMethod,
     pub depth: u32,
     pub physical_size: u64,
     pub spans: Vec<Span>,
+    // Live plans pin the generation that supplied the mapping. Recovery
+    // already validates persisted source generations against its receipts.
+    #[serde(skip)]
+    pub(crate) generation: Option<Arc<PhysicalFileGeneration>>,
+}
+
+impl PartialEq for ReadView {
+    fn eq(&self, other: &Self) -> bool { self.geometry() == other.geometry() }
+}
+
+impl Eq for ReadView {}
+
+impl Serialize for ReadView {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[cfg(windows)]
+        let stamp = self.generation.as_ref().filter(|_| serializer.is_human_readable())
+            .map(|generation| generation.worker_stamp());
+        #[cfg(not(windows))]
+        let stamp: Option<[u64; 4]> = None;
+        // The named worker wire carries the live stamp. Compact checkpoints
+        // keep their existing layout and validate their group generations.
+        let mut view = serializer.serialize_struct("ReadView", 4 + usize::from(stamp.is_some()))?;
+        view.serialize_field("method", &self.method)?;
+        view.serialize_field("depth", &self.depth)?;
+        view.serialize_field("physical_size", &self.physical_size)?;
+        view.serialize_field("spans", &self.spans)?;
+        if let Some(stamp) = stamp { view.serialize_field("file_generation", &stamp)?; }
+        view.end()
+    }
+}
+
+impl Hash for ReadView {
+    fn hash<H: Hasher>(&self, state: &mut H) { self.geometry().hash(state); }
 }
 
 impl ReadView {
+    fn geometry(&self) -> (ViewMethod, u32, u64, &[Span]) {
+        (self.method, self.depth, self.physical_size, &self.spans)
+    }
+
+    pub(crate) fn matches_generation(&self, current: Option<&PhysicalFileGeneration>) -> bool {
+        self.generation.as_deref().is_none_or(|saved| current.is_some_and(|current| current.matches_input(saved)))
+    }
+
     pub fn len(&self) -> u64 {
         self.spans.iter().map(|s| s.end - s.start).sum()
     }
@@ -169,16 +212,6 @@ impl ReadView {
         Ok(pos)
     }
 
-    pub(crate) fn physical_runs(&self, start: u64, end: u64) -> Vec<Span> {
-        let mut runs = Vec::new();
-        self.visit(start, end, |span| {
-            span.append_to(&mut runs);
-            Ok(())
-        })
-        .expect("collecting ranges is infallible");
-        runs
-    }
-
     // Scalar identity for evidence reads contained in one contiguous physical run.
     // A read crossing a boundary keeps its original logical source identity.
     pub(crate) fn single_run(&self, start: u64, len: u64) -> Option<Span> {
@@ -209,10 +242,18 @@ impl ReadView {
         mapped.is_ok() && cursor == end
     }
 
-    pub fn bind(self: &Arc<Self>, physical: &ManagedReader) -> io::Result<ManagedReader> {
+    pub(crate) fn validate_source(&self, physical: &ManagedReader) -> io::Result<()> {
         if physical.len() != self.physical_size {
             return Err(io::Error::other("file size changed after view discovery"));
         }
+        if !self.matches_generation(physical.physical_generation()) {
+            return Err(io::Error::other("file changed after view discovery"));
+        }
+        Ok(())
+    }
+
+    pub fn bind(self: &Arc<Self>, physical: &ManagedReader) -> io::Result<ManagedReader> {
+        self.validate_source(physical)?;
         let len = self
             .spans
             .iter()
@@ -326,7 +367,11 @@ const fn maximum_probe() -> ProbeShape {
 pub(crate) struct ViewProbes(u32);
 
 impl ViewProbes {
+    // The directory word also carries format rejections below the method bits.
+    const PROBED: u32 = 1 << 15;
+
     pub(crate) fn enabled(self) -> bool { self.0 != 0 }
+    pub(crate) fn was_probed(evidence: u32) -> bool { evidence & Self::PROBED != 0 }
     pub(crate) fn has_view_rejection(evidence: u32) -> bool {
         ViewMethod::MAPPED.iter().any(|method| evidence & method.rejection() != 0)
     }
@@ -337,9 +382,9 @@ impl ViewProbes {
             pending & method.rejection() != 0 && size.is_none_or(|n| n >= method.probe().minimum))
     }
 
-    pub(crate) fn rejections(self, file: &File, size: u64, prefix: &[u8]) -> u32 {
+    pub(crate) fn probe_evidence(self, file: &File, size: u64, prefix: &[u8]) -> u32 {
         if !self.enabled() { return 0; }
-        self.probe(size, prefix, |at, buf| super::reader::positional_read(file, buf, at), |rejected, _| rejected)
+        self.probe(size, prefix, |at, buf| super::reader::positional_read(file, buf, at), |rejected, _| rejected | Self::PROBED)
     }
 
     /// Share prefix/suffix reads on this handle. A short read is inconclusive.
@@ -501,6 +546,7 @@ impl ConfiguredViews {
         -> io::Result<Vec<Arc<ReadView>>> {
         let mut result = Vec::<Arc<ReadView>>::new();
         let physical_size = physical.len();
+        let mut generation = None;
         for group in self.methods.chunk_by(|a, b| a.0 == b.0) {
             let method = group[0].0;
             if rejected & method.rejection() != 0 { continue; }
@@ -519,10 +565,12 @@ impl ConfiguredViews {
                 if record_boundary {
                     if let Some(end) = layer.prefix_end { boundaries.record(parent, end); }
                 }
-                let view = ReadView { method, depth, physical_size, spans: layer.spans };
+                let mut view = ReadView { method, depth, physical_size, spans: layer.spans, generation: None };
                 record_boundary = wanted.peek() == Some(&depth);
                 if record_boundary {
                     wanted.next();
+                    view.generation = generation.get_or_insert_with(||
+                        physical.physical_generation().cloned().map(Arc::new)).clone();
                     result.push(Arc::new(view));
                     intermediate = None;
                 } else {

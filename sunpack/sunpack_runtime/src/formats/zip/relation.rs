@@ -10,6 +10,15 @@ pub(crate) struct RelationDirectory {
     pub end: u64,
 }
 
+impl RelationDirectory {
+    /// A raw ZIP tail stores an offset in the concatenated archive. The walk
+    /// of its directory opens only the terminal file.
+    pub(crate) fn in_raw_tail(mut self) -> Option<Self> {
+        self.offset = self.end.checked_sub(self.size)?;
+        Some(self)
+    }
+}
+
 /// Read one directory record at a time. No payload reads or directory-sized
 /// allocation; callers discard tentative matches if the extent is incomplete.
 pub(crate) fn visit_relation_directory(
@@ -41,32 +50,54 @@ pub(crate) fn visit_relation_directory(
     let mut cursor = start;
     for _ in 0..count {
         reader.hint_probe_window(cursor);
-        let fixed = reader.read_cached_at(cursor, 46)?;
-        let Some(len) = super::central_directory_record_len(&fixed) else {
+        let Some(record) = read_relation_record(&reader, cursor, directory, &mut visit)? else {
             return Ok(false);
         };
-        if cursor
-            .checked_add(len as u64)
-            .is_none_or(|end| end > directory.end)
-        {
-            return Ok(false);
-        }
-        let full = reader.read_cached_at(cursor, len)?;
-        let Some(record) = super::parse_central_directory_record(&full) else {
-            return Ok(false);
-        };
-        let Some(values) = super::zip64::central_entry_values(&full, record.extra) else {
-            return Ok(false);
-        };
-        if values.disk > u64::from(directory.disk) {
-            return Ok(false);
-        }
-        visit(&record, values);
-        cursor += len as u64;
+        cursor = record;
     }
     super::central_directory_complete(cursor, directory.end, |at, len| {
         reader.read_cached_at(at, len)
     })
+}
+
+fn read_relation_record(
+    reader: &crate::io::reader::ManagedReader,
+    cursor: u64,
+    directory: RelationDirectory,
+    visit: impl FnOnce(&super::CentralDirectoryRecord<'_>, super::zip64::CentralValues),
+) -> std::io::Result<Option<u64>> {
+    let fixed = reader.read_cached_at(cursor, 46)?;
+    let Some(len) = super::central_directory_record_len(&fixed) else { return Ok(None); };
+    let Some(next) = cursor.checked_add(len as u64).filter(|end| *end <= directory.end) else { return Ok(None); };
+    let full = reader.read_cached_at(cursor, len)?;
+    let Some(record) = super::parse_central_directory_record(&full) else { return Ok(None); };
+    let Some(values) = super::zip64::central_entry_values(&full, record.extra) else { return Ok(None); };
+    if values.disk > u64::from(directory.disk) { return Ok(None); }
+    visit(&record, values);
+    Ok(Some(next))
+}
+
+pub(crate) fn relation_first_local_key(
+    reader: &crate::io::reader::ManagedReader, directory: RelationDirectory,
+) -> std::io::Result<Option<(u64, RelationLocalKey)>> {
+    if directory.cd_disk != directory.disk || directory.entries != directory.disk_entries
+        || directory.entries == 0 || directory.end > reader.len()
+    {
+        return Ok(None);
+    }
+    let Some(start) = directory.end.checked_sub(directory.size) else { return Ok(None); };
+    let reader = reader.probe_reader();
+    let mut first = None;
+    read_relation_record(&reader, start, directory, |record, values| {
+        if values.disk == 0 && record.flags & 0x2000 == 0 {
+            first = Some((values.local_offset, RelationLocalKey {
+                name: record.name.to_vec(),
+                fields: RelationLocalFields::new(record.method, record.flags, record.crc32,
+                    values.compressed, values.uncompressed),
+            }));
+        }
+    })?;
+    Ok(first)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

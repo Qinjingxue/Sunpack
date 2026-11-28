@@ -7,6 +7,8 @@
 #include <memory>
 #include <atomic>
 #include <optional>
+#include <array>
+#include <cstdint>
 
 namespace sunpack::sevenzip {
 
@@ -155,6 +157,7 @@ struct ReadSpan {
 struct ReadView {
     unsigned long long physical_size = 0;
     std::vector<ReadSpan> spans;
+    std::optional<std::array<std::uint64_t, 4>> file_generation;
 };
 struct ExtractInputRange {
     std::wstring path;
@@ -165,7 +168,7 @@ struct ExtractInputRange {
 };
 
 struct VolumeAttemptPlan;
-enum class ArchiveOpenMode { File, FileRange, NativeVolumes, SfxWithVolumes };
+enum class ArchiveOpenMode { File, FileRange, NativeVolumes, SfxWithVolumes, NamedVolumes };
 
 PasswordTestResult test_password_batch(
     const std::wstring& archive_path,

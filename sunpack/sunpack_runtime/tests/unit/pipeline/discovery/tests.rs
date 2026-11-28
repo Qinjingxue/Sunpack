@@ -3,6 +3,41 @@ use super::*;
 const STORED_ZIP: &[u8] = b"PK\x03\x04\x14\x00\x00\x00\x00\x00\x00\x00!\x00\x15j,B\x07\x00\x00\x00\x07\x00\x00\x00\x08\x00\x00\x00item.txtpayloadPK\x01\x02\x14\x03\x14\x00\x00\x00\x00\x00\x00\x00!\x00\x15j,B\x07\x00\x00\x00\x07\x00\x00\x00\x08\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x80\x01\x00\x00\x00\x00item.txtPK\x05\x06\x00\x00\x00\x00\x01\x00\x01\x006\x00\x00\x00-\x00\x00\x00\x00\x00";
 
 #[test]
+fn view_anchor_dedup_preserves_distinct_ends() {
+    use crate::analysis_native::volume_anchor::VolumeAnchor;
+    use crate::io::view::{ReadView, Span, ViewMethod};
+
+    let view = Arc::new(ReadView {
+        generation: None,
+        method: ViewMethod::Apate,
+        depth: 1,
+        physical_size: 128,
+        spans: vec![
+            Span { start: 116, end: 124, reverse: true },
+            Span { start: 8, end: 116, reverse: false },
+        ],
+    });
+    let plain = VolumeAnchor {
+        path: "carrier.dat".into(),
+        format: "zip",
+        size: 128,
+        structure_offset: Some(16),
+        carrier_limit: Some(72),
+        ..Default::default()
+    };
+    let duplicate = VolumeAnchor {
+        size: view.len(),
+        view: Some(view),
+        ..plain.clone()
+    };
+    let distinct = VolumeAnchor { carrier_limit: Some(96), ..duplicate.clone() };
+    let mut anchors = vec![Arc::new(plain), Arc::new(duplicate), Arc::new(distinct)];
+    read_views::retain_distinct_view_anchors(&mut anchors);
+    assert_eq!(anchors.iter().map(|a| (a.view.is_some(), a.carrier_limit)).collect::<Vec<_>>(),
+               [(false, Some(72)), (true, Some(96))]);
+}
+
+#[test]
 fn zip_carrier_search_keeps_eocd_crossing_the_checked_suffix() {
     use crate::analysis_native::volume_anchor::{
         probe_volume_anchor_path_cheap, upgrade_relation_zip_carrier_tail,

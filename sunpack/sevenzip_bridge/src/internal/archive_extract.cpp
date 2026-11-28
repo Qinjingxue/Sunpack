@@ -310,7 +310,7 @@ namespace sunpack::sevenzip
 #else
         const auto formats = extraction_formats_for_hint(format_hint);
 #endif
-        const auto prefetch_config = input_prefetch_config(format_hint, mode == ArchiveOpenMode::NativeVolumes);
+        const auto prefetch_config = input_prefetch_config(format_hint, mode);
 
         // Try each handler at the canonical input start before allowing
         // signature search. A wrong handler must not scan the whole archive
@@ -403,7 +403,8 @@ namespace sunpack::sevenzip
                 PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::CallbackSetup);
 #endif
                 return new OpenCallback(
-                    password, input.callback_path, part_paths, canonical_names, prefetch_config, cancel_token, input_ranges);
+                    password, input.handler_callback_path(format.Data4[5] == 0x01, mode),
+                    part_paths, canonical_names, prefetch_config, cancel_token, input_ranges);
             }();
             CMyComPtr<IArchiveOpenCallback> open_callback(raw_open_callback);
 

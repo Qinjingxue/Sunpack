@@ -283,7 +283,7 @@ pub(super) fn resolve_carrier_geometry(validation: &mut ProposalValidation) {
         return;
     }
     if let Some(plan) = validation.attempts.take() {
-        let head = &validation.facts.anchors[&path_key(&validation.proposal.volumes[0].0)];
+        let head = validation.anchor(&path_key(&validation.proposal.volumes[0].0)).unwrap();
         validation.attempts = Some(plan.with_spanned_carrier(head));
     }
 }
@@ -310,6 +310,7 @@ pub(super) struct AttemptSource {
     pub end: u64,
     pub proven_end: Option<u64>,
     pub terminal: bool,
+    pub zip_eocd_offset: Option<u64>,
     pub head_size: Option<u64>,
 }
 impl AttemptSource {
@@ -327,6 +328,7 @@ impl AttemptSource {
                 .map_or(anchor.extent_end(), |limit| limit.min(anchor.extent_end())),
             proven_end: anchor.proven_extent_end(),
             terminal: anchor.has_any(TERMINAL),
+            zip_eocd_offset: anchor.zip_eocd_offset,
             head_size: anchor.zip_head_size,
         }
     }
@@ -351,7 +353,8 @@ fn head_geometry(head: &VolumeAnchor, format: &str) -> (Option<u64>, Option<u64>
     (minimum.filter(|_| trim), minimum, trim)
 }
 
-fn group_head_views(view: &BucketView<'_>, heads: &mut Vec<(usize, usize)>, raw_zip: bool) -> HashMap<usize, Vec<usize>> {
+fn group_head_views(view: &BucketView<'_>, heads: &mut Vec<(usize, usize)>, raw_zip: bool,
+    locals_cache: Option<&super::structural::ZipLocalKeys<'_>>) -> HashMap<usize, Vec<usize>> {
     // Group only heads at the same logical position with compatible structure.
     let mut equivalent = HashMap::new();
     let mut aliases = HashMap::<usize, Vec<usize>>::new();
@@ -397,7 +400,7 @@ fn group_head_views(view: &BucketView<'_>, heads: &mut Vec<(usize, usize)>, raw_
                 // The split signature proves the role, the first local record
                 // separates different ZIP families at this disk coordinate.
                 let Some(at) = a.structure_offset.unwrap_or(0).checked_add(4) else { return true };
-                let Ok(Some(key)) = crate::formats::zip::relation_local_key(&a.path, a.view.as_ref(), at) else { return true };
+                let Ok(Some(key)) = super::structural::zip_local_key(a, at, locals_cache) else { return true };
                 zip_local = Some(key);
             } else if a.proven_extent_end().is_some() || !(raw_zip
                 || a.has_any(ZIP_DIRECTORY_MEMBER) || a.seven_zip_next_header.is_some()) {
@@ -501,6 +504,7 @@ pub(super) fn build(
     view: &BucketView<'_>,
     logical: Option<&str>,
     raw_zip_minimum: Option<u64>,
+    locals_cache: Option<&super::structural::ZipLocalKeys<'_>>,
 ) -> Vec<ProposalValidation> {
     let Some(first) = view.indexes.iter().position(|index| view.facts[index].exact_slot == Some(1)) else {
         return Vec::new();
@@ -523,7 +527,7 @@ pub(super) fn build(
     let mut head_position = indexes.len();
     indexes.push(heads[0].0);
     let spanned = view.spanned();
-    let aliases = group_head_views(view, &mut heads, raw_zip_minimum.is_some());
+    let aliases = group_head_views(view, &mut heads, raw_zip_minimum.is_some(), locals_cache);
     let mut output = Vec::new();
     let mut shared_facts = None;
     for (head, position) in heads {
@@ -555,14 +559,7 @@ pub(super) fn build(
                 .collect(),
             ..Default::default()
         };
-        let local = BucketView {
-            rows: view.rows,
-            indexes: &indexes,
-            facts: view.facts,
-            features: view.features,
-            format: view.format,
-            loose_numeric_allowed: true,
-        };
+        let local = BucketView::new(view.rows, &indexes, view.facts, view.features, view.format, true);
         let (canonical, tokens) = local.channels(&structural, &profile);
         let channels: Vec<_> = canonical.into_iter().chain(tokens).collect();
         let mut layouts = Layouts::default();
@@ -1070,6 +1067,7 @@ impl VolumeAttempts {
             .layouts
             .iter()
             .map(|AttemptLayout { slots: layout, minimum_slots }| {
+                let last = layout.last().map(|(number, _)| *number);
                 let slots = layout
                     .iter()
                     .map(|&(number, ref choices)| {
@@ -1082,7 +1080,7 @@ impl VolumeAttempts {
                                     Arc::new(choices.iter().map(|&i| remap[i]).filter(|i| seen.insert(*i)).collect())
                                 } else { Arc::clone(choices) };
                                 domains.push(VolumeDomain { choices: mapped });
-                                (index, zip_spanned && choices.iter().all(|&i| self.sources[i].terminal))
+                                (index, zip_spanned && choices.iter().any(|&i| self.sources[i].terminal))
                             });
                         VolumeSlot {
                             number,
@@ -1091,7 +1089,7 @@ impl VolumeAttempts {
                                 number,
                                 style,
                                 proposal.width,
-                                terminal,
+                                terminal && last == Some(number),
                             ),
                             domain,
                         }

@@ -217,8 +217,14 @@ pub(crate) struct NativeScanResult {
     #[cfg(test)]
     raw_hit_count: usize,
     pub(crate) empty_middle: Option<(PhysicalFileGeneration, std::ops::Range<u64>)>,
+    pub(crate) seven_zip_view_evidence: Option<Arc<SevenZipViewEvidence>>,
     zip_eocd_absent: bool,
     unique_zip_eocd: Option<Arc<ZipEocdSearch>>,
+}
+
+pub(crate) struct SevenZipViewEvidence {
+    pub(crate) generation: PhysicalFileGeneration,
+    pub(crate) interrupted: Vec<VolumeAnchor>,
 }
 
 pub(crate) struct RarInputResolution {
@@ -249,6 +255,19 @@ pub(crate) struct ResolvedEmbeddedScan {
 }
 
 impl NativeScanResult {
+    /// Apply evidence only to an anchor from the same logical stream and full size.
+    pub(crate) fn apply_zip_eocd_evidence(&self, anchor: &mut VolumeAnchor) {
+        if anchor.size != self.file_size || !(anchor.format.is_empty() || anchor.format == "zip") {
+            return;
+        }
+        // Signature evidence includes split EOCDs rejected by standalone validation.
+        if self.zip_eocd_absent {
+            anchor.flags |= ZIP_TAIL_CHECKED | ZIP_CARRIER_CHECKED;
+        } else if let Some(search) = &self.unique_zip_eocd {
+            anchor.zip_eocd_search = Some(Arc::clone(search));
+        }
+    }
+
     /// A physical source may contain several independent volume inputs. ZIP
     /// local records without a volume proof still nominate only one hypothesis.
     pub(crate) fn relation_anchors(&self, path: &str, view: Option<&Arc<crate::io::view::ReadView>>) -> Vec<VolumeAnchor> {
@@ -295,15 +314,7 @@ impl NativeScanResult {
                     boundaries.next();
                 }
                 anchor.carrier_limit = boundaries.peek().map(|c| c.offset);
-                // Physical signature evidence includes split EOCDs too and
-                // survives without retaining the hit index.
-                if anchor.format == "zip" {
-                    if self.zip_eocd_absent {
-                        anchor.flags |= ZIP_TAIL_CHECKED | ZIP_CARRIER_CHECKED;
-                    } else {
-                        anchor.zip_eocd_search.clone_from(&self.unique_zip_eocd);
-                    }
-                }
+                self.apply_zip_eocd_evidence(&mut anchor);
                 anchor.path = path.to_owned();
                 anchor.view = view.cloned();
                 Some(anchor)
@@ -424,8 +435,10 @@ pub(crate) fn scan_embedded_view(reader: ManagedReader, parallel_files: usize,
 ) -> io::Result<NativeScanResult> {
     if reader.read_view().is_some() {
         // A mapped view needs just one sequential buffer per producer.
+        // All chunks use that view over the same open physical generation.
+        let owned_generation = reader.physical_generation().cloned();
         return scan_embedded_archives_native_with_iocp(reader, MAX_DISCOVERY_IOCP_CHUNK_SIZE,
-            DEFAULT_IOCP_BUFFERS, 1, generation, shared_empty);
+            DEFAULT_IOCP_BUFFERS, 1, generation.or(owned_generation.as_ref()), shared_empty);
     }
     let parallel_files = parallel_files.clamp(1, 8);
     let workers = (DEFAULT_IOCP_WORKERS / parallel_files).max(1);
@@ -546,11 +559,15 @@ fn scan_embedded_archives_native_with_iocp(
             // and skip the second file handle, completion port and job queue.
             if file_size <= chunk_bytes as u64 {
                 let data = reader.read_direct_at(0, file_size as usize)?;
-                if generation.is_some() && data.len() as u64 != file_size {
+                let complete = data.len() as u64 == file_size;
+                if generation.is_some() && !complete {
                     return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short embedded scan read"));
                 }
                 let (hits, _) = scan(&data, 0, 0);
-                let reuse = data.len() as u64 == file_size
+                if !complete {
+                    physical_zip_eocd.store(u64::MAX, Ordering::Relaxed);
+                }
+                let reuse = complete
                     && (generation.is_some()
                         || (hits.results.is_none() && !leading_legacy_tar.load(Ordering::Relaxed))
                         || reader.physical_generation().is_some_and(|expected| {
@@ -618,6 +635,8 @@ fn scan_embedded_archives_native_with_iocp(
                     let reusable = shared_empty.is_some() && offset != 0 && validation_end <= file_size
                         && reader.read_view().is_some_and(|v| v.unchanged(base.saturating_sub(512), validation_end));
                     if reusable && previous.start <= base && stop <= previous.end {
+                        // The identical interval already has negative signature evidence,
+                        // including raw ZIP terminal signatures.
                         reload_carry = true;
                     } else {
                         let end = carry + len;
@@ -703,6 +722,8 @@ fn scan_embedded_archives_native_with_iocp(
     // A large sibling can make a split 7z's declared length fit the carrier.
     // Retain that failed NextHeader proposal only with independent evidence
     // that another archive interrupts its declared range. No second probe.
+    let view_generation = generation.or_else(|| reader.read_view().and(reader.physical_generation()));
+    let mut interrupted = Vec::new();
     if candidates.iter().any(|c| {
         c.format == "7z"
             && c.volume_anchor.is_some()
@@ -716,16 +737,20 @@ fn scan_embedded_archives_native_with_iocp(
             .filter(|c| c.end_offset.is_some() && c.volume_anchor.is_none())
             .map(|c| c.offset)
             .collect();
-        candidates.retain(|c| {
+        candidates.retain_mut(|c| {
             let Some(anchor) = c.volume_anchor.as_ref().filter(|a| a.format == "7z") else {
                 return true;
             };
             let Some(end) = anchor.expected_logical_size.filter(|end| *end <= file_size) else {
                 return true;
             };
-            exact
+            let retained = exact
                 .get(exact.partition_point(|start| *start <= c.offset))
-                .is_some_and(|start| *start < end)
+                .is_some_and(|start| *start < end);
+            if view_generation.is_some() && !retained {
+                interrupted.push(*c.volume_anchor.take().unwrap());
+            }
+            retained
         });
     }
     resolve_logical_candidates(&mut candidates);
@@ -738,6 +763,8 @@ fn scan_embedded_archives_native_with_iocp(
                 let interval = clean_start.into_inner()..clean_end.into_inner();
                 (!interval.is_empty()).then(|| (g.clone(), interval))
             }),
+        seven_zip_view_evidence: view_generation.filter(|_| !interrupted.is_empty())
+            .map(|generation| Arc::new(SevenZipViewEvidence { generation: generation.clone(), interrupted })),
         candidates,
         #[cfg(test)]
         raw_hit_count,

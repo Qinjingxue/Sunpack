@@ -204,6 +204,7 @@ fn validation_with_owned_paths(status: ProposalStatus, paths: &[&str]) -> Propos
             companions: Vec::new(),
         },
         facts: Arc::default(),
+        head_override: None,
     }
 }
 
@@ -237,7 +238,7 @@ fn parsed_rar_head_extent_keeps_native_volume_scan_layout() {
     assert_eq!(input.mode, OpenMode::NativeVolumes);
     assert_eq!(input.parts[0].extent.start, 0);
     assert_eq!(input.parts[0].extent.end, Some(end));
-    let layout = crate::pipeline::ScanLayout::from_input(&input);
+    let layout = crate::pipeline::ScanLayout::from_input(&input, crate::pipeline::Mode::Scan);
     assert!(!layout.range);
     assert!(layout.volumes);
     std::fs::remove_file(path).unwrap();

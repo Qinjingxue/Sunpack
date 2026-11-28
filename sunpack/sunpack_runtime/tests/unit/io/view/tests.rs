@@ -14,7 +14,7 @@ fn view_policy_keeps_independent_rejections_boundaries_and_saved_depths() {
     assert!(!policy.probes().could_derive(Some(6), apate));
     assert!(!policy.probes().could_derive(Some(5), 0));
 
-    let view = ReadView { method: ViewMethod::Apate, depth: 1, physical_size: 24, spans: Vec::new() };
+    let view = ReadView { method: ViewMethod::Apate, depth: 1, physical_size: 24, spans: Vec::new(), generation: None };
     let mut bounds = MaskBoundaries::default();
     for end in [8, 5, 8] {
         bounds.record(Some(&view), end + 1);

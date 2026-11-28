@@ -22,8 +22,8 @@ namespace sunpack::sevenzip
         {
             return opened_stream(new MultiRangeInStream(input_ranges, trace, prefetch_config, probe_reads, mode));
         }
-        // Rust supplies the ordered volumes and the SFX mode. An executable
-        // extension alone says nothing about how the volumes should be read.
+        // Ordinal byte splits share one stream. A named-volume handler opens
+        // each following volume through its callback.
         if (mode == ArchiveOpenMode::NativeVolumes && part_paths.size() > 1)
         {
             return opened_stream(new MultiRangeInStream(part_paths, trace, prefetch_config));

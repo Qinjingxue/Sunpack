@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde::ser::{SerializeMap, SerializeSeq};
+use super::view::{ReadView, Span};
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::Arc;
@@ -35,30 +36,38 @@ pub(crate) struct InputExtent {
 pub(crate) enum PhysicalRanges {
     Forward(u64, Option<u64>),
     Reverse(u64, u64),
-    Mapped(Vec<crate::io::view::Span>),
+    Mapped(Vec<Span>),
 }
 
 impl PhysicalRanges {
-    fn contiguous(span: &crate::io::view::Span) -> Self {
+    fn contiguous(span: &Span) -> Self {
         if span.reverse { Self::Reverse(span.start, span.end) }
         else { Self::Forward(span.start, Some(span.end)) }
     }
 
-    pub(crate) fn new(view: Option<&crate::io::view::ReadView>, start: u64, end: Option<u64>) -> Self {
-        if end == Some(start) { return Self::Forward(start, end); }
-        if let Some(view) = view {
-            let end = end.unwrap_or_else(|| view.len());
-            if let Some(span) = end.checked_sub(start).and_then(|len| view.single_run(start, len)) {
-                return Self::contiguous(&span);
+    pub(crate) fn new(view: Option<&ReadView>, start: u64, end: Option<u64>) -> Self {
+        let Some(view) = view.filter(|_| end != Some(start)) else {
+            return Self::Forward(start, end);
+        };
+        let mut spans = Vec::new();
+        let mut pending: Option<Span> = None;
+        view.visit(start, end.unwrap_or_else(|| view.len()), |mut span| {
+            if pending.as_mut().is_some_and(|last| last.join(&span)) {
+                return Ok(());
             }
-            let spans = view.physical_runs(start, end);
-            if let [span] = spans.as_slice() {
-                return Self::contiguous(span);
+            span.normalize();
+            if let Some(finished) = pending.replace(span) {
+                spans.push(finished);
             }
-            PhysicalRanges::Mapped(spans)
-        } else {
-            PhysicalRanges::Forward(start, end)
+            Ok(())
+        }).expect("collecting ranges is infallible");
+        if let Some(last) = pending {
+            if spans.is_empty() {
+                return Self::contiguous(&last);
+            }
+            spans.push(last);
         }
+        Self::Mapped(spans)
     }
 }
 
@@ -229,12 +238,18 @@ impl ArchiveInput {
         eligible.then_some(facts.missing_volume_evidence.as_deref()).flatten()
     }
 
+    pub(crate) fn uses_named_volumes(&self) -> bool {
+        self.mode.structured() && (self.mode == OpenMode::SfxWithVolumes
+            || self.analysis.rar_native_volume || self.analysis.zip_spanned)
+    }
+
     pub(crate) fn worker_input(&self) -> WorkerInput<'_> {
         let attempts = self.volume_attempts.as_deref();
         WorkerInput {
             entry_path: &self.entry_path,
             open_mode: self.mode,
             format_hint: &self.format_hint,
+            named_volumes: self.uses_named_volumes(),
             parts: if attempts.is_some() { &[] } else { &self.parts },
             volume_attempts: attempts,
             analysis: self
@@ -466,6 +481,8 @@ pub(crate) struct WorkerInput<'a> {
     entry_path: &'a str,
     open_mode: OpenMode,
     format_hint: &'a str,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    named_volumes: bool,
     #[serde(skip_serializing_if = "slice_empty")]
     parts: &'a [InputPart],
     #[serde(skip_serializing_if = "Option::is_none")]

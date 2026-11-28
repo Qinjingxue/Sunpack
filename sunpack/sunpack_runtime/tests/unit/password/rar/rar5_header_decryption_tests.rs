@@ -17,20 +17,18 @@ pub(crate) fn hex_bytes(hex: &str) -> Vec<u8> {
 fn embedded_boundary_reopen_failure_is_local_but_cancellation_propagates() {
     let missing = crate::test_support::temp_file("rar_boundary_missing", b"");
     std::fs::remove_file(&missing).unwrap();
-    let path = missing.to_string_lossy().into_owned();
-    let rows = resolve_embedded_rar_boundaries(path.clone(), None, vec![7, 42], &[]).unwrap();
+    let rows = resolve_embedded_rar_boundaries(|| ManagedReader::open(&missing), vec![7, 42], &[]).unwrap();
     assert_eq!(rows.iter().map(|row| row.offset).collect::<Vec<_>>(), [7, 42]);
     assert!(rows.iter().all(|row| row.status == "error" && row.error.is_some()));
 
     let valid = crate::test_support::temp_file("rar_boundary_valid", &hex_bytes(SINGLE_HP_HEX));
-    let valid_path = valid.to_string_lossy().into_owned();
     let passwords = [Arc::<str>::from("secret")];
-    let rows = resolve_embedded_rar_boundaries(valid_path.clone(), None, vec![0], &passwords).unwrap();
+    let rows = resolve_embedded_rar_boundaries(|| ManagedReader::open(&valid), vec![0], &passwords).unwrap();
     assert_eq!(rows[0].status, "ok");
     let cancel = Cancellation::new();
     cancel.cancel();
-    for path in [path, valid_path] {
-        let result = cancel.run(|| resolve_embedded_rar_boundaries(path, None, vec![0], &passwords));
+    for path in [&missing, &valid] {
+        let result = cancel.run(|| resolve_embedded_rar_boundaries(|| ManagedReader::open(path), vec![0], &passwords));
         assert!(matches!(result, Err(error) if is_cancellation(&error)));
     }
     std::fs::remove_file(valid).unwrap();

@@ -91,12 +91,33 @@ pub(crate) struct ProposalValidation {
     status: ProposalStatus,
     proposal: RelationProposal,
     facts: Arc<RelationCache>,
+    // Several plans can share a bucket while choosing different slices of
+    // the same path as their first disk.
+    head_override: Option<(String, Arc<VolumeAnchor>)>,
     reason: Option<RelationFailureReason>,
     unresolved: Vec<String>,
     attempts: Option<attempts::VolumeAttempts>,
 }
 
 impl ProposalValidation {
+    fn anchor(&self, key: &str) -> Option<&VolumeAnchor> {
+        self.head_override.as_ref().filter(|(path, _)| path == key).map(|(_, a)| a)
+            .or_else(|| self.facts.anchors.get(key)).map(Arc::as_ref)
+    }
+
+    fn rar_head(&self) -> Option<&VolumeAnchor> {
+        self.proposal.head_path().filter(|_| self.proposal.format == "rar")
+            .and_then(|path| self.anchor(&path_key(path)))
+    }
+
+    fn any_anchor(&self, mut matches: impl FnMut(&VolumeAnchor) -> bool) -> bool {
+        if let Some((path, anchor)) = &self.head_override {
+            matches(anchor) || self.facts.anchors.iter().any(|(key, anchor)| key != path && matches(anchor))
+        } else {
+            self.facts.anchors.values().any(|anchor| matches(anchor))
+        }
+    }
+
     fn part_paths(&self) -> impl Iterator<Item = &str> {
         let (volumes, sources) = match &self.attempts {
             Some(plan) => (&[][..], plan.base_sources()),
@@ -183,19 +204,20 @@ impl<'a> RelationCandidateData<'a> {
                 .unwrap_or(Cow::Borrowed("")),
             NativeRelationGroup::Proposal(validation) => proposal_split_family(
                 &validation.proposal,
-                &validation.facts.anchors,
+                validation.rar_head(),
             ),
         }
     }
 }
 
 impl NativeRelationGroup {
-    pub(crate) fn proven_zip_tails(&self) -> impl Iterator<Item = &str> {
+    pub(crate) fn proven_zip_tails(&self) -> impl Iterator<Item = (&str, Option<&crate::io::view::ReadView>, Option<u64>)> {
         let plan = match self {
             Self::Proposal(v) if v.proposal.format == "zip" && v.status == ProposalStatus::Valid => v.attempts.as_ref(),
             _ => None,
         };
-        plan.into_iter().flat_map(|p| p.sources.iter().filter(|s| s.terminal).map(|s| s.path.as_str()))
+        plan.into_iter().flat_map(|p| p.sources.iter().filter(|s| s.terminal)
+            .map(|s| (s.path.as_str(), s.view.as_deref(), s.zip_eocd_offset)))
     }
 
     pub(crate) fn excluded_heads(&self) -> &[Arc<VolumeAnchor>] {
@@ -262,11 +284,7 @@ impl NativeRelationGroup {
     pub(crate) fn entry_anchor(&self) -> Option<&VolumeAnchor> {
         match self {
             Self::Ordinary(row, _) => row.anchor.as_deref(),
-            Self::Proposal(validation) => validation
-                .facts
-                .anchors
-                .get(&path_key(validation.proposal.entry_path()))
-                .map(Arc::as_ref),
+            Self::Proposal(validation) => validation.anchor(&path_key(validation.proposal.entry_path())),
         }
     }
 
@@ -517,6 +535,9 @@ pub(crate) fn collect_relation_cache<'a>(
                 }
             }
             NativeRelationGroup::Proposal(validation) => {
+                if let Some((path, anchor)) = &validation.head_override {
+                    cache.anchors.entry(path.clone()).or_insert_with(|| anchor.clone());
+                }
                 if !seen.insert(Arc::as_ptr(&validation.facts)) {
                     continue;
                 }
@@ -752,7 +773,7 @@ fn resolve_shared_carrier_volumes(
                     .filter(|(_, slot)| *slot == 1 || !has_head && *slot == 0)
                     .any(|(path, _)| {
                         let key = path_key(path);
-                        validation.facts.anchors.get(&key).is_some_and(|head|
+                        validation.anchor(&key).is_some_and(|head|
                             by_path.get(&key).is_some_and(|anchors| anchors.iter().any(|anchor|
                                 anchor.format == validation.proposal.format
                                     && anchor.view == head.view && (anchor.structure_offset == head.structure_offset
@@ -764,7 +785,7 @@ fn resolve_shared_carrier_volumes(
                 }
                 let mapping: Vec<_> = validation.proposal.volumes.iter().map(|part| {
                     let key = path_key(&part.0);
-                    let anchor = validation.facts.anchors.get(&key);
+                    let anchor = validation.anchor(&key);
                     (key, part.1, anchor.and_then(|a| a.structure_offset),
                         anchor.and_then(|a| a.payload_end), anchor.and_then(|a| a.view.clone()))
                 }).collect();
@@ -787,7 +808,7 @@ fn resolve_shared_carrier_volumes(
         let zip = has_weak_zip && validation.proposal.format == "zip";
         for (path, number) in &validation.proposal.volumes {
             let key = path_key(path);
-            if let Some(a) = validation.facts.anchors.get(&key) {
+            if let Some(a) = validation.anchor(&key) {
                 if zip && validation.attempts.is_none() && (*number == 1 || a.has_any(TERMINAL)) {
                     zip_disks.entry(key.clone()).or_default().insert((a.view.clone(), a.structure_offset.unwrap_or(0), a.extent_end()));
                 }
@@ -872,6 +893,7 @@ fn resolve_shared_carrier_volumes(
                 anchors: HashMap::from([(path_key(&path), anchor)]),
                 ..Default::default()
             }),
+            head_override: None,
             reason: Some(if needs_password {
                 RelationFailureReason::NeedsPassword
             } else {
@@ -1093,7 +1115,6 @@ pub(crate) fn promote_sfx_archive_anchor(
     if anchor.format != format || !anchor.strong {
         return None;
     }
-    anchor.view.clone_from(&facts.view);
     anchor.pe_state = PeState::Confirmed;
     anchor.pe_image_end = Some(image_end);
     anchor.sfx = true;
@@ -1153,12 +1174,10 @@ fn project_proposal(
     input: &mut ArchiveInput,
 ) -> Option<&'static str> {
     let proposal = &validation.proposal;
-    let anchors = &validation.facts.anchors;
-    let style = proposal_split_family(proposal, anchors);
+    let head = validation.rar_head();
+    let style = proposal_split_family(proposal, head);
     input.analysis.zip_spanned = style == "zip_spanned";
-    input.analysis.rar_native_volume = proposal.format == "rar" && proposal.head_path()
-        .and_then(|path| anchors.get(&path_key(path)))
-        .is_some_and(|head| head.has_any(RAR_OLD_NUMBERING | RAR_PART_NUMBERING));
+    input.analysis.rar_native_volume = head.is_some_and(|head| head.has_any(RAR_OLD_NUMBERING | RAR_PART_NUMBERING));
     input.mode = if style == "rar_sfx_part" {
         OpenMode::SfxWithVolumes
     } else {
@@ -1179,7 +1198,7 @@ fn project_proposal(
         .volumes
         .iter()
         .map(|(path, number)| {
-            let anchor = anchors.get(&path_key(path));
+            let anchor = validation.anchor(&path_key(path));
             let terminal = proposal.style == "zip_spanned"
                 && anchor.is_some_and(|anchor| anchor.has_any(TERMINAL));
             InputPart {
@@ -1209,7 +1228,7 @@ fn project_proposal(
     if proposal.format == "zip" && input.volume_attempts.is_none() {
         let mut logical_start = 0u64;
         for (path, _) in &proposal.volumes {
-            let Some(anchor) = anchors.get(&path_key(path)) else {
+            let Some(anchor) = validation.anchor(&path_key(path)) else {
                 break;
             };
             let start = anchor.structure_offset.unwrap_or(0);
@@ -1224,9 +1243,7 @@ fn project_proposal(
         }
     }
     let incomplete = missing_disks || validation.status == ProposalStatus::Inconclusive
-        || anchors
-            .values()
-            .any(|anchor| anchor.has_any(UNRESOLVED_VOLUME));
+        || validation.any_anchor(|anchor| anchor.has_any(UNRESOLVED_VOLUME));
     input.analysis.volume_completeness = Some(
         if missing_disks {
             VolumeCompleteness::Missing
@@ -1241,7 +1258,7 @@ fn project_proposal(
     let reason = match validation.status {
         _ if missing_disks => Some("missing_volume"),
         ProposalStatus::Valid => None,
-        ProposalStatus::NeedsPassword => Some(if anchors.values().any(|a| a.wrong_password) {
+        ProposalStatus::NeedsPassword => Some(if validation.any_anchor(|a| a.wrong_password) {
             "wrong_password"
         } else { RelationFailureReason::NeedsPassword.as_str() }),
         ProposalStatus::Inconclusive => validation.reason.map(RelationFailureReason::as_str),
@@ -1316,13 +1333,10 @@ fn canonical_volume_name(
 /// `x.rar`/`x.r00`, and `x.rar`/`x.r00` files of a new-numbering set as parts.
 fn proposal_split_family(
     proposal: &RelationProposal,
-    anchors: &HashMap<String, Arc<VolumeAnchor>>,
+    head: Option<&VolumeAnchor>,
 ) -> Cow<'static, str> {
     let style = proposal.style;
     if proposal.format == "rar" && style != "rar_sfx_part" {
-        let head = proposal
-            .head_path()
-            .and_then(|path| anchors.get(&path_key(path)));
         let old_naming = head.is_some_and(|anchor| anchor.has_any(RAR_OLD_NUMBERING));
         let new_naming = head.is_some_and(|anchor| anchor.has_any(RAR_PART_NUMBERING));
         if old_naming && style != "rar_oldstyle" {

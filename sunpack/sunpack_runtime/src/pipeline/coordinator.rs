@@ -457,9 +457,11 @@ type RecoveryAnchor = (String, u64, Option<Arc<crate::io::view::ReadView>>);
 type RecoveryAnchorIndex = HashMap<String, HashMap<RecoveryAnchor, Vec<(Arc<str>, usize)>>>;
 type SourceGenerations = HashMap<String, PhysicalFileGeneration>;
 type WatchGenerations = BTreeMap<String, PhysicalFileGeneration>;
+type WatchBatchGenerations = (Arc<WatchGenerations>, Arc<[u128]>);
+type WatchTaskGenerations = (Arc<WatchGenerations>, Option<u128>);
 
 enum TaskAdmission {
-    Execute(Option<SourceGenerations>),
+    Execute(Option<(SourceGenerations, u128)>),
     Departed,
     Completed(PathBuf),
 }
@@ -1311,8 +1313,8 @@ impl<'run, O: Observer> Run<'run, O> {
         }
         let requested = self.watch_generations(&discovered);
         let mut watch = None;
-        if let Some(members) = &requested {
-            match self.engine.leases.claim_watch(self.output_names.owner, members, &self.request) {
+        if let Some((members, layouts)) = &requested {
+            match self.engine.leases.claim_watch(self.output_names.owner, members, layouts, &self.request) {
                 WatchFamily::Owner(owner) => watch = Some(owner),
                 WatchFamily::Follower(key, owner, completion) => {
                     self.observer.coalesced();
@@ -1335,7 +1337,7 @@ impl<'run, O: Observer> Run<'run, O> {
         result
     }
 
-    fn watch_generations(&self, discovered: &Discovered) -> Option<Arc<WatchGenerations>> {
+    fn watch_generations(&self, discovered: &Discovered) -> Option<WatchBatchGenerations> {
         if self.request.origin != Origin::Watch || self.request.mode != Mode::Extract
             || !self.request.checkpoints.is_empty() || !self.request.generated_sources.is_empty()
             || !discovered.errors.is_empty() || !discovered.scan_errors.is_empty()
@@ -1351,7 +1353,9 @@ impl<'run, O: Observer> Run<'run, O> {
                 entry.insert(capture_file_generation(Path::new(path)).ok()?);
             }
         }
-        Some(Arc::new(members))
+        let object = |key: &str| members.get(key).and_then(PhysicalFileGeneration::object_id);
+        let layouts = discovered.tasks.iter().map(|task| completed_source_layout(task, object)).collect();
+        Some((Arc::new(members), layouts))
     }
 
     async fn finish(&self, mut executed: io::Result<Outcome>) -> io::Result<Outcome> {
@@ -1443,16 +1447,16 @@ impl<'run, O: Observer> Run<'run, O> {
         inherited_scope: Option<Arc<RecursiveScope>>,
         parent_id: Option<TaskId>,
         spawner: Spawner<'run>,
-        requested: Option<Arc<WatchGenerations>>,
+        requested: Option<WatchBatchGenerations>,
     ) -> io::Result<Outcome> {
         // Blocked paths are only used while projecting discovery candidates.
         drop(batch.blocked_paths);
         let request_entry = depth == self.request.start_depth;
         // Scan has no request claim to reveal aliases. Reuse the resolved
         // paths from deduplication for read leases in both modes.
-        let resolved_paths = if request_entry && batch.tasks.len() > 1
-            && (self.resolve_aliases || (self.request.mode == Mode::Scan && self.request.inputs.len() > 1))
-        {
+        let dedup_aliases = request_entry && batch.tasks.len() > 1
+            && (self.resolve_aliases || (self.request.mode == Mode::Scan && self.request.inputs.len() > 1));
+        let resolved_paths = if dedup_aliases {
             dedup_resolved_plans(&mut batch.tasks)
         } else {
             HashMap::new()
@@ -1501,13 +1505,14 @@ impl<'run, O: Observer> Run<'run, O> {
             batch.tasks.iter().map(|task| CleanupOwner::new(&self.cleanup_refs, &task.owned_paths))
                 .collect::<Vec<_>>().into_iter()
         });
-        let tasks = batch.tasks.into_iter().map(move |task| {
+        let tasks = batch.tasks.into_iter().enumerate().map(move |(index, task)| {
             let sources = sources.as_mut().and_then(Iterator::next);
-            (task, sources)
+            (index, task, sources)
         });
-        let executed = spawner.bounded_map(tasks, move |(task, sources)| {
+        let executed = spawner.bounded_map(tasks, move |(index, task, sources)| {
             let keys = (!resolved_paths.is_empty()).then(|| source_lease_keys(&task, &resolved_paths));
-            let requested = requested.as_ref().filter(|_| task.owned_paths.len() > 1).cloned();
+            let requested = requested.as_ref().filter(|_| task.owned_paths.len() > 1)
+                .map(|(members, layouts)| (Arc::clone(members), (!dedup_aliases).then(|| layouts[index])));
             let root_errors = has_root_errors
                 .then(|| root_errors.lock().unwrap().remove(&task.entry().entry_path))
                 .flatten();
@@ -1717,14 +1722,14 @@ impl<'run, O: Observer> Run<'run, O> {
     }
 
     #[cfg(test)]
-    fn register_task(&self, task: Task) -> (Task, Option<CleanupOwner>, Option<HashSet<Arc<str>>>, Option<Arc<WatchGenerations>>) {
+    fn register_task(&self, task: Task) -> (Task, Option<CleanupOwner>, Option<HashSet<Arc<str>>>, Option<WatchTaskGenerations>) {
         let sources = self.cleanup_owner(&task);
         (task, sources, None, None)
     }
 
     fn execute_task(
         self: &Arc<Self>,
-        (mut task, mut sources, keys, requested): (Task, Option<CleanupOwner>, Option<HashSet<Arc<str>>>, Option<Arc<WatchGenerations>>),
+        (mut task, mut sources, keys, requested): (Task, Option<CleanupOwner>, Option<HashSet<Arc<str>>>, Option<WatchTaskGenerations>),
         task_id: TaskId,
         depth: usize,
         inherited_scope: Option<Arc<RecursiveScope>>,
@@ -1753,8 +1758,9 @@ impl<'run, O: Observer> Run<'run, O> {
                 let (mut generations, missing) = this.capture_generations(&task);
                 let (discovery_scope, retry) = task.take_context(this.request.mode == Mode::Extract);
                 let admission = this.task_admission(&task, &generations, &missing, watch_root,
-                    |path| requested.as_ref().and_then(|members| members.get(path))
-                        .or_else(|| captured.as_ref().and_then(|members| members.get(path))))?;
+                    |path| requested.as_ref().and_then(|(members, _)| members.get(path))
+                        .or_else(|| captured.as_ref().and_then(|members| members.get(path))),
+                    requested.as_ref().and_then(|(_, layout)| *layout))?;
                 drop((requested, captured));
                 let mut completed_family = match admission {
                     TaskAdmission::Execute(family) => family,
@@ -1767,6 +1773,11 @@ impl<'run, O: Observer> Run<'run, O> {
                         return Ok(ExecutedTask::Complete(outcome));
                     }
                 };
+                if this.request.config.filesystem.read_views.has_mapped_views()
+                    && admit_changed_views(&mut task, &generations)
+                {
+                    completed_family = None;
+                }
                 if watch_root && this.observer.input_admission_enabled() && !task.inputs.is_empty()
                     && task.inputs.iter().all(|input| input.failure.is_none())
                 {
@@ -1823,8 +1834,8 @@ impl<'run, O: Observer> Run<'run, O> {
                         // main scan_items still projects every original descriptor.
                         task.inputs.iter().enumerate().map(|(index, logical)| {
                             let mut result = receipt(&logical.input, task.source, depth);
-                            if this.request.mode == Mode::Scan {
-                                result.scan_layout = super::ScanLayout::from_input(&logical.input);
+                            if this.request.mode == Mode::Scan || this.watch_view_layout() {
+                                result.scan_layout = super::ScanLayout::from_input(&logical.input, this.request.mode);
                             }
                             result.password = logical.password.as_deref().map(str::to_owned);
                             result.volume_attempts = logical.input.volume_attempts.clone();
@@ -1835,7 +1846,11 @@ impl<'run, O: Observer> Run<'run, O> {
                             result
                         }).collect()
                     } else {
-                        vec![receipt(task.entry(), task.source, depth)]
+                        let mut result = receipt(task.entry(), task.source, depth);
+                        if this.watch_view_layout() {
+                            result.scan_layout = super::ScanLayout::from_input(task.entry(), this.request.mode);
+                        }
+                        vec![result]
                     };
                     let discovery_scope = discovery_scope.as_deref()
                         .filter(|_| this.request.mode == Mode::Extract)
@@ -2100,7 +2115,7 @@ impl<'run, O: Observer> Run<'run, O> {
                                 let (current_generations, missing) = this.capture_generations(&replacement);
                                 generations = current_generations;
                                 let admission = this.task_admission(&replacement, &generations, &missing, watch_root,
-                                    |path| requested.as_ref().and_then(|members| members.get(path)))?;
+                                    |path| requested.as_ref().and_then(|members| members.get(path)), None)?;
                                 drop(requested);
                                 completed_family = match admission {
                                     TaskAdmission::Execute(family) => family,
@@ -2113,6 +2128,11 @@ impl<'run, O: Observer> Run<'run, O> {
                                         return Ok(ExecutedTask::Complete(outcome));
                                     }
                                 };
+                                if this.request.config.filesystem.read_views.has_mapped_views()
+                                    && admit_changed_views(&mut replacement, &generations)
+                                {
+                                    completed_family = None;
+                                }
                                 this.admit_missing_inputs(&mut replacement, &missing);
                                 this.observer.claim_sources(Path::new(&replacement.entry().entry_path),
                                     &replacement.owned_paths, dispatch_depth,
@@ -2158,8 +2178,10 @@ impl<'run, O: Observer> Run<'run, O> {
                         inventory,
                         mut input,
                     } = executed;
+                    if this.request.mode == Mode::Scan || this.watch_view_layout() {
+                        result.scan_layout = super::ScanLayout::from_input(&input, this.request.mode);
+                    }
                     if this.request.mode == Mode::Scan {
-                        result.scan_layout = super::ScanLayout::from_input(&input);
                         result.volume_attempts = Arc::make_mut(&mut input).volume_attempts.take();
                         if result
                             .failure
@@ -2230,6 +2252,9 @@ impl<'run, O: Observer> Run<'run, O> {
                     };
                     let replacement_result = replacement_retained.map(|checkpoint| {
                         let mut retained = checkpoint.result(depth);
+                        if this.request.mode == Mode::Scan || this.watch_view_layout() {
+                            retained.scan_layout = super::ScanLayout::from_input(checkpoint.input(), this.request.mode);
+                        }
                         // First-attempt history precedes the replacement and its children.
                         outcome.checkpoints.push(checkpoint);
                         // These are two logical input IDs of the same replanned carrier,
@@ -2539,10 +2564,11 @@ impl<'run, O: Observer> Run<'run, O> {
                         && !cancel.cancelled();
                     let mut root_cleanup = None;
                     if let Some(sources) = sources.as_mut().filter(|_| sources_complete) {
-                        if let Some(family) = completed_family {
+                        if let Some((family, layout)) = completed_family {
                             stage("output_state", &Cancellation::default()).await?;
-                            this.observer.sources_processed(family,
-                                carrier.as_deref().or_else(|| completed.iter().find_map(|result| result.output.as_deref())))?;
+                            this.observer.sources_processed(family, layout,
+                                carrier.as_deref().or_else(|| completed.iter().find_map(|result| result.output.as_deref())),
+                                this.watch_view_layout().then_some(completed.as_slice()))?;
                         }
                         let SourceCleanup { sources: actions, .. } = cleanup_plan.unwrap_or_else(|| {
                             let plan = this.plan_cleanup(sources, &physical_sources, &generations,
@@ -2715,7 +2741,8 @@ impl<'run, O: Observer> Run<'run, O> {
             return None;
         }
         let checkpoint = previous?;
-        if !checkpoint.valid_for(input, generations)
+        if changed_view_source(input, generations).is_some()
+            || !checkpoint.valid_for(input, generations)
             || !checkpoint.password_unchanged(|| candidates.signature(&input.entry_path)) {
             return None;
         }
@@ -2843,7 +2870,9 @@ impl<'run, O: Observer> Run<'run, O> {
         // from a missing generation entry or rechecked later with another stat.
         let mut generations = HashMap::new();
         let mut missing = Vec::new();
-        let retain_generations = self.request.mode == Mode::Extract || !self.generated_sources.is_empty();
+        let retain_generations = self.request.mode == Mode::Extract || !self.generated_sources.is_empty()
+            || self.request.config.filesystem.read_views.has_mapped_views()
+                && task.inputs.iter().any(|logical| logical.input.source_extents().any(|extent| extent.view.is_some()));
         for path in &task.owned_paths {
             match capture_file_generation(Path::new(path)) {
                 Ok(generation) if retain_generations => { generations.insert(path_key(path), generation); }
@@ -2886,6 +2915,10 @@ impl<'run, O: Observer> Run<'run, O> {
         (generations.len() > 1).then_some(generations)
     }
 
+    fn watch_view_layout(&self) -> bool {
+        self.request.origin == Origin::Watch && self.request.config.filesystem.read_views.has_mapped_views()
+    }
+
     fn task_admission<'a>(
         &self,
         task: &Task,
@@ -2893,6 +2926,7 @@ impl<'run, O: Observer> Run<'run, O> {
         missing: &[PathBuf],
         watch_root: bool,
         requested: impl Fn(&str) -> Option<&'a PhysicalFileGeneration>,
+        requested_layout: Option<u128>,
     ) -> io::Result<TaskAdmission> {
         // Check the resolved physical family only after its lease is acquired.
         // Departed discovery proposals are not successful output reuse.
@@ -2925,10 +2959,24 @@ impl<'run, O: Observer> Run<'run, O> {
                     }
                 }).collect::<Option<SourceGenerations>>()
             };
-            if let Some(output) = version.as_ref().map(|version| self.observer.completed_sources(version)).transpose()?.flatten() {
-                return Ok(TaskAdmission::Completed(output));
+            if let Some(version) = version {
+                // The layout digest uses object IDs. Version matching and
+                // cache lookup still use each captured input generation.
+                let layout = requested_layout.filter(|_| version.iter().all(|(key, current)| {
+                    requested(key).is_some_and(|previous| current.object_id() == previous.object_id())
+                })).unwrap_or_else(|| completed_source_layout(task, |key| version.get(key).and_then(PhysicalFileGeneration::object_id)));
+                if let Some(output) = self.observer.completed_sources(&version, layout)? {
+                    // A consumed member can only be checked against the receipt's
+                    // generation. A stale mapping can never reuse that receipt.
+                    if !self.request.config.filesystem.read_views.has_mapped_views()
+                        || task.inputs.iter().all(|logical| changed_view_source(&logical.input, &version).is_none())
+                    {
+                        return Ok(TaskAdmission::Completed(output));
+                    }
+                    return Ok(TaskAdmission::Execute(None));
+                }
+                return Ok(TaskAdmission::Execute(Some((version, layout))));
             }
-            return Ok(TaskAdmission::Execute(version));
         }
         Ok(TaskAdmission::Execute(None))
     }
@@ -3874,6 +3922,71 @@ fn recovery_anchors(input: &ArchiveInput) -> impl Iterator<Item = RecoveryAnchor
         .chain(empty.then(|| (path_key(&input.entry_path), 0, None)))
 }
 
+pub(super) fn changed_view_source<'a>(input: &'a ArchiveInput, generations: &SourceGenerations) -> Option<&'a str> {
+    input.source_extents().find_map(|extent| extent.view.as_ref()
+        .filter(|view| !view.matches_generation(generations.get(&path_key(&extent.path))))
+        .map(|_| extent.path.as_str()))
+}
+
+fn admit_changed_views(task: &mut Task, generations: &SourceGenerations) -> bool {
+    let mut changed = false;
+    for logical in &mut task.inputs {
+        if logical.failure.is_some() { continue; }
+        if let Some(path) = changed_view_source(&logical.input, generations) {
+            let message = format!("file changed after read view discovery: {path}");
+            logical.failure = Some(Failure::new(FailureKind::FilesystemError, message));
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn completed_source_layout(task: &Task, object_id: impl Fn(&str) -> Option<(u64, [u8; 16])>) -> u128 {
+    use crate::io::archive_state::InputExtent;
+    use std::hash::Hash;
+    use xxhash_rust::xxh3::Xxh3;
+
+    // Keep only the execution geometry in the short-lived completion cache.
+    // Object IDs preserve a layout across a rename or a different spelling.
+    let mut hash = Xxh3::new();
+    let member = |path: &str, hash: &mut Xxh3| {
+        let key = path_key(path);
+        let object = object_id(&key);
+        object.hash(hash);
+        if object.is_none() { key.hash(hash); }
+    };
+    let extent = |extent: &InputExtent, hash: &mut Xxh3| {
+        member(&extent.path, hash);
+        (extent.start, extent.end, &extent.view).hash(hash);
+    };
+    task.inputs.len().hash(&mut hash);
+    for logical in &task.inputs {
+        let input = &logical.input;
+        (input.mode, &input.format_hint, &input.volume_style, &input.analysis.zip_directory_id,
+            input.uses_named_volumes(), input.analysis.standalone_truncated, input.execution_evidence(),
+            logical.failure.as_ref().map(|failure| failure.kind as u8)).hash(&mut hash);
+        input.volume_attempts.is_some().hash(&mut hash);
+        if let Some(plan) = &input.volume_attempts {
+            plan.sources.len().hash(&mut hash);
+            for source in &plan.sources { extent(source, &mut hash); }
+            (&plan.domains, plan.head_size_from_total, plan.minimum_size, &plan.tail_totals).hash(&mut hash);
+            plan.layouts.len().hash(&mut hash);
+            for layout in &plan.layouts {
+                (layout.minimum_slots, layout.slots.len()).hash(&mut hash);
+                for slot in &layout.slots { (slot.number, slot.domain).hash(&mut hash); }
+            }
+        } else {
+            input.parts.len().hash(&mut hash);
+            if input.parts.is_empty() { member(&input.entry_path, &mut hash); }
+            for part in &input.parts {
+                extent(&part.extent, &mut hash);
+                (part.role, part.volume_number).hash(&mut hash);
+            }
+        }
+    }
+    hash.digest128()
+}
+
 fn output_create_failure(error: io::Error, path: &Path) -> Failure {
     let mut failure = file_failure(error);
     if let Some(context) = &mut failure.context {
@@ -4443,6 +4556,7 @@ type WatchSettlement = OnceLock<io::Result<()>>;
 struct ActiveWatchFamily {
     id: u64,
     members: Arc<WatchGenerations>,
+    layouts: Arc<[u128]>,
     request: Arc<Request>,
     settlement: Arc<WatchSettlement>,
 }
@@ -4736,10 +4850,14 @@ struct Lease {
 
 impl Leases {
     fn claim_watch(
-        self: &Arc<Self>, id: u64, members: &Arc<WatchGenerations>, request: &Arc<Request>,
+        self: &Arc<Self>, id: u64, members: &Arc<WatchGenerations>, layouts: &Arc<[u128]>, request: &Arc<Request>,
     ) -> WatchFamily {
-        // The first ordered physical path is independent of the selection
-        // and task order. Compare the full generation union in its bucket.
+        // Compare the full generation union and the decoded layouts in the
+        // bucket anchored by the first physical path.
+        let mut layouts = Arc::clone(layouts);
+        if !layouts.is_sorted() {
+            Arc::make_mut(&mut layouts).sort_unstable();
+        }
         let anchor = members.first_key_value().expect("resolved Watch family").0.as_str();
         let mut state = self.state.lock().unwrap();
         let key = state.watch.get_key_value(anchor).map_or_else(
@@ -4757,14 +4875,15 @@ impl Leases {
                     (Some(request), Some(owner)) => Arc::ptr_eq(request, owner),
                     (None, None) => true,
                     _ => false,
-                } && members == &active.members && !owner.cancel.cancelled()
+                } && layouts == active.layouts && members == &active.members && !owner.cancel.cancelled()
         });
         if let Some(active) = active {
             return WatchFamily::Follower(key, active.id, Arc::clone(&active.settlement));
         }
         let settlement = Arc::new(WatchSettlement::new());
         owners.push(ActiveWatchFamily {
-            id, members: Arc::clone(members), request: Arc::clone(request), settlement: Arc::clone(&settlement),
+            id, members: Arc::clone(members), layouts,
+            request: Arc::clone(request), settlement: Arc::clone(&settlement),
         });
         WatchFamily::Owner(WatchFamilyOwner { leases: Arc::clone(self), key, id, settlement })
     }

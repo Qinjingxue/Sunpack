@@ -1,6 +1,7 @@
 use crate::analysis_native::volume_anchor::{
     CheapAnchor, VolumeAnchor, EMBEDDED_VOLUME,
 };
+use crate::io::view::ViewProbes;
 use crate::path_keys::{case_key, path_key};
 use crate::relations::{
     build_native_candidate_groups_from_snapshot, collect_relation_cache, resolve_embedded_volumes,
@@ -13,7 +14,7 @@ use crate::scan::directory::{
 };
 use crate::scan::embedded::{
     scan_embedded_path, NativeScanResult, PreparedZipScan, RarInputResolution,
-    ResolvedEmbeddedScan,
+    ResolvedEmbeddedScan, SevenZipViewEvidence,
 };
 use crate::scan::pe_overlay::{inspect_pe_image_native, PeProbe, PeState};
 use rayon::prelude::*;
@@ -81,6 +82,7 @@ impl Candidate {
 #[derive(Default)]
 pub(crate) struct NativeCandidateTable {
     pub(crate) empty_middles: HashMap<String, (crate::io::reader::PhysicalFileGeneration, std::ops::Range<u64>)>,
+    pub(crate) seven_zip_view_evidence: HashMap<String, Arc<SevenZipViewEvidence>>,
     pub(crate) plain_volume_anchors: HashMap<String, Vec<Arc<VolumeAnchor>>>,
     // Only supplemental physical rows, and only while a mixed-view scope is pending.
     // None records a completed scan with no independent sibling to project.
@@ -101,6 +103,7 @@ pub(crate) struct ReadScope {
     pub raw: NativeDirectorySnapshot,
     pub selected: NativeDirectorySnapshot,
     pub aliases: Option<Box<SplitAliases>>,
+    pub probes: ViewProbes,
 }
 
 pub(crate) struct SplitAliases {
@@ -109,7 +112,8 @@ pub(crate) struct SplitAliases {
 }
 
 impl ReadScope {
-    pub(crate) fn new(root: &str, raw: &NativeDirectorySnapshot, filtered: &NativeDirectorySnapshot, targets: Option<&FileTargets>) -> Self {
+    pub(crate) fn new(root: &str, raw: &NativeDirectorySnapshot, filtered: &NativeDirectorySnapshot,
+        targets: Option<&FileTargets>, probes: ViewProbes) -> Self {
         let mut aliases = None;
         let selected = match targets {
             None => filtered.clone(),
@@ -133,7 +137,7 @@ impl ReadScope {
                 filtered.view(rows)
             }
         };
-        Self { root: root.into(), raw: raw.clone(), selected, aliases }
+        Self { root: root.into(), raw: raw.clone(), selected, aliases, probes }
     }
 }
 
@@ -396,6 +400,9 @@ impl NativeEmbeddedBatch {
                         if let Some(proof) = &scan.empty_middle {
                             table.empty_middles.insert(key.clone(), proof.clone());
                         }
+                        if let Some(proof) = &scan.seven_zip_view_evidence {
+                            table.seven_zip_view_evidence.insert(path.to_owned(), Arc::clone(proof));
+                        }
                     }
                     if !table.read_scopes.is_empty() && self.supplemental.contains(&index) {
                         table.plain_peer_scans.insert(key.clone(),
@@ -492,9 +499,14 @@ fn scan_embedded_jobs(
                         };
                         let (table, batch) = groups[group];
                         let (path, pe) = table.rows[index].embedded_source();
-                        let retention = if table.read_scopes.is_empty() { ScanRetention::Archives }
-                            else if batch.supplemental.contains(&index) { ScanRetention::Peer }
-                            else { ScanRetention::ViewEvidence };
+                        let retention = match table.read_scopes.first() {
+                            None => ScanRetention::Archives,
+                            Some(_) if batch.supplemental.contains(&index) => ScanRetention::Peer,
+                            Some(scope) => match &table.rows[index] {
+                                Candidate::File(facts, row) if !facts.could_derive_view(*row, scope.probes) => ScanRetention::Archives,
+                                _ => ScanRetention::ViewEvidence,
+                            },
+                        };
                         let outcome = scan_embedded_candidate(
                             path, batch.force_scan, pe, parallel_files, table.prepared_zip_scan.as_ref(),
                             retention,
@@ -803,8 +815,7 @@ impl NativeEmbeddedBatch {
                 .into_par_iter()
                 .map(|(anchor, values)| {
                     cancellation.run(|| -> io::Result<_> {
-                        let reader =
-                            crate::io::reader::ManagedReader::open(&anchor.path)?.probe_reader();
+                        let reader = anchor.open()?.probe_reader();
                         let (resolved, index) =
                             resolve_encrypted_relation_anchor(anchor, &reader, values, true, None)?;
                         if let Some(current) = Arc::get_mut(anchor) {
@@ -1241,6 +1252,9 @@ impl NativeCandidateTable {
                 routes.relations.push((index, false));
             } else if data.relation_confirmed && crate::formats::supports_volume_relations(data.format_hint) {
                 routes.relations.push((index, true));
+                if group.entry_anchor().is_some_and(super::root::RootRoute::zip_directory_belongs_to_later_archive) {
+                    routes.embedded.push(index);
+                }
             } else if super::root::RootRoute::from_facts(group.entry_anchor(), None) != super::root::RootRoute::PeImage {
                 relation_residual.push(index);
             }
@@ -1524,7 +1538,7 @@ fn scan_embedded_candidate(
     }
     let keep_scan = |scan: &NativeScanResult| scan.has_candidates() || match retention {
         ScanRetention::Archives => false,
-        ScanRetention::ViewEvidence => scan.empty_middle.is_some(),
+        ScanRetention::ViewEvidence => scan.empty_middle.is_some() || scan.seven_zip_view_evidence.is_some(),
         ScanRetention::Peer => true,
     };
     if let Some(scan) = prepared_zip_scan.and_then(|prepared| prepared.reuse(path)) {

@@ -1237,9 +1237,35 @@ impl CompletedMember {
     }
 }
 
-type CompletedFamilyKey = (Arc<[CompletedMember]>, bool);
+type CompletedFamilyKey = (Arc<[CompletedMember]>, bool, u128);
 type CompletedGenerations = Arc<[(Arc<str>, PhysicalFileGeneration)]>;
-type CompletedReceipt = (CompletedGenerations, Arc<Path>);
+type CompletedReceipt = (CompletedGenerations, Arc<Path>, Option<Arc<[CompletedHead]>>);
+
+struct CompletedHead {
+    member: CompletedMember,
+    format: String,
+    start: u64,
+    end: Option<u64>,
+    view: Option<crate::io::archive_state::ViewReport>,
+    directory: Option<Arc<str>>,
+}
+
+impl CompletedHead {
+    fn new(member: CompletedMember, archive: &ArchiveResult) -> Self {
+        Self {
+            member, format: archive.format.clone(), start: archive.offset,
+            end: archive.end_offset.filter(|_| archive.scan_layout.distinguish_end),
+            view: archive.scan_layout.head_view, directory: archive.scan_layout.zip_directory_id.clone(),
+        }
+    }
+
+    fn covers(&self, member: &CompletedMember, archive: &ArchiveResult) -> bool {
+        &self.member == member && self.format == archive.format && self.start == archive.offset
+            && self.view == archive.scan_layout.head_view
+            && self.end == archive.end_offset.filter(|_| archive.scan_layout.distinguish_end)
+            && archive.scan_layout.zip_directory_id.as_ref().is_none_or(|id| self.directory.as_ref() == Some(id))
+    }
+}
 
 #[derive(Default)]
 struct CompletedFamilies(Mutex<CompletedFamilyCache>);
@@ -1267,9 +1293,10 @@ impl CompletedFamilyCache {
         }
     }
 
-    fn insert(&mut self, family: CompletedFamilyKey, (generations, output): CompletedReceipt) {
-        if let Some((previous, saved_output)) = self.receipts.get_mut(&family) {
+    fn insert(&mut self, family: CompletedFamilyKey, (generations, output, heads): CompletedReceipt) {
+        if let Some((previous, saved_output, saved_heads)) = self.receipts.get_mut(&family) {
             *saved_output = output;
+            *saved_heads = heads;
             let previous = std::mem::replace(previous, Arc::clone(&generations));
             if previous.iter().map(|(path, _)| path).ne(generations.iter().map(|(path, _)| path)) {
                 self.unindex(&family, &previous);
@@ -1277,7 +1304,7 @@ impl CompletedFamilyCache {
             }
         } else {
             self.index(&family, &generations);
-            if let Some((evicted, (generations, _))) = self.receipts.insert(family, (generations, output), COMPLETED_FAMILY_LIMIT) {
+            if let Some((evicted, (generations, _, _))) = self.receipts.insert(family, (generations, output, heads), COMPLETED_FAMILY_LIMIT) {
                 self.unindex(&evicted, &generations);
             }
         }
@@ -1286,11 +1313,11 @@ impl CompletedFamilyCache {
 
     fn validate_output(&mut self, family: &CompletedFamilyKey, output: &Arc<Path>, live: bool) -> bool {
         // An old probe cannot refresh or remove a replacement receipt.
-        if !self.receipts.peek_mut(family).is_some_and(|(_, current)| Arc::ptr_eq(output, current)) {
+        if !self.receipts.peek_mut(family).is_some_and(|(_, current, _)| Arc::ptr_eq(output, current)) {
             return false;
         }
         if !live {
-            let (generations, _) = self.receipts.remove(family).unwrap();
+            let (generations, _, _) = self.receipts.remove(family).unwrap();
             self.unindex(family, &generations);
             crate::collections::trim_map(&mut self.members);
         }
@@ -1299,19 +1326,25 @@ impl CompletedFamilyCache {
 }
 
 impl CompletedFamilies {
-    fn remember(&self, generations: SourceGenerations, deep: bool, output: &Path) {
+    fn remember(&self, generations: SourceGenerations, deep: bool, layout: u128, output: &Path,
+        archives: Option<&[ArchiveResult]>) {
         if generations.is_empty() { return; }
+        let heads = archives.map(|archives| archives.iter().filter_map(|archive| {
+            let path = key(&archive.path);
+            let member = CompletedMember::new(&path, generations.get(&path)?);
+            Some(CompletedHead::new(member, archive))
+        }).collect());
         let mut ordered: Vec<_> = generations.into_iter().map(|(path, generation)|
             (CompletedMember::new(&path, &generation), (Arc::<str>::from(path), generation))).collect();
         ordered.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         let (members, generations): (Vec<_>, Vec<_>) = ordered.into_iter().unzip();
-        let family = (Arc::from(members), deep);
+        let family = (Arc::from(members), deep, layout);
         let generations = Arc::from(generations);
         let output = Arc::from(output);
-        self.0.lock().unwrap().insert(family, (generations, output));
+        self.0.lock().unwrap().insert(family, (generations, output, heads));
     }
 
-    fn output(&self, generations: &SourceGenerations, deep: bool) -> Option<PathBuf> {
+    fn output(&self, generations: &SourceGenerations, deep: bool, layout: u128) -> Option<PathBuf> {
         // Rename changes a spelling, not an already extracted physical member.
         // Keep the full family and content-generation checks, without another
         // metadata pass or a search through all cached families.
@@ -1319,10 +1352,10 @@ impl CompletedFamilies {
             (CompletedMember::new(path, generation), (path, generation))).collect();
         current.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         let (members, current): (Vec<_>, Vec<_>) = current.into_iter().unzip();
-        let family = (Arc::from(members), deep);
+        let family = (Arc::from(members), deep, layout);
         let output = {
             let mut cache = self.0.lock().unwrap();
-            let (previous, output) = cache.receipts.peek_mut(&family)?;
+            let (previous, output, _) = cache.receipts.peek_mut(&family)?;
             if !current.iter().zip(previous.iter()).all(|((_, current), (_, previous))|
                 current.matches_input(previous)) {
                 return None;
@@ -1332,7 +1365,7 @@ impl CompletedFamilies {
         let live = output.is_dir();
         let mut cache = self.0.lock().unwrap();
         if !cache.validate_output(&family, &output, live) { return None; }
-        let (previous, _) = cache.receipts.peek_mut(&family).unwrap();
+        let (previous, _, heads) = cache.receipts.peek_mut(&family).unwrap();
         if current.iter().zip(previous.iter()).any(|((path, _), (stored, _))| stored.as_ref() != path.as_str()) {
             // Keep the validated versions and publish the live names for late
             // completion checks, retaining allocations for unchanged names.
@@ -1340,24 +1373,34 @@ impl CompletedFamilies {
                 let path = if stored.as_ref() == path.as_str() { Arc::clone(stored) } else { Arc::from(path.as_str()) };
                 (path, generation.clone())
             }).collect::<CompletedGenerations>();
-            cache.insert(family, (renamed, Arc::clone(&output)));
+            let heads = heads.clone();
+            cache.insert(family, (renamed, Arc::clone(&output), heads));
         } else {
             cache.receipts.get(&family);
         }
         Some(output.to_path_buf())
     }
 
-    fn covers(&self, path: &Path, deep: bool) -> bool {
+    fn covers(&self, path: &Path, deep: bool, failure: Option<&ArchiveResult>) -> bool {
         let path = key(path);
+        let failure_path = failure.map(|archive| key(&archive.path));
         let candidates: Vec<_> = {
             let mut cache = self.0.lock().unwrap();
             let CompletedFamilyCache { receipts, members } = &mut *cache;
             let Some(families) = members.get(path.as_str()) else { return false; };
-            families.iter().filter(|family| family.1 == deep)
-                .map(|family| (family.clone(), receipts.peek_mut(family).expect("indexed receipt").clone()))
-                .collect()
+            families.iter().filter(|family| family.1 == deep).filter_map(|family| {
+                let (generations, output, heads) = receipts.peek_mut(family).expect("indexed receipt");
+                let covered = heads.as_ref().map_or_else(
+                    || failure.is_none_or(|archive| !archive.scan_layout.observed),
+                    |heads| failure.zip(failure_path.as_deref()).is_some_and(|(archive, path)| {
+                        generations.iter().zip(family.0.iter()).find(|((stored, _), _)| stored.as_ref() == path)
+                            .is_some_and(|(_, member)| heads.iter().any(|head| head.covers(member, archive)))
+                    }),
+                );
+                covered.then(|| (family.clone(), Arc::clone(generations), Arc::clone(output)))
+            }).collect()
         };
-        for (family, (generations, output)) in candidates {
+        for (family, generations, output) in candidates {
             // Require the entire current family, not only the old request's head.
             if !generations.iter().all(|(member, previous)| {
                 crate::io::reader::capture_file_generation(Path::new(member.as_ref()))
@@ -1366,7 +1409,7 @@ impl CompletedFamilies {
             let live = output.is_dir();
             let mut cache = self.0.lock().unwrap();
             if cache.validate_output(&family, &output, live)
-                && cache.receipts.peek_mut(&family).is_some_and(|(current, _)| Arc::ptr_eq(current, &generations)) {
+                && cache.receipts.peek_mut(&family).is_some_and(|(current, _, _)| Arc::ptr_eq(current, &generations)) {
                 cache.receipts.get(&family);
                 return true;
             }
@@ -2544,7 +2587,7 @@ impl Scheduler {
         let hub = Arc::clone(&self.hub);
         job.handle = Some(self.engine.submit_discovery(request, move |owner, inputs| {
             if inputs.iter().flat_map(|input| input.physical_paths()).any(|path| !scope.contains(path)) { return Ok(()); }
-            let result = dedup::consider(&index, &owner.to_string_lossy(), scope.key(), inputs, Some(generation));
+            let result = dedup::consider(&index, &owner.to_string_lossy(), scope.key(), inputs, generation, true);
             if let Err(error) = result {
                 journal.log(json!({"event":"watch_dedup_unavailable","path":owner,"error":error.to_string()}));
             }
@@ -5675,7 +5718,8 @@ impl Scheduler {
         let observer = Arc::new(WatchObserver {
             deep: root.deep,
             dedup: Arc::clone(&self.dedup),
-            dedup_enabled: self.settings.watch.deduplication != config::WatchDeduplication::None,
+            dedup_generation: (self.settings.watch.deduplication != config::WatchDeduplication::None)
+                .then(|| self.dedup.lock().unwrap().generation()),
             dedup_scope: scope.clone(),
             catalog: Arc::clone(&self.catalog),
             journal,
@@ -6208,7 +6252,8 @@ impl Scheduler {
             if self.active_paths.contains_key(&id) {
                 continue;
             }
-            if self.hub.completed_families.covers(&archive.path, active.deep) {
+            if is_only_blocked_layout(archive, by_path.get(&id).map_or(&[], Vec::as_slice))
+                && self.hub.completed_families.covers(&archive.path, active.deep, Some(archive)) {
                 operations.finish_pending(&candidate.path, None);
                 continue;
             }
@@ -6424,7 +6469,9 @@ impl Scheduler {
                 continue;
             }
             if (retryable || discovery_failure.is_some_and(|failure| failure.kind == FailureKind::MissingVolume || failure.is_password_retry()))
-                && self.hub.completed_families.covers(Path::new(&canonical), active.deep) {
+                && (failed_archive.is_some() || !self.settings.filesystem.read_views.has_mapped_views())
+                && failed_archive.is_none_or(|archive| is_only_blocked_layout(archive, archives.map_or(&[], Vec::as_slice)))
+                && self.hub.completed_families.covers(Path::new(&canonical), active.deep, failed_archive) {
                 operations.finish_pending(&candidate.path, None);
                 continue;
             }
@@ -6807,9 +6854,16 @@ fn watch_retryable(input: &InputFailure<'_>, multipart: bool) -> bool {
 }
 
 fn nested_retry(archive: &ArchiveResult, failures: &HashMap<String, InputFailure<'_>>) -> bool {
-    archive.depth > 1 && !archive.partial && failures
+    archive.depth > 1 && !archive.partial && archive.failure.is_some() && failures
         .get(&crate::path_keys::path_key(&archive.path.to_string_lossy()))
         .is_some_and(|input| watch_retryable(input, archive.source_paths.len() > 1))
+}
+
+fn is_only_blocked_layout(archive: &ArchiveResult, related: &[&ArchiveResult]) -> bool {
+    // A matching view receipt can retire one failure. The physical Watch entry
+    // must survive if it still owns another failed logical archive.
+    !archive.scan_layout.observed || related.iter().copied().all(|other|
+        std::ptr::eq(archive, other) || other.partial || other.failure.is_none())
 }
 
 // Completion and persisted retry admission share the Watch boundary. Keep
@@ -7228,7 +7282,7 @@ impl ObservedOutputs {
 
 struct WatchObserver {
     deep: bool,
-    dedup_enabled: bool,
+    dedup_generation: Option<u64>,
     dedup: Arc<Mutex<dedup::Index>>,
     dedup_scope: NativeDiscoveryScope,
     catalog: Arc<NativeWatchCatalog>,
@@ -7277,9 +7331,10 @@ impl WatchObserver {
 impl Observer for WatchObserver {
     const PUBLISHES_ROOTS: bool = true;
 
-    fn input_admission_enabled(&self) -> bool { self.dedup_enabled }
+    fn input_admission_enabled(&self) -> bool { self.dedup_generation.is_some() }
 
     fn admit_inputs(&self, owner: &Path, inputs: &[&crate::io::archive_state::ArchiveInput], members: &[String], depth: usize) -> io::Result<bool> {
+        let Some(generation) = self.dedup_generation else { return Ok(true); };
         if depth != 1 || inputs.iter().flat_map(|input| input.physical_paths()).any(|path| !self.dedup_scope.contains(path)) {
             return Ok(true);
         }
@@ -7292,7 +7347,7 @@ impl Observer for WatchObserver {
             || self.journal.state().pending(&owner_path).is_some_and(|pending| pending.has_output_work()) {
             return Ok(true);
         }
-        let duplicate = match dedup::consider(&self.dedup, &owner_path, self.dedup_scope.key(), inputs, None) {
+        let duplicate = match dedup::consider(&self.dedup, &owner_path, self.dedup_scope.key(), inputs, generation, false) {
             Ok(duplicate) => duplicate,
             Err(error) => {
                 self.journal.log(json!({"event":"watch_dedup_unavailable","path":owner,"error":error.to_string()}));
@@ -7388,17 +7443,19 @@ impl Observer for WatchObserver {
             .then_some(receipt)
     }
 
-    fn completed_sources(&self, generations: &SourceGenerations) -> io::Result<Option<PathBuf>> {
-        Ok(self.hub.completed_families.output(generations, self.deep))
+    fn completed_sources(&self, generations: &SourceGenerations, layout: u128) -> io::Result<Option<PathBuf>> {
+        Ok(self.hub.completed_families.output(generations, self.deep, layout))
     }
 
     fn sources_processed(
         &self,
         generations: SourceGenerations,
+        layout: u128,
         output: Option<&Path>,
+        archives: Option<&[ArchiveResult]>,
     ) -> io::Result<()> {
         if let Some(output) = output {
-            self.hub.completed_families.remember(generations, self.deep, output);
+            self.hub.completed_families.remember(generations, self.deep, layout, output, archives);
         }
         Ok(())
     }

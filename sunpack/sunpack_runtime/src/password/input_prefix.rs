@@ -220,6 +220,7 @@ mod tests {
         // A second disk can use the same logical interval in a different view.
         plan.sources[2] = plan.sources[1].clone();
         plan.sources[2].view = Some(Arc::new(crate::io::view::ReadView {
+            generation: None,
             method: crate::io::view::ViewMethod::Apate, depth: 1, physical_size: 120,
             spans: vec![crate::io::view::Span { start: 10, end: 120, reverse: true }],
         }));

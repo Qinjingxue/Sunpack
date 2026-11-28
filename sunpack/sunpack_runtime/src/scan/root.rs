@@ -1,5 +1,5 @@
 //! Root discovery policy for a directory probe or an open logical byte stream.
-use crate::analysis_native::volume_anchor::{probe_volume_anchor_prefix, CheapAnchor, VolumeAnchor};
+use crate::analysis_native::volume_anchor::{probe_volume_anchor_prefix, CheapAnchor, VolumeAnchor, ZIP_LOCAL_HEADER};
 use crate::formats::StreamFormat;
 use crate::io::reader::ManagedReader;
 use super::directory::{FILE_ROUTE_DETECTION, FILE_ROUTE_RELATIONS, FILE_ROUTE_RESIDUAL};
@@ -29,12 +29,10 @@ impl ArchiveRoot {
         deep: bool,
         refine_relation: bool,
     ) -> io::Result<Self> {
-        let view = reader.read_view();
         let head = reader.read_direct_at(0, 512)?;
         let mut anchor = probe_volume_anchor_prefix(
             VolumeAnchor {
                 path: path.to_owned(),
-                view: view.cloned(),
                 ..Default::default()
             },
             reader,
@@ -65,6 +63,17 @@ impl ArchiveRoot {
 }
 
 impl RootRoute {
+    pub(crate) fn zip_directory_belongs_to_later_archive(anchor: &VolumeAnchor) -> bool {
+        // A leading local record cannot be assigned to a single-disk directory
+        // whose recorded offsets put the archive start later in this stream.
+        anchor.standalone && anchor.structure_offset == Some(0) && anchor.has_any(ZIP_LOCAL_HEADER)
+            && anchor.zip_directory.as_deref().is_some_and(|directory| {
+                directory.disk == 0 && directory.cd_disk == 0
+                    && directory.offset.checked_add(directory.size)
+                        .is_some_and(|end| end < directory.end)
+            })
+    }
+
     // A cheap directory snapshot can route a row without opening the source.
     // Only a reader with validated prefix evidence can establish a complete range.
     pub(crate) fn from_facts(anchor: Option<&VolumeAnchor>, scan: Option<&NativeScanResult>) -> Self {

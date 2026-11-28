@@ -303,6 +303,62 @@ fn delayed_read_keeps_unavailable_choices_separate_from_readable_bytes() {
 }
 
 #[test]
+fn same_size_replacement_cannot_supply_projected_volume_evidence() {
+    use super::attempts::{prepare_attempt_evidence, AttemptGeometry, DeferredReadError};
+    use crate::io::archive_state::{VolumeAttemptPlan, VolumeDomain, VolumeLayout, VolumeSlot};
+    use crate::io::view::ConfiguredViews;
+    use std::sync::Arc;
+
+    let carrier = temp_file("stamped_attempt_view", b"XAa\x01\0\0\0");
+    let head = temp_file("stamped_attempt_head", b"H");
+    let file = ManagedReader::open(&carrier).unwrap();
+    let view = ConfiguredViews::parse([Some("apate:1")].into_iter()).unwrap()
+        .derive_views(&file, &mut Default::default()).unwrap().pop().unwrap();
+    drop(file);
+    let extent = |path: &std::path::Path, start| InputExtent {
+        view: None, path: path.to_string_lossy().into_owned(), start, end: Some(start + 1),
+    };
+    let plain = extent(&carrier, 1);
+    let mapped = InputExtent { view: Some(view), ..plain.clone() };
+    let plan = VolumeAttemptPlan {
+        sources: Box::new([extent(&head, 0), plain, mapped]),
+        domains: [vec![0], vec![1, 2]].map(|choices| VolumeDomain { choices: Arc::new(choices) }).into(),
+        layouts: Box::new([VolumeLayout {
+            minimum_slots: 0,
+            slots: ["head", "tail"].into_iter().enumerate().map(|(domain, name)| VolumeSlot {
+                number: domain as u32 + 1, canonical_name: name.into(), domain,
+            }).collect(),
+        }]),
+        head_size_from_total: None,
+        minimum_size: None,
+        tail_totals: Box::default(),
+    };
+    let read_tail = || {
+        let prepared = prepare_attempt_evidence(&plan.sources[0], &plan, &[],
+            AttemptGeometry::DiskRelative, |reader| Ok(Some(reader.deferred_reads(true))),
+        ).unwrap_or_else(|_| panic!("projected volume topology"));
+        prepared[0].evaluate(|reader| reader.read_disk_offset(1, 0, 0, 1)).unwrap()
+    };
+    let original = read_tail();
+    assert_eq!(original.len(), 1);
+    assert_eq!(original[0].1.as_deref().unwrap(), b"A");
+
+    std::fs::rename(temp_file("replaced_attempt_view", b"XBb\x01\0\0\0"), &carrier).unwrap();
+    let replaced = read_tail();
+    assert_eq!(replaced.len(), 2);
+    for (projection, result) in replaced {
+        let source = projection.edges.iter().find(|edge| edge[2] != 0).unwrap()[2];
+        match (source, result) {
+            (1, Ok(bytes)) if bytes == b"B" => {}
+            (2, Err(DeferredReadError::Io(_))) => {}
+            (source, result) => panic!("unexpected evidence for source {source}: {result:?}"),
+        }
+    }
+    std::fs::remove_file(carrier).unwrap();
+    std::fs::remove_file(head).unwrap();
+}
+
+#[test]
 fn equal_volume_evidence_reuses_its_comparison_bytes() {
     use super::attempts::{count_edge_reads, prepare_attempt_evidence, AttemptGeometry};
     use crate::io::archive_state::{VolumeAttemptPlan, VolumeDomain, VolumeLayout, VolumeSlot};
@@ -349,6 +405,7 @@ fn equal_volume_evidence_reuses_its_comparison_bytes() {
     };
     // Relations kept the plain representative of this exact mapped head.
     let head = InputExtent { start: 1, end: Some(2), view: Some(Arc::new(crate::io::view::ReadView {
+        generation: None,
         method: crate::io::view::ViewMethod::Apate, depth: 1, physical_size: 3,
         spans: vec![crate::io::view::Span { start: 2, end: 3, reverse: false },
                     crate::io::view::Span { start: 0, end: 1, reverse: false }],

@@ -44,6 +44,11 @@ const RELATION_ELIGIBLE: u8 = 1 << 2;
 pub(super) const FORMAT_REJECT_TAR: u32 = 1 << 3;
 
 impl DirectorySnapshotTable {
+    pub(crate) fn could_derive_view(&self, row: usize, probes: crate::io::view::ViewProbes) -> bool {
+        !self.is_dir(row) && probes.could_derive(self.sizes[row],
+            self.relation_anchors[row].as_ref().map_or(0, CheapAnchor::reject_mask))
+    }
+
     pub(crate) fn file_route(&self, row: usize) -> u8 {
         self.routes[row] & !RELATION_ELIGIBLE
     }

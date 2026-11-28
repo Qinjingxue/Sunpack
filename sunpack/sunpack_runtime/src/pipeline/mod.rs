@@ -398,6 +398,7 @@ pub struct ArchiveResult {
 /// Extraction diagnostics keep their original completeness independently.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct ScanLayout {
+    pub(crate) observed: bool,
     pub(crate) views: Box<[crate::io::archive_state::ViewReport]>,
     pub(crate) zip_directory_id: Option<Arc<str>>,
     pub(crate) head_view: Option<crate::io::archive_state::ViewReport>,
@@ -407,18 +408,20 @@ pub(crate) struct ScanLayout {
 }
 
 impl ScanLayout {
-    pub(crate) fn from_input(input: &crate::io::archive_state::ArchiveInput) -> Self {
+    pub(crate) fn from_input(input: &crate::io::archive_state::ArchiveInput, mode: Mode) -> Self {
         use crate::io::archive_state::{AnalysisOrigin, OpenMode};
         let extent = input.physical_extents().next();
+        let scan = mode == Mode::Scan;
         Self {
-            views: input.view_tags().into(),
+            observed: true,
+            views: if scan { input.view_tags().into() } else { Box::default() },
             zip_directory_id: input.analysis.zip_directory_id.clone(),
             head_view: extent.and_then(|e| e.view.as_deref()).map(Into::into),
             distinguish_end: input.analysis.distinguish_end,
-            range: extent.is_some_and(|extent| extent.start != 0
+            range: scan && extent.is_some_and(|extent| extent.start != 0
                 || if let Some(view)=&extent.view { extent.end.is_some_and(|end|end < view.len()) }
                 else {input.mode == OpenMode::FileRange || extent.end.is_some() && input.analysis.origin == AnalysisOrigin::Embedded}),
-            volumes: !input.volume_style.is_empty() || input.mode.structured(),
+            volumes: scan && (!input.volume_style.is_empty() || input.mode.structured()),
         }
     }
 
@@ -785,6 +788,7 @@ pub(crate) trait Observer: Send + Sync {
     fn completed_sources(
         &self,
         _generations: &HashMap<String, PhysicalFileGeneration>,
+        _layout: u128,
     ) -> io::Result<Option<PathBuf>> {
         Ok(None)
     }
@@ -792,7 +796,9 @@ pub(crate) trait Observer: Send + Sync {
     fn sources_processed(
         &self,
         _generations: HashMap<String, PhysicalFileGeneration>,
+        _layout: u128,
         _output: Option<&Path>,
+        _archives: Option<&[ArchiveResult]>,
     ) -> io::Result<()> {
         Ok(())
     }

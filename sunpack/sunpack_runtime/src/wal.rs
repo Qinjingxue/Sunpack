@@ -29,8 +29,8 @@ pub(crate) fn file_header(kind: Kind) -> [u8; 16] {
     let version: u16 = match kind {
         // Task persistence includes the flatten intent and relocation payload.
         Kind::TaskWal | Kind::TaskSnapshot => 2,
-        // A single source uses an implicit zero index for all dedup extents.
-        Kind::DedupWal => 3,
+        // Dedup keeps exact source paths and the ordered logical archive boundaries.
+        Kind::DedupWal => 4,
         _ => 1,
     };
     header[4..6].copy_from_slice(&version.to_le_bytes());

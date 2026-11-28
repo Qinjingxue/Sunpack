@@ -88,6 +88,7 @@ fn recovery_volume_descriptor_preserves_style_roles_and_plan_order() {
     let mut input = ArchiveInput::file("first.zip".into(), "zip".into(), "archive".into());
     input.mode = OpenMode::NativeVolumes;
     input.volume_style = "zip_spanned".into();
+    input.analysis.zip_spanned = true;
     input.parts = Box::new([InputPart {
         role: InputRole::Terminal,
         extent: InputExtent {
@@ -120,6 +121,7 @@ fn recovery_volume_descriptor_preserves_style_roles_and_plan_order() {
     }));
     let mut decoded: ArchiveInput =
         serde_json::from_slice(&serde_json::to_vec(&input).unwrap()).unwrap();
+    assert_eq!(serde_json::to_value(decoded.worker_input()).unwrap()["named_volumes"], true);
     assert_eq!(serde_json::to_value(input.report()).unwrap(), serde_json::to_value(decoded.report()).unwrap());
     decoded
         .select_volumes(&VolumeSelection {

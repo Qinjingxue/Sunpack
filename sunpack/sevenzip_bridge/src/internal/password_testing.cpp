@@ -114,7 +114,7 @@ namespace sunpack::sevenzip
                 }
             }
             std::error_code error;
-            const auto size = std::filesystem::file_size(win32_extended_path(ranges.empty() ? path : ranges.front().path), error);
+            const auto size = input_file_size(ranges.empty() ? path : ranges.front().path, error);
             const auto start = ranges.empty() ? 0 : ranges.front().start;
             return !error && size >= start && size - start >= minimum;
         }
@@ -844,8 +844,9 @@ namespace sunpack::sevenzip
                 return result;
             }
 
-            auto *raw_open_callback = new OpenCallback(password, input.callback_path, part_paths, canonical_names,
-                InputPrefetchConfig{false}, native_job_cancel_token(), input_ranges, volumes.observer(), !final_read_only);
+            auto *raw_open_callback = new OpenCallback(password, input.handler_callback_path(format.Data4[5] == 0x01, mode),
+                part_paths, canonical_names, InputPrefetchConfig{false}, native_job_cancel_token(), input_ranges,
+                volumes.observer(), !final_read_only);
             CMyComPtr<IArchiveOpenCallback> open_callback(raw_open_callback);
 
             hr = archive->Open(input.stream.Interface(), search_limit, open_callback.Interface());

@@ -275,8 +275,12 @@ void check_open_callback_canonical_range()
 
     const std::wstring path(executable, length);
     const std::wstring name = L"archive.part2.rar";
-    const std::vector<ExtractInputRange> ranges{{path, 1, 2, true}};
-    const std::vector<std::wstring> canonical_names{name};
+    const std::wstring variable_name = L"archive.part3.rar";
+    auto view = std::make_shared<ReadView>();
+    view->physical_size = std::filesystem::file_size(path);
+    view->spans = {{0, 2, true}};
+    const std::vector<ExtractInputRange> ranges{{path, 0, 1, true, view}, {path, 1, 2, true, view}};
+    const std::vector<std::wstring> canonical_names{name, variable_name};
 
     // A one-file descriptor still permits the configured entry as a volume.
     auto *single = new OpenCallback(L"", path, {}, {}, InputPrefetchConfig{false});
@@ -296,6 +300,10 @@ void check_open_callback_canonical_range()
               "whole-file volume stream reports its I/O error to the callback");
     }
 
+    ExtractionReplay replay;
+    replay.volumes.started = true;
+    replay.variable_slots = {1};
+    ExtractionReplayScope replay_scope(&replay);
     auto *raw = new OpenCallback(
         L"", L"archive.part1.rar", {}, canonical_names, InputPrefetchConfig{false}, {},
         ranges);
@@ -303,16 +311,31 @@ void check_open_callback_canonical_range()
 
     CMyComPtr<IInStream> stream;
     const HRESULT hr = raw->GetStream(name.c_str(), &stream);
-    check(hr == S_OK && stream, "volume callback resolves a canonical name to its range");
+    check(hr == S_OK && stream, "volume callback resolves a canonical name to its mapped range");
     if (hr == S_OK && stream)
     {
         char bytes[2]{};
         UInt32 read = 0;
         check(stream->Read(bytes, sizeof(bytes), &read) == S_OK && read == 1 && bytes[0] == 'Z',
-              "volume callback reads only the configured range");
-        const auto seek_error = stream->Seek(-1, FILE_BEGIN, nullptr);
-        check(FAILED(seek_error) && raw->input_error() == seek_error,
-              "sliced volume stream reports its I/O error to the callback");
+              "volume callback restores mapped bytes within the configured logical range");
+        check(!replay.uncertain_read.load(), "fixed named slice does not inherit uncertainty from its carrier");
+        const auto seek_error = stream->Seek((std::numeric_limits<Int64>::max)(), FILE_END, nullptr);
+        UInt64 position = 0;
+        check(FAILED(seek_error) && raw->input_error() == seek_error &&
+              FAILED(stream->Seek(0, 3, nullptr)) &&
+              stream->Seek(0, FILE_CURRENT, &position) == S_OK && position == 1,
+              "invalid seeks leave the mapped position intact and report an input error");
+    }
+    CMyComPtr<IInStream> variable_stream;
+    const auto variable_hr = raw->GetStream(variable_name.c_str(), &variable_stream);
+    check(variable_hr == S_OK && variable_stream && !replay.uncertain_read.load(),
+          "opening the variable named slot does not count as reading it");
+    if (variable_hr == S_OK && variable_stream)
+    {
+        char byte = 0;
+        UInt32 read = 0;
+        check(variable_stream->Read(&byte, 1, &read) == S_OK && read == 1 && byte == 'M' &&
+              replay.uncertain_read.load(), "reading the variable named slice records its slot");
     }
 }
 
@@ -348,10 +371,17 @@ void check_open_archive_stream_ownership()
         view->spans.push_back({0, 1, true});
         std::vector<ExtractInputRange> ranges{{head, 0, 1, true}, {tail, 0, 1, true}};
         ranges.front().view = view;
-        auto mapped = open_archive_stream(head, {}, nullptr, names, InputPrefetchConfig{false},
-                                          ranges, nullptr, ArchiveOpenMode::SfxWithVolumes);
-        check(mapped.opened && mapped.stream->Read(bytes, sizeof(bytes), &read) == S_OK &&
-              read == 1 && bytes[0] == 'a', "a mapped SFX head ends before its named continuation");
+        for (const auto mode : {ArchiveOpenMode::NamedVolumes, ArchiveOpenMode::SfxWithVolumes}) {
+            VolumeReadUncertainty observed;
+            observed.uncertain_ranges = {{0, 1}, {1, 2}};
+            observed.observed = std::make_unique<std::atomic<bool>[]>(2);
+            auto mapped = open_archive_stream(head, {}, nullptr, names, InputPrefetchConfig{false},
+                                              ranges, &observed, mode);
+            check(mapped.opened && mapped.stream->Read(bytes, sizeof(bytes), &read) == S_OK &&
+                  read == 1 && bytes[0] == 'a' && mapped.stream->Read(bytes, sizeof(bytes), &read) == S_OK &&
+                  read == 0 && observed.observed[0] && !observed.observed[1],
+                  "reads through the mapped first volume do not observe its named continuation");
+        }
 
         auto stale = std::make_shared<ReadView>(*view);
         stale->physical_size = 2;
@@ -685,6 +715,51 @@ void check_prefetch_virtual_inputs()
               trace.read_hresult == missing && trace.last_source_path == second.wstring() &&
               trace.last_read_virtual_offset == boundary && trace.last_read_source_offset == 0,
               "a later valid read does not overwrite evidence of a disappeared volume");
+    }
+    {
+        ExtractInputTrace trace;
+        ExtractInputRange range;
+        range.path = first.wstring();
+        auto view = std::make_shared<ReadView>();
+        view->physical_size = 257;
+        view->spans = {{128, 257, false}, {0, 128, false}};
+        view->file_generation.emplace();
+        range.view = view;
+        auto *raw = new MultiRangeInStream({range}, &trace, {true, 64});
+        CMyComPtr<IInStream> stream(raw);
+        unsigned char bytes[8]{};
+        UInt32 read = 0;
+        const auto changed = HRESULT_FROM_WIN32(ERROR_FILE_INVALID);
+        check(raw->is_open() && stream->Read(bytes, sizeof(bytes), &read) == changed &&
+              trace.read_hresult == changed && read == 0,
+              "the real mapped read handle rejects a different generation of the same size");
+
+        OverlappedPrefetcher prefetch({true, 64}, 257, [&](UInt64 offset, PrefetchSource &source) {
+            source = PrefetchSource{&range.path, offset, 257 - offset, view.get()};
+            return true;
+        });
+        prefetch.after_read(0);
+        prefetch.after_read(64);
+        check(!prefetch.consume(64, bytes, sizeof(bytes)),
+              "prefetch does not publish bytes from a different mapped generation");
+    }
+    {
+        ExtractInputTrace trace;
+        ExtractInputRange range;
+        range.path = first.wstring();
+        auto view = std::make_shared<ReadView>();
+        view->physical_size = 257;
+        view->spans = {{128, 257, false}, {0, 128, false}};
+        range.view = view;
+        auto *raw = new MultiRangeInStream({range}, &trace, {false});
+        CMyComPtr<IInStream> stream(raw);
+        std::filesystem::resize_file(first, 131);
+        unsigned char bytes[8]{};
+        UInt32 read = 0;
+        const auto truncated = HRESULT_FROM_WIN32(ERROR_HANDLE_EOF);
+        check(raw->is_open() && stream->Read(bytes, sizeof(bytes), &read) == truncated &&
+              trace.read_hresult == truncated && read == 0,
+              "a truncated forward mapping reports an input error inside its logical extent");
     }
     std::filesystem::remove_all(root);
 }

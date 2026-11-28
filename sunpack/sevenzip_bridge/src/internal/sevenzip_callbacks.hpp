@@ -171,7 +171,7 @@ namespace sunpack::sevenzip
                         failed_volume_name_ = std::filesystem::path(path).filename().wstring();
                     return E_FAIL;
                 };
-                if (range) return finish_open(new MultiRangeInStream(*range, volume_prefetch_config_, input_error_));
+                if (range) return finish_open(new MultiRangeInStream(*range, volume_prefetch_config_, input_error_, *index));
                 return finish_open(new FileInStream(path, nullptr, volume_prefetch_config_, input_error_));
             }
             catch (const std::bad_alloc &) { return E_OUTOFMEMORY; }

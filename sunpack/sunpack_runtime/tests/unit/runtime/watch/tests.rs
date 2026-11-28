@@ -107,30 +107,44 @@ fn completed_family_requires_full_generation_mode_and_live_output() {
     let generations: SourceGenerations = [&head, &tail].into_iter().map(|path|
         (key(path), crate::io::reader::capture_file_generation(path).unwrap())).collect();
     let cache = CompletedFamilies::default();
-    cache.remember(generations.clone(), false, &output);
-    assert_eq!(cache.output(&generations, false), Some(output.clone()));
-    assert_eq!(cache.output(&generations, true), None);
+    cache.remember(generations.clone(), false, 1, &output, None);
+    assert_eq!(cache.output(&generations, false, 1), Some(output.clone()));
+    assert_eq!(cache.output(&generations, false, 2), None);
+    assert_eq!(cache.output(&generations, true, 1), None);
     let subset = HashMap::from([(key(&head), generations[&key(&head)].clone())]);
-    assert_eq!(cache.output(&subset, false), None);
-    assert!(cache.covers(&head, false));
-    assert!(cache.covers(&tail, false));
-    assert!(!cache.covers(&head, true));
+    assert_eq!(cache.output(&subset, false, 1), None);
+    assert!(cache.covers(&head, false, None));
+    assert!(cache.covers(&tail, false, None));
+    assert!(!cache.covers(&head, true, None));
+    let mut mapped = completion_archive(head.to_str().unwrap(), 1, Some(FailureKind::MissingVolume));
+    let view = crate::io::archive_state::ViewReport { method: crate::io::view::ViewMethod::Apate, depth: 1 };
+    mapped.scan_layout.observed = true;
+    mapped.scan_layout.views = Box::new([view]);
+    mapped.scan_layout.head_view = Some(view);
+    assert!(!cache.covers(&head, false, Some(&mapped)));
+    let mapped_cache = CompletedFamilies::default();
+    mapped_cache.remember(generations.clone(), false, 2, &output, Some(std::slice::from_ref(&mapped)));
+    assert!(mapped_cache.covers(&head, false, Some(&mapped)));
+    mapped.scan_layout.head_view = None;
+    mapped.scan_layout.views = Box::new([]);
+    assert!(!mapped_cache.covers(&head, false, Some(&mapped)));
+    assert!(!cache.covers(&head, false, Some(&mapped)));
     fs::rename(&tail, directory.join("away")).unwrap();
-    assert!(!cache.covers(&head, false));
+    assert!(!cache.covers(&head, false, None));
     fs::rename(directory.join("away"), &tail).unwrap();
-    assert!(cache.covers(&head, false));
+    assert!(cache.covers(&head, false, None));
     fs::write(&tail, b"changed tail generation").unwrap();
-    assert!(!cache.covers(&head, false));
+    assert!(!cache.covers(&head, false, None));
     let refreshed: SourceGenerations = [&head, &tail].into_iter().map(|path|
         (key(path), crate::io::reader::capture_file_generation(path).unwrap())).collect();
-    assert_eq!(cache.output(&refreshed, false), None);
-    cache.remember(refreshed.clone(), false, &output);
-    assert_eq!(cache.output(&refreshed, false), Some(output.clone()));
-    assert!(cache.covers(&head, false));
-    assert!(cache.covers(&tail, false));
+    assert_eq!(cache.output(&refreshed, false, 1), None);
+    cache.remember(refreshed.clone(), false, 1, &output, None);
+    assert_eq!(cache.output(&refreshed, false, 1), Some(output.clone()));
+    assert!(cache.covers(&head, false, None));
+    assert!(cache.covers(&tail, false, None));
     fs::remove_dir(&output).unwrap();
-    assert_eq!(cache.output(&refreshed, false), None);
-    assert!(!cache.covers(&head, false));
+    assert_eq!(cache.output(&refreshed, false, 1), None);
+    assert!(!cache.covers(&head, false, None));
     let stored = cache.0.lock().unwrap();
     assert_eq!(stored.receipts.len(), 0);
     assert!(stored.members.is_empty());
@@ -151,19 +165,28 @@ fn completed_family_reuses_renamed_members_but_rejects_new_objects() {
             (key(path), crate::io::reader::capture_file_generation(path).unwrap())).collect()
     };
     let cache = CompletedFamilies::default();
-    cache.remember(capture(&tail), false, &output);
+    cache.remember(capture(&tail), false, 1, &output, None);
+    let mut mapped = completion_archive(tail.to_str().unwrap(), 1, Some(FailureKind::MissingVolume));
+    let view = crate::io::archive_state::ViewReport { method: crate::io::view::ViewMethod::Apate, depth: 1 };
+    mapped.scan_layout.observed = true;
+    mapped.scan_layout.head_view = Some(view);
+    cache.remember(capture(&tail), false, 2, &output, Some(std::slice::from_ref(&mapped)));
     fs::rename(&tail, &arrived).unwrap();
     let renamed = capture(&arrived);
-    assert_eq!(cache.output(&renamed, false), Some(output.clone()));
-    assert!(cache.covers(&arrived, false));
-    assert!(cache.covers(&head, false));
-    assert!(!cache.covers(&tail, false));
-    assert_eq!(cache.output(&renamed, true), None);
+    assert_eq!(cache.output(&renamed, false, 1), Some(output.clone()));
+    assert!(cache.covers(&arrived, false, None));
+    assert!(cache.covers(&head, false, None));
+    assert!(!cache.covers(&tail, false, None));
+    assert_eq!(cache.output(&renamed, false, 2), Some(output.clone()));
+    mapped.path.clone_from(&arrived);
+    assert!(cache.covers(&arrived, false, Some(&mapped)));
+    assert_eq!(cache.output(&renamed, true, 1), None);
     // A newly created object at the same name is not a completed member,
     // even if it has the same bytes and size. Keep the old object alive.
     fs::rename(&arrived, &old).unwrap();
     fs::write(&arrived, b"tail").unwrap();
-    assert_eq!(cache.output(&capture(&arrived), false), None);
+    assert_eq!(cache.output(&capture(&arrived), false, 1), None);
+    assert!(!cache.covers(&arrived, false, Some(&mapped)));
     assert_ne!(CompletedMember::Object(1, [7; 16]), CompletedMember::Object(2, [7; 16]));
     fs::remove_file(head).unwrap();
     fs::remove_file(arrived).unwrap();
@@ -180,11 +203,11 @@ fn idle_completed_families_release_old_output_but_live_requests_reuse_it() {
     let generations: SourceGenerations = [&head, &tail].into_iter().map(|path|
         (key(path), crate::io::reader::capture_file_generation(path).unwrap())).collect();
     let hub = Hub::new();
-    hub.completed_families.remember(generations.clone(), false, &output);
-    assert_eq!(hub.completed_families.output(&generations, false), Some(output.clone()));
+    hub.completed_families.remember(generations.clone(), false, 1, &output, None);
+    assert_eq!(hub.completed_families.output(&generations, false, 1), Some(output.clone()));
     hub.clear_idle_completed_families();
     let cache = &hub.completed_families;
-    assert_eq!(cache.output(&generations, false), None);
+    assert_eq!(cache.output(&generations, false, 1), None);
     let stored = cache.0.lock().unwrap();
     assert_eq!(stored.receipts.len(), 0);
     assert!(stored.members.is_empty());
@@ -202,17 +225,17 @@ fn completed_family_cache_is_bounded_and_refreshes_lru() {
     fs::write(&head, b"head").unwrap();
     let generation = crate::io::reader::capture_file_generation(&head).unwrap();
     let cache = CompletedFamilies::default();
-    cache.remember(HashMap::from([(key(&head), generation.clone())]), false, &directory);
+    cache.remember(HashMap::from([(key(&head), generation.clone())]), false, 1, &directory, None);
     // Synthetic unrelated families exercise the LRU without thousands of
     // filesystem objects; spellings of the same object now intentionally coalesce.
     for n in 1..COMPLETED_FAMILY_LIMIT {
-        let family: CompletedFamilyKey = (Arc::from([CompletedMember::Path(format!("other-{n}"))]), false);
+        let family: CompletedFamilyKey = (Arc::from([CompletedMember::Path(format!("other-{n}"))]), false, 1);
         let generations = Arc::from([(Arc::from(format!("other-{n}")), generation.clone())]);
-        cache.0.lock().unwrap().insert(family, (generations, Arc::from(directory.as_path())));
+        cache.0.lock().unwrap().insert(family, (generations, Arc::from(directory.as_path()), None));
     }
-    assert!(cache.covers(&head, false));
-    cache.remember(HashMap::from([(key(&head), generation)]), true, &directory);
-    assert!(cache.covers(&head, false));
+    assert!(cache.covers(&head, false, None));
+    cache.remember(HashMap::from([(key(&head), generation)]), true, 1, &directory, None);
+    assert!(cache.covers(&head, false, None));
     let cache = cache.0.lock().unwrap();
     assert_eq!(cache.receipts.len(), COMPLETED_FAMILY_LIMIT);
     assert!(!cache.members.contains_key("other-1"));
@@ -1087,7 +1110,11 @@ fn retained_carrier_segments_share_blockers_without_hiding_independent_terminal_
     let mut partial = completion_archive(retained_path, 2, Some(FailureKind::MissingVolume));
     partial.partial = true;
     let terminal = completion_archive(retained_path, 2, Some(FailureKind::Damaged));
-    let blocked = completion_archive(retained_path, 2, Some(FailureKind::WrongPassword));
+    let mut blocked = completion_archive(retained_path, 2, Some(FailureKind::WrongPassword));
+    blocked.scan_layout.observed = true;
+    blocked.scan_layout.head_view = Some(crate::io::archive_state::ViewReport {
+        method: crate::io::view::ViewMethod::Apate, depth: 1,
+    });
     let mut outcome = Outcome::default();
     outcome.archives = vec![completion_archive(owner.to_str().unwrap(), 1, None), partial, terminal, blocked];
     let outputs = BTreeMap::from([
@@ -1095,6 +1122,11 @@ fn retained_carrier_segments_share_blockers_without_hiding_independent_terminal_
         (key(Path::new(r"C:\Watch\outer")), owner.to_string_lossy().into_owned()),
     ]);
     let failures = outcome.input_failures();
+    let successful_sibling = completion_archive(retained_path, 2, None);
+    let blocked = outcome.archives.last().unwrap();
+    assert!(!nested_retry(&successful_sibling, &failures));
+    assert!(is_only_blocked_layout(blocked, &[blocked, &successful_sibling, blocked]));
+    assert!(!is_only_blocked_layout(blocked, &outcome.archives.iter().collect::<Vec<_>>()));
     let carrier = &failures[&crate::path_keys::path_key(retained_path)];
     assert!(carrier.retryable());
     assert!(carrier.password.is_some() && carrier.missing.is_some());
@@ -1760,7 +1792,7 @@ fn root_handoff_preserves_alias_aggregates_and_live_shared_tail_owners() {
         members: vec![head.to_string_lossy().into_owned(), alias.to_string_lossy().into_owned()] });
     let hub = Arc::new(Hub::new());
     let mut observer = WatchObserver {
-        dedup_enabled: false,
+        dedup_generation: None,
         dedup: Arc::new(Mutex::new(dedup::Index::open(&directory, crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root, Default::default()).unwrap())),
         dedup_scope: NativeDiscoveryScope::new(directory.to_string_lossy().into_owned(), None, Vec::new()),
         deep: false,
@@ -1962,7 +1994,7 @@ fn restored_checkpoint_routes_nested_outputs_to_the_durable_owner() {
         let checkpoints = restore_checkpoints(journal.state(), owner, &mut outputs, &mut Vec::new()).unwrap();
         assert_eq!(checkpoints.len(), 1);
         let observer = WatchObserver {
-            dedup_enabled: false,
+            dedup_generation: None,
             dedup: Arc::new(Mutex::new(dedup::Index::open(&directory, crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root, Default::default()).unwrap())),
             dedup_scope: NativeDiscoveryScope::new(directory.to_string_lossy().into_owned(), None, Vec::new()),
             deep: false,

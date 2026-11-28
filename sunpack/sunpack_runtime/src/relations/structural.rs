@@ -158,6 +158,7 @@ pub(super) fn collect(
     }
     let mut rar = Vec::new();
     let mut zip = Vec::new();
+    let mut mapped = false;
     for indexes in index.rows_by_stem.values() {
         let zip_bucket = indexes.iter().any(|i| {
             rows[*i]
@@ -169,6 +170,7 @@ pub(super) fn collect(
             let Some(a) = &rows[i].anchor else {
                 continue;
             };
+            mapped |= a.view.is_some();
             if !rows[i].relation_member_eligible || a.standalone {
                 continue;
             }
@@ -210,32 +212,27 @@ pub(super) fn collect(
         remember_tail_facts(&rows[i], rows[i].anchor.as_ref().unwrap());
     }
     for indexes in index.rows_by_stem.values() {
-        let zip_bucket = indexes.iter().any(|&i| {
-            rows[i]
-                .anchor
-                .as_ref()
-                .is_some_and(|a| a.format == "zip" && !a.standalone)
-        });
-        let terminal = indexes.iter().any(|&i| {
-            rows[i]
-                .anchor
-                .as_ref()
-                .is_some_and(|a| a.format == "zip" && a.has_any(TERMINAL))
-        });
-        if zip_bucket && !terminal {
-            let candidates: Vec<_> = indexes
-                .iter()
-                .copied()
-                .filter(|&i| {
-                    rows[i].relation_member_eligible
-                        && rows[i].anchor.as_ref().is_some_and(|a| {
-                            !a.standalone
-                                && a.error.is_empty()
-                                && a.carrier_limit.is_none()
-                                && (a.format.is_empty() || a.format == "zip")
-                        })
-                })
-                .collect();
+        let anchors = || indexes.iter().filter_map(|&i| rows[i].anchor.as_deref());
+        let zip_bucket = anchors().any(|a| a.format == "zip" && !a.standalone);
+        let terminal = zip_bucket && anchors().any(|a| a.format == "zip" && a.has_any(TERMINAL));
+        let mapped_bucket = mapped && terminal && anchors().any(|a| !a.standalone && a.view.is_some());
+        if zip_bucket && (!terminal || mapped_bucket) {
+            let possible_tails = || indexes.iter().copied().filter(|&i| {
+                rows[i].relation_member_eligible
+                    && rows[i].anchor.as_ref().is_some_and(|a| {
+                        !a.standalone
+                            && a.error.is_empty()
+                            && a.carrier_limit.is_none()
+                            && !a.has_any(TERMINAL | ZIP_CARRIER_CHECKED)
+                            && (a.format.is_empty() || a.format == "zip")
+                    })
+            });
+            let known_offset = |i: usize| rows[i].anchor.as_ref().unwrap().zip_eocd_search
+                .as_ref().is_some_and(|e| e.unique_offset.is_some());
+            // Another archive's visible tail cannot rule out a buried tail.
+            let search = !terminal || possible_tails().any(|i| !known_offset(i))
+                && (missing_view_zip_tail(rows, indexes) || !zip_heads_have_directory_proof(rows, indexes));
+            let candidates: Vec<_> = possible_tails().filter(|&i| search || known_offset(i)).collect();
             if let (Some(prepared), [i], [_]) =
                 (prepared_zip_scan.as_deref_mut(), candidates.as_slice(), indexes.as_slice())
             {
@@ -299,6 +296,109 @@ pub(super) fn collect(
             }
         }
     }
+}
+
+fn missing_view_zip_tail(rows: &[RelationInput], indexes: &[usize]) -> bool {
+    let mut heads = [0usize; 2];
+    let mut tails = [0usize; 2];
+    let candidates = || indexes.iter().map(|&i| &rows[i]).filter(|row| row.relation_member_eligible);
+    for row in candidates() {
+        if let Some(directory) = zip_terminal_directory(row) {
+            tails[usize::from(directory.disk > 0)] += 1;
+        } else if let Some(kind) = row.anchor.as_deref().and_then(zip_head_kind) {
+            heads[kind] += 1;
+        }
+    }
+    let exceeds = |heads: [usize; 2], tails: [usize; 2]| {
+        heads[1] > tails[1] || heads[0] + heads[1] > tails[0] + tails[1]
+    };
+    let unique_heads = std::cell::OnceCell::new();
+    let missing = |tails| exceeds(heads, tails)
+        && exceeds(*unique_heads.get_or_init(|| distinct_zip_heads(rows, indexes)), tails);
+    if missing(tails) { return true; }
+    let [raw, split] = *unique_heads.get().unwrap_or(&heads);
+    if raw + split < 2 { return false; }
+
+    // A directory visible through several views covers only one layout.
+    // Count the same physical directory identity used by the assignment.
+    let mut distinct = HashSet::new();
+    tails = [0; 2];
+    for row in candidates() {
+        if let Some(&directory) = zip_terminal_directory(row) {
+            if distinct.insert(zip_directory_key(row, directory)) {
+                tails[usize::from(directory.disk > 0)] += 1;
+            }
+        }
+    }
+    missing(tails)
+}
+
+fn zip_head_kind(anchor: &VolumeAnchor) -> Option<usize> {
+    (anchor.format == "zip" && !anchor.standalone && !anchor.has_any(TERMINAL)
+        && anchor.has_any(ZIP_LOCAL_HEADER | ZIP_SPLIT_START))
+        .then(|| usize::from(anchor.has_any(ZIP_SPLIT_START)))
+}
+
+fn zip_heads_have_directory_proof(rows: &[RelationInput], indexes: &[usize]) -> bool {
+    let eligible = || indexes.iter().map(|&i| &rows[i]).filter(|row| row.relation_member_eligible);
+    let mut heads = eligible().filter_map(|row| {
+        let anchor = row.anchor.as_deref()?;
+        (anchor.error.is_empty() && !anchor.continuation_from_previous).then_some(())?;
+        zip_head_kind(anchor).map(|kind| (anchor, if kind == 1 { 4u64 } else { 0 }))
+    }).peekable();
+    if heads.peek().is_none() { return true; }
+
+    let mut seen = HashSet::new();
+    let mut first_records = HashSet::new();
+    for row in eligible() {
+        let Some(&directory) = zip_terminal_directory(row) else { continue; };
+        if !seen.insert(zip_directory_key(row, directory)) { continue; }
+        let anchor = row.anchor.as_ref().unwrap();
+        if let Ok(Some(key)) = anchor.open().and_then(|reader| {
+            crate::formats::zip::relation_first_local_key(&reader, directory)
+        }) {
+            first_records.insert(key);
+        }
+    }
+    !first_records.is_empty() && heads.all(|(head, local)| {
+        head.structure_offset.unwrap_or(0).checked_add(local).is_some_and(|at| {
+            zip_local_key(head, at, None).is_ok_and(|key| key.is_some_and(|key| first_records.contains(&(local, key))))
+        })
+    })
+}
+
+fn distinct_zip_heads(rows: &[RelationInput], indexes: &[usize]) -> [usize; 2] {
+    let mut first = HashMap::<_, &VolumeAnchor>::new();
+    let mut count = [0, 0];
+    for &i in indexes {
+        let row = &rows[i];
+        if !row.relation_member_eligible { continue; }
+        let Some(anchor) = row.anchor.as_deref() else { continue; };
+        let Some(kind) = zip_head_kind(anchor) else { continue; };
+        let start = anchor.structure_offset.unwrap_or(0);
+        match first.entry((&row.path_key, start, kind)) {
+            std::collections::hash_map::Entry::Vacant(entry) => { entry.insert(anchor); }
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                let other = *entry.get();
+                let end = anchor.size.min(other.size);
+                let prefix_end = start.saturating_add(512).min(end);
+                let ranges = |a: &VolumeAnchor, start, end| {
+                    crate::io::archive_state::PhysicalRanges::new(a.view.as_deref(), start, Some(end))
+                };
+                if prefix_end > start && ranges(anchor, prefix_end, end) == ranges(other, prefix_end, end) {
+                    if ranges(anchor, start, prefix_end) == ranges(other, start, prefix_end) {
+                        continue;
+                    }
+                    let prefix = |a: &VolumeAnchor| a.open()?.read_direct_at(start, (prefix_end - start) as usize);
+                    if let (Ok(left), Ok(right)) = (prefix(anchor), prefix(other)) {
+                        if left == right && left.len() as u64 == prefix_end - start { continue; }
+                    }
+                }
+            }
+        }
+        count[kind] += 1;
+    }
+    count
 }
 
 /// Only byte facts enter the existing generation cell, before any peer-based
@@ -365,38 +465,46 @@ pub(super) fn zip_local_key(
     crate::formats::zip::relation_local_key(&a.path, a.view.as_ref(), at)
 }
 
+pub(super) fn zip_terminal_directory(row: &RelationInput) -> Option<&crate::formats::zip::RelationDirectory> {
+    let anchor = row.anchor.as_ref()?;
+    (row.relation_member_eligible && anchor.format == "zip" && !anchor.standalone
+        && !anchor.sfx && anchor.error.is_empty() && anchor.has_any(TERMINAL))
+        .then_some(anchor.zip_directory.as_deref()).flatten()
+}
+
+pub(super) fn zip_directory_key<'a>(row: &'a RelationInput, directory: crate::formats::zip::RelationDirectory)
+    -> (&'a str, crate::formats::zip::RelationDirectory, crate::io::archive_state::PhysicalRanges) {
+    let view = row.anchor.as_ref().and_then(|a| a.view.as_deref());
+    let start = if directory.cd_disk == directory.disk { directory.end.saturating_sub(directory.size) } else { 0 };
+    (row.path_key.as_str(), directory, crate::io::archive_state::PhysicalRanges::new(view, start, Some(directory.end)))
+}
+
 pub(super) fn refine_zip_members(rows: &mut [RelationInput], indexes: &[usize], cached: Option<&ZipLocalKeys<'_>>,
     mut interior: impl FnMut(&Arc<VolumeAnchor>, u64)) {
     use crate::formats::zip::{visit_relation_directory, RelationLocalFields};
-    let terminals: Vec<_> = indexes
+    let mut terminals: Vec<_> = indexes
         .iter()
-        .filter_map(|&i| {
-            rows[i]
-                .anchor
-                .as_ref()
-                .filter(|a| a.error.is_empty())
-                .and_then(|a| a.zip_directory.as_ref())
-                .filter(|d| d.disk > 0)
-                .map(|d| (i, **d))
-        })
+        .filter_map(|&i| zip_terminal_directory(&rows[i]).map(|&d| (i, d)))
         .collect();
-    if terminals.is_empty() {
-        return;
-    }
+    let Some(&(first, dir)) = terminals.iter().find(|(_, d)| d.disk > 0) else { return; };
     // Root and embedded probes, or several views of a terminal disk, may
     // reference the exact same directory bytes. Walk that directory once
     // while retaining every disk view as a distinct source for payload reads.
-    let (first, dir) = terminals[0];
-    let directory_range = |i: usize| {
-        let a = rows[i].anchor.as_ref().unwrap();
-        let start = if dir.disk == dir.cd_disk { dir.end.saturating_sub(dir.size) } else { 0 };
-        crate::io::archive_state::PhysicalRanges::new(a.view.as_deref(), start, Some(dir.end))
-    };
-    let unique_directory = terminals.len() == 1 || {
-        let first_range = directory_range(first);
-        terminals.iter().skip(1).all(|&(i, d)| rows[i].path_key == rows[first].path_key
-            && d == dir && directory_range(i) == first_range)
-    };
+    let first_key = std::cell::OnceCell::new();
+    let same = |i: usize, d| i == first || (d == dir
+        && rows[i].path_key == rows[first].path_key
+        && &zip_directory_key(&rows[i], d)
+            == first_key.get_or_init(|| zip_directory_key(&rows[first], dir)));
+    // Raw and spanned ZIPs or competing mapped directories are refined in
+    // their own assignment scopes, so this pass need not read them first.
+    if cached.is_none() && terminals.len() > 1
+        && (terminals.iter().any(|(_, d)| d.disk == 0)
+            || indexes.iter().any(|&i| rows[i].anchor.as_ref()
+                .is_some_and(|a| a.view.is_some() && !a.standalone)))
+        && terminals.iter().any(|&(i, d)| !same(i, d))
+    { return; }
+    terminals.retain(|(_, d)| d.disk > 0);
+    let unique_directory = terminals.iter().all(|&(i, d)| same(i, d));
     let mut local = HashMap::<Vec<u8>, HashMap<RelationLocalFields, Vec<usize>>>::new();
     for &i in indexes.iter().filter(|_| unique_directory) {
         let Some(a) = rows[i].anchor.as_ref().filter(|a| {
@@ -584,7 +692,7 @@ pub(super) fn refine_zip_members(rows: &mut [RelationInput], indexes: &[usize], 
                     interior(a, base);
                 }
                 if slot == 1 && first_local.as_ref().is_some_and(|(offset, key)| base.checked_add(*offset).is_some_and(|at| Some(at) != a.structure_offset
-                    && matches!(zip_local_key(a, at, cached), Ok(actual) if actual.as_ref() != Some(key))))
+                    && !matches!(zip_local_key(a, at, cached), Ok(actual) if actual.as_ref() == Some(key))))
                 {
                     continue;
                 }

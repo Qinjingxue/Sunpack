@@ -137,7 +137,10 @@ impl InputCheckpoint {
         generations: &HashMap<String, PhysicalFileGeneration>,
         container: Option<&Path>,
     ) -> Option<Self> {
-        if result.failure.as_ref().is_some_and(|failure| failure.kind == FailureKind::Cancelled) {
+        // A stale live mapping must never acquire a receipt for the new file.
+        if result.failure.as_ref().is_some_and(|failure| failure.kind == FailureKind::Cancelled)
+            || super::coordinator::changed_view_source(&input, generations).is_some()
+        {
             return None;
         }
         let mut sources = Vec::with_capacity(result.source_paths.len());
@@ -407,11 +410,7 @@ impl InputCheckpoint {
 
     pub(super) fn result(&self, depth: usize) -> ArchiveResult {
         let failure = self.failure.as_ref().map(|receipt| receipt.failure.clone());
-        let extent = self
-            .input
-            .parts
-            .first()
-            .map(|part| &part.extent);
+        let extent = self.input.physical_extents().next();
         ArchiveResult {
             path: PathBuf::from(&self.input.entry_path),
             format: self.input.format_hint.clone(),

@@ -182,6 +182,15 @@ bool read_extent_field(wire::RequestReader& reader, std::string_view key,
         auto view = std::make_shared<sunpack::sevenzip::ReadView>();
         read_object(reader, [&](auto field) {
             if (field == "physical_size") view->physical_size = reader.number();
+            else if (field == "file_generation") {
+                auto& stamp = view->file_generation.emplace();
+                std::size_t index = 0;
+                read_array(reader, [&] {
+                    if (index == stamp.size()) throw std::runtime_error("invalid read view generation");
+                    stamp[index++] = reader.number();
+                });
+                if (index != stamp.size()) throw std::runtime_error("incomplete read view generation");
+            }
             else if (field == "spans") read_array(reader, [&] {
                 auto& span = view->spans.emplace_back();
                 read_object(reader, [&](auto attr) {
@@ -338,9 +347,11 @@ void read_input_parts(wire::RequestReader& reader, WorkerArchiveInput& input) {
 WorkerArchiveInput read_archive_input(wire::RequestReader& reader) {
     WorkerArchiveInput input;
     bool attempts = false;
+    bool named_volumes = false;
     read_object(reader, [&](auto key) {
         if (key == "entry_path") input.archive_path = utf8_to_wide(reader.text());
         else if (key == "open_mode") input.mode = read_input_mode(reader.text());
+        else if (key == "named_volumes") named_volumes = reader.boolean();
         else if (key == "format_hint") input.format_hint = utf8_to_wide(reader.text());
         else if (key == "parts") read_input_parts(reader, input);
         else if (key == "volume_attempts") {
@@ -356,10 +367,12 @@ WorkerArchiveInput read_archive_input(wire::RequestReader& reader) {
             });
         } else reader.skip();
     });
+    if (named_volumes && input.mode == ArchiveOpenMode::NativeVolumes)
+        input.mode = ArchiveOpenMode::NamedVolumes;
     if (!attempts && input.validation_error.empty()) {
         if (input.mode == ArchiveOpenMode::FileRange && input.ranges.empty())
             input.validation_error = "file_range descriptor requires canonical parts with extents";
-        else if ((input.mode == ArchiveOpenMode::NativeVolumes || input.mode == ArchiveOpenMode::SfxWithVolumes)
+        else if ((input.mode == ArchiveOpenMode::NativeVolumes || sunpack::sevenzip::uses_named_volume_streams(input.mode))
             && input.canonical_names.empty())
             input.validation_error = "structured volume descriptor has no parts";
     }
@@ -766,7 +779,7 @@ class CompleteVolumeGeometry {
 #ifdef SUP7Z_DEBUG
                         ++file_size_queries;
 #endif
-                        size->second = std::filesystem::file_size(source.path, error);
+                        size->second = sunpack::sevenzip::input_file_size(source.path, error);
                         if (error) { state = State::Incomplete; return false; }
                     }
                     const bool covered = source.view
@@ -1513,7 +1526,9 @@ RequestExecution execute_request(
             select_volume_attempt(request.archive_input, cursor.layout, cursor.selected, selected_input);
             auto& uncertainty = volume_replay->uncertain_ranges;
             uncertainty.clear();
-            volume_replay->uncertain_paths.clear();
+            auto& variable_slots = volume_replay->variable_slots;
+            variable_slots.clear();
+            const bool named_volumes = uses_named_volume_streams(request.archive_input.mode);
             unsigned long long offset = 0;
             bool variable_offset = false;
             for (std::size_t i = 0; !selected_input.missing_volume_number && i < selected_input.ranges.size(); ++i) {
@@ -1525,8 +1540,7 @@ RequestExecution execute_request(
                         uncertainty.back().second += length;
                     else uncertainty.emplace_back(offset, offset + length);
                 }
-                if (variation.variable)
-                    volume_replay->uncertain_paths.insert(plan.sources[cursor.selected[i]].path);
+                if (named_volumes && variation.variable) variable_slots.push_back(i);
                 variable_offset |= variation.variable_length || variation.length != length;
                 offset += length;
             }

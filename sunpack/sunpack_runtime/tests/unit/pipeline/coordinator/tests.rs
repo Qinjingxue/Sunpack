@@ -939,14 +939,19 @@ fn watch_family_join_preserves_owner_and_propagates_infrastructure_error() {
     let second = crate::test_support::temp_file("join_watch_second_head", b"second");
     let tail1 = crate::test_support::temp_file("join_watch_tail1", b"common tail 1");
     let tail2 = crate::test_support::temp_file("join_watch_tail2", b"common tail 2");
-    let task = |path: &Path| Task {
-        primary: None,
-        owned_paths: [path, &tail1, &tail2].into_iter()
-            .map(|member| member.to_string_lossy().into_owned()).collect(),
-        inputs: vec![LogicalInput { password: None,
-            input: ArchiveInput::file(path.to_string_lossy().into_owned(), "7z".into(), "split".into()),
-            failure: None }],
-        source: DiscoverySource::Relations, context: None,
+    let task = |path: &Path| {
+        let mut input = ArchiveInput::file(path.to_string_lossy().into_owned(), "7z".into(), "split".into());
+        input.mode = OpenMode::FileRange;
+        input.parts = Box::new([crate::io::archive_state::InputPart::range(crate::io::archive_state::InputExtent {
+            path: input.entry_path.clone(), start: 0, end: Some(5), view: None,
+        })]);
+        Task {
+            primary: None,
+            owned_paths: [path, &tail1, &tail2].into_iter()
+                .map(|member| member.to_string_lossy().into_owned()).collect(),
+            inputs: vec![LogicalInput { password: None, input, failure: None }],
+            source: DiscoverySource::Relations, context: None,
+        }
     };
     let engine = Engine::new(PathBuf::from("unused-worker"));
     let leases = &engine.leases;
@@ -957,23 +962,36 @@ fn watch_family_join_preserves_owner_and_propagates_infrastructure_error() {
         inputs: vec![tail2.clone()], cancel: Cancellation::new(), ..request.clone()
     });
     let notify = |_: Event| {};
-    let members = test_run(&engine, &leader, &notify).watch_generations(&Discovered {
+    let (members, layouts) = test_run(&engine, &leader, &notify).watch_generations(&Discovered {
         tasks: vec![task(&first), task(&second)], ..Discovered::default()
     }).expect("two logical roots can share one physical generation union");
-    let follower_members = test_run(&engine, &follower, &notify).watch_generations(&Discovered {
+    let (follower_members, follower_layouts) = test_run(&engine, &follower, &notify).watch_generations(&Discovered {
         tasks: vec![task(&second), task(&first)], ..Discovered::default()
     }).unwrap();
     assert_eq!(members.len(), 4);
     let mut cx = Context::from_waker(Waker::noop());
 
-    let WatchFamily::Owner(owner) = leases.claim_watch(1, &members, &leader) else {
+    let WatchFamily::Owner(owner) = leases.claim_watch(1, &members, &layouts, &leader) else {
         panic!("first request owns extraction");
     };
     let different_policy = Arc::new(Request { deep: true, ..request });
-    let WatchFamily::Owner(other) = leases.claim_watch(2, &members, &different_policy) else {
+    let WatchFamily::Owner(other) = leases.claim_watch(2, &members, &layouts, &different_policy) else {
         panic!("different policy must execute independently");
     };
-    let WatchFamily::Follower(key, id, settlement) = leases.claim_watch(3, &follower_members, &follower) else {
+    let mut mapped = task(&first);
+    mapped.inputs[0].input.parts[0].extent.view = Some(Arc::new(crate::io::view::ReadView {
+        generation: None,
+        method: crate::io::view::ViewMethod::Apate, depth: 1, physical_size: 5,
+        spans: vec![crate::io::view::Span { start: 0, end: 5, reverse: true }],
+    }));
+    let (same_members, mapped_layouts) = test_run(&engine, &follower, &notify).watch_generations(&Discovered {
+        tasks: vec![mapped, task(&second)], ..Discovered::default()
+    }).unwrap();
+    assert_eq!(members, same_members);
+    let WatchFamily::Owner(mapped_owner) = leases.claim_watch(5, &same_members, &mapped_layouts, &follower) else {
+        panic!("same physical members with another view must execute independently");
+    };
+    let WatchFamily::Follower(key, id, settlement) = leases.claim_watch(3, &follower_members, &follower_layouts, &follower) else {
         panic!("equivalent request must join the active owner");
     };
     assert_eq!(id, 1);
@@ -989,7 +1007,7 @@ fn watch_family_join_preserves_owner_and_propagates_infrastructure_error() {
     assert!(wait.as_mut().poll(&mut cx).is_pending());
     owner.finish(&Err(io::Error::other("write failed")), &leader.cancel);
     // A replacement owner can register before existing followers wake.
-    let WatchFamily::Owner(owner) = leases.claim_watch(4, &members, &leader) else {
+    let WatchFamily::Owner(owner) = leases.claim_watch(4, &members, &layouts, &leader) else {
         panic!("failed owner must retire");
     };
     let Poll::Ready(Err(error)) = wait.as_mut().poll(&mut cx) else {
@@ -999,6 +1017,7 @@ fn watch_family_join_preserves_owner_and_propagates_infrastructure_error() {
     drop(wait);
     drop(owner);
     drop(other);
+    drop(mapped_owner);
     let state = leases.state.lock().unwrap();
     assert!(state.watch.is_empty() && state.waiters.is_empty() && state.blocked_by.is_empty());
     drop(state);
@@ -1011,14 +1030,15 @@ fn completed_watch_family_returns_existing_success_without_extracting_or_reownin
         output: PathBuf,
         events: Mutex<Vec<Event>>,
         queries: std::sync::atomic::AtomicUsize,
+        layout: OnceLock<u128>,
     }
     impl Observer for Reuse {
         fn notify(&self, event: Event) { self.events.lock().unwrap().push(event); }
-        fn completed_sources(&self, generations: &HashMap<String, PhysicalFileGeneration>) -> io::Result<Option<PathBuf>> {
+        fn completed_sources(&self, generations: &HashMap<String, PhysicalFileGeneration>, layout: u128) -> io::Result<Option<PathBuf>> {
             if !self.output.is_dir() { return Ok(None); }
             assert_eq!(generations.len(), 2);
             self.queries.fetch_add(1, Ordering::SeqCst);
-            Ok(Some(self.output.clone()))
+            Ok((self.layout.get() == Some(&layout)).then(|| self.output.clone()))
         }
         fn register_output(&self, _: &ArchiveResult, _: &Path) -> io::Result<()> {
             panic!("completed output must not be created again")
@@ -1039,14 +1059,14 @@ fn completed_watch_family_returns_existing_success_without_extracting_or_reownin
     let engine = Engine::new(PathBuf::from("must-not-start-worker.exe"));
     let mut request = Request::new(vec![tail.clone()], Mode::Extract);
     request.origin = Origin::Watch;
-    let observer = Reuse { output: output.clone(), events: Mutex::default(), queries: 0.into() };
+    let observer = Reuse { output: output.clone(), events: Mutex::default(), queries: 0.into(), layout: Default::default() };
     let run = test_run(&engine, &request, &observer);
     let mut input = ArchiveInput::file(head.to_string_lossy().into_owned(), "zip".into(), "archive".into());
     input.mode = OpenMode::NativeVolumes;
     input.parts = [&head, &tail].map(|path| crate::io::archive_state::InputPart::range(
         crate::io::archive_state::InputExtent { view: None, path: path.to_string_lossy().into_owned(), start: 0, end: None },
     )).into();
-    let task = Task {
+    let mut task = Task {
         primary: None, owned_paths: [&head, &tail, &launcher].map(|path| path.to_string_lossy().into_owned()).into(),
         inputs: vec![LogicalInput {
             input,
@@ -1054,30 +1074,44 @@ fn completed_watch_family_returns_existing_success_without_extracting_or_reownin
         source: DiscoverySource::Relations, context: None,
     };
     let (generations, missing) = run.capture_generations(&task);
+    observer.layout.set(completed_source_layout(&task, |key| generations.get(key).and_then(PhysicalFileGeneration::object_id))).unwrap();
     assert_eq!(generations.len(), 3, "launcher remains owned for cleanup");
     assert_eq!(run.requested_generation(&task, true).unwrap().len(), 2);
     // Foreground/nested tasks and incomplete observations do not consume
     // the Watch-only completed family fact.
-    assert!(matches!(run.task_admission(&task, &generations, &[], false, |_| None).unwrap(), TaskAdmission::Execute(None)));
+    assert!(matches!(run.task_admission(&task, &generations, &[], false, |_| None, None).unwrap(), TaskAdmission::Execute(None)));
     let mut partial = generations.clone();
     partial.remove(&path_key(&tail.to_string_lossy()));
-    assert!(matches!(run.task_admission(&task, &partial, &[tail.clone()], true, |_| None).unwrap(), TaskAdmission::Execute(None)));
-    assert!(matches!(run.task_admission(&task, &HashMap::new(), &[head.clone(), tail.clone()], true, |_| None).unwrap(), TaskAdmission::Departed));
+    assert!(matches!(run.task_admission(&task, &partial, &[tail.clone()], true, |_| None, None).unwrap(), TaskAdmission::Execute(None)));
+    assert!(matches!(run.task_admission(&task, &HashMap::new(), &[head.clone(), tail.clone()], true, |_| None, None).unwrap(), TaskAdmission::Departed));
     let single = Task { primary: None, owned_paths: vec![head.to_string_lossy().into_owned()],
         inputs: vec![LogicalInput {
             input: ArchiveInput::file(head.to_string_lossy().into_owned(), "zip".into(), "archive".into()),
             password: None, failure: None }],
         source: DiscoverySource::Relations, context: None };
-    assert!(matches!(run.task_admission(&single, &partial, &[], true, |_| None).unwrap(), TaskAdmission::Execute(None)));
+    assert!(matches!(run.task_admission(&single, &partial, &[], true, |_| None, None).unwrap(), TaskAdmission::Execute(None)));
     assert_eq!(observer.queries.load(Ordering::SeqCst), 0);
-    assert!(matches!(run.task_admission(&task, &partial, &[tail.clone()], true, |path| generations.get(path)).unwrap(),
+    let requested_layout = observer.layout.get().copied();
+    assert!(matches!(run.task_admission(&task, &partial, &[tail.clone()], true, |path| generations.get(path), requested_layout).unwrap(),
         TaskAdmission::Completed(ref path) if path == &output));
     assert!(matches!(run.task_admission(&task, &HashMap::new(), &[head.clone(), tail.clone()], true,
-        |path| generations.get(path)).unwrap(), TaskAdmission::Departed));
+        |path| generations.get(path), requested_layout).unwrap(), TaskAdmission::Departed));
     let changed = HashMap::from([(path_key(&head.to_string_lossy()), generations[&path_key(&tail.to_string_lossy())].clone())]);
-    assert!(matches!(run.task_admission(&task, &changed, &[tail.clone()], true, |path| generations.get(path)).unwrap(), TaskAdmission::Execute(None)));
-    assert_eq!(observer.queries.swap(0, Ordering::SeqCst), 1);
+    assert!(matches!(run.task_admission(&task, &changed, &[tail.clone()], true, |path| generations.get(path), requested_layout).unwrap(), TaskAdmission::Execute(None)));
+    let mut changed_complete = generations.clone();
+    changed_complete.extend(changed);
+    assert!(matches!(run.task_admission(&task, &changed_complete, &[], true, |path| generations.get(path), requested_layout).unwrap(), TaskAdmission::Execute(Some(_))));
+    assert_eq!(observer.queries.swap(0, Ordering::SeqCst), 2);
     assert!(missing.is_empty());
+    let part = &mut task.inputs[0].input.parts[1];
+    part.extent.view = Some(Arc::new(crate::io::view::ReadView {
+        generation: None,
+        method: crate::io::view::ViewMethod::Apate, depth: 1, physical_size: 4,
+        spans: vec![crate::io::view::Span { start: 0, end: 4, reverse: true }],
+    }));
+    assert!(matches!(run.task_admission(&task, &generations, &[], true, |_| None, None).unwrap(), TaskAdmission::Execute(Some(_))));
+    task.inputs[0].input.parts[1].extent.view = None;
+    assert_eq!(observer.queries.swap(0, Ordering::SeqCst), 1);
     // A successful worker can select only two of three candidate sources.
     // The cache must store the complete admitted set and omit the unrelated
     // executable. Do not derive its key from the successful worker output.
@@ -1097,18 +1131,43 @@ fn completed_watch_family_returns_existing_success_without_extracting_or_reownin
         inputs: vec![LogicalInput { input: alternative_input, password: None, failure: None }],
         source: DiscoverySource::Relations, context: None,
     };
-    let uncached = Reuse { output: output.join("absent"), events: Mutex::default(), queries: 0.into() };
+    let uncached = Reuse { output: output.join("absent"), events: Mutex::default(), queries: 0.into(), layout: Default::default() };
     let uncached = test_run(&engine, &request, &uncached);
     let (physical, missing) = uncached.capture_generations(&alternative_task);
-    let TaskAdmission::Execute(Some(cache_key)) = uncached.task_admission(
-        &alternative_task, &physical, &missing, true, |_| None,
+    let TaskAdmission::Execute(Some((cache_key, _))) = uncached.task_admission(
+        &alternative_task, &physical, &missing, true, |_| None, None,
     ).unwrap() else { panic!("uncached speculative family should execute"); };
     let candidate_paths = [&head, &tail, &alternative].map(|path| path_key(&path.to_string_lossy()));
     assert_eq!(cache_key.len(), candidate_paths.len());
     assert!(candidate_paths.iter().all(|path| cache_key.contains_key(path)));
     fs::remove_file(alternative).unwrap();
+
+    // A mapped member consumed after discovery can still reuse the completed
+    // family, but only if the receipt names the generation that supplied it.
+    let tail_key = path_key(&tail.to_string_lossy());
+    let mut view = crate::io::view::ReadView {
+        generation: Some(Arc::new(generations[&tail_key].clone())),
+        method: crate::io::view::ViewMethod::Apate, depth: 1, physical_size: 4,
+        spans: vec![crate::io::view::Span { start: 0, end: 4, reverse: true }],
+    };
+    task.inputs[0].input.parts[1].extent.view = Some(Arc::new(view.clone()));
+    let layout = completed_source_layout(&task, |key| generations.get(key).and_then(PhysicalFileGeneration::object_id));
+    drop(run);
+    Arc::make_mut(&mut request.config).filesystem.read_views =
+        crate::io::view::ConfiguredViews::parse([Some("apate:1")].into_iter()).unwrap();
+    let observer = Reuse { output: output.clone(), events: Mutex::default(), queries: 0.into(), layout: OnceLock::from(layout) };
+    let run = test_run(&engine, &request, &observer);
+    view.generation = Some(Arc::new(generations[&path_key(&head.to_string_lossy())].clone()));
+    let original_view = task.inputs[0].input.parts[1].extent.view.replace(Arc::new(view));
+    assert!(matches!(run.task_admission(&task, &partial, &[tail.clone()], true,
+        |path| generations.get(path), Some(layout)).unwrap(), TaskAdmission::Execute(None)));
+    task.inputs[0].input.parts[1].extent.view = original_view;
+    observer.queries.store(0, Ordering::SeqCst);
+    fs::remove_file(&tail).unwrap();
+    let mut registered = run.register_task(task);
+    registered.3 = Some((Arc::new(generations.into_iter().collect()), Some(layout)));
     let outcome = Scheduler::new().run(1, Origin::Watch, &request.cancel, |spawner| {
-        run.execute_task(run.register_task(task), 1, 1, None, spawner)
+        run.execute_task(registered, 1, 1, None, spawner)
     }).unwrap();
     assert_eq!(observer.queries.load(Ordering::SeqCst), 1);
     assert_eq!(outcome.archives.len(), 1);
@@ -1128,7 +1187,6 @@ fn completed_watch_family_returns_existing_success_without_extracting_or_reownin
     assert!(launcher.is_file());
     fs::remove_dir_all(output).unwrap();
     fs::remove_file(head).unwrap();
-    fs::remove_file(tail).unwrap();
     fs::remove_file(launcher).unwrap();
 }
 
@@ -1170,7 +1228,7 @@ fn partial_departure_fails_admission_and_keeps_generations_for_extraction() {
                 assert_eq!(generations[&path_key(&path.to_string_lossy())], capture_file_generation(&path).unwrap());
             }
         }
-        assert!(matches!(run.task_admission(&task, &generations, &absent, false, |_| None).unwrap(), TaskAdmission::Execute(None)));
+        assert!(matches!(run.task_admission(&task, &generations, &absent, false, |_| None, None).unwrap(), TaskAdmission::Execute(None)));
         task.inputs[0].failure = Some(Failure::new(FailureKind::Unsupported, "discovery")
             .with_context(super::super::FailureContext::Discovery {
                 discovery: DiscoverySource::Embedded, reason: "unsupported".into(),
@@ -2035,6 +2093,54 @@ fn cancelled_or_panicking_prompt_wakes_siblings_and_joins_its_callback() {
 }
 
 #[test]
+fn a_same_size_replacement_cannot_execute_an_old_read_view() {
+    use crate::io::{archive_state::InputExtent, reader::ManagedReader, view::ConfiguredViews};
+
+    let path = crate::test_support::temp_file("mapped_admission", b"cba\x01\0\0\0");
+    let replacement = crate::test_support::temp_file("mapped_replacement", b"xba\x02\0\0\0");
+    let views = ConfiguredViews::parse([Some("apate:1")].into_iter()).unwrap();
+    let spelled = path.to_string_lossy().into_owned();
+    let old = ManagedReader::open(&spelled).unwrap();
+    let view = views.derive_views(&old, &mut Default::default()).unwrap().pop().unwrap();
+    assert_eq!(view.len(), 2);
+    let saved = rmp_serde::to_vec(view.as_ref()).unwrap();
+    let restored: crate::io::view::ReadView = rmp_serde::from_slice(&saved).unwrap();
+    assert_eq!(view.as_ref(), &restored);
+    assert!(restored.generation.is_none());
+    drop(old);
+    fs::rename(replacement, &path).unwrap();
+    let new = ManagedReader::open(&spelled).unwrap();
+    assert_eq!(new.len(), view.physical_size);
+    assert!(view.bind(&new).is_err());
+    drop(new);
+
+    let mut input = ArchiveInput::file(spelled.clone(), "tar".into(), "mapped".into());
+    input.mode = OpenMode::FileRange;
+    input.parts = [crate::io::archive_state::InputPart::range(InputExtent {
+        path: spelled.clone(), start: 0, end: Some(2), view: Some(view),
+    })].into();
+    let task = Task {
+        inputs: vec![LogicalInput { input, password: None, failure: None }],
+        primary: None, owned_paths: vec![spelled], source: DiscoverySource::Detection, context: None,
+    };
+    let engine = Engine::new(PathBuf::from("must-not-start-worker.exe"));
+    let mut request = Request::new(vec![path.clone()], Mode::Extract);
+    Arc::make_mut(&mut request.config).filesystem.read_views = views;
+    let observer = |_: Event| {};
+    let run = test_run(&engine, &request, &observer);
+    let outcome = Scheduler::new().run(1, Origin::Foreground, &request.cancel, |spawner| {
+        run.execute_task(run.register_task(task), 1, 1, None, spawner)
+    }).unwrap();
+    let result = outcome.archives.iter().next().unwrap();
+    let failure = result.failure.as_ref().unwrap();
+    assert_eq!(failure.kind, FailureKind::FilesystemError);
+    assert!(failure.message.starts_with("file changed after read view discovery"));
+    assert!(result.output.is_none());
+    assert!(outcome.checkpoints.is_empty());
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn cancelled_batch_does_not_swallow_unrelated_journal_io_errors() {
     struct JournalFailure(Cancellation, io::ErrorKind);
     impl Observer for JournalFailure {
@@ -2253,6 +2359,7 @@ fn alias_dedup_covers_candidate_and_preflight_failure_plans() {
     let mut restored = make(&alias, true, false);
     let plan = Arc::make_mut(restored.inputs[0].input.volume_attempts.as_mut().unwrap());
     plan.sources[0].view = Some(Arc::new(crate::io::view::ReadView {
+        generation: None,
         method: crate::io::view::ViewMethod::Apate, depth: 1, physical_size: 16,
         spans: vec![crate::io::view::Span { start: 4, end: 12, reverse: true }],
     }));

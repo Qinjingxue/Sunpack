@@ -2,7 +2,7 @@
 use super::dedup_hash::StreamHash;
 use crate::core::config::{WatchDeduplication, WatchDeduplicationScope};
 use crate::io::archive_state::{ArchiveInput, OpenMode, VolumeCompleteness};
-use crate::io::view::{ConfiguredViews, Span};
+use crate::io::view::{ConfiguredViews, ReadView, Span};
 use crate::io::reader::{physical_file_generation_from_metadata, PhysicalFileGeneration};
 use crate::collections::{trim_map, SmallOrderedSet};
 use crate::path_keys::{path_ancestors, path_key};
@@ -24,13 +24,13 @@ struct Identity {
     reversed: bool,
 }
 #[derive(Clone, Serialize, Deserialize)]
-struct Source { path: String, generation: PhysicalFileGeneration, mtime: f64, usn: i64 }
+struct Source { path: Arc<str>, generation: PhysicalFileGeneration, mtime: f64, usn: i64 }
 type SourceSnapshot = crate::filesystem::WatchFileSnapshot<PhysicalFileGeneration>;
 
 impl Source {
     fn current_snapshot(&self) -> Option<SourceSnapshot> {
         crate::filesystem::watch_ready_file_snapshot(
-            Path::new(&self.path), Some(self.usn), physical_file_generation_from_metadata,
+            Path::new(self.path.as_ref()), Some(self.usn), physical_file_generation_from_metadata,
         )
             .ok().flatten().filter(|snapshot| {
                 snapshot.captured.object_id() == self.generation.object_id()
@@ -61,6 +61,7 @@ struct Record {
     owner: Arc<str>,
     scope: Arc<str>,
     bytes: u64,
+    layout: LogicalLayout,
     admitted: bool,
     sources: Arc<[Source]>,
     // All extents use source zero when there is only one physical source.
@@ -68,6 +69,40 @@ struct Record {
     identities: Arc<[Identity]>,
     digest: Option<[u8; 16]>,
 }
+
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+enum LogicalLayout {
+    Single(u64),
+    SingleLong(Arc<str>),
+    Archives(Arc<[LogicalArchive]>),
+}
+
+impl LogicalLayout {
+    fn single(format: &str) -> Self {
+        let mut tag = [0; 8];
+        let bytes = format.as_bytes();
+        if bytes.len() <= tag.len() && !bytes.contains(&0) {
+            tag[..bytes.len()].copy_from_slice(bytes);
+            Self::Single(u64::from_le_bytes(tag))
+        } else {
+            Self::SingleLong(Arc::from(format))
+        }
+    }
+}
+
+#[derive(PartialEq, Eq, Hash, Serialize, Deserialize)]
+struct LogicalArchive {
+    format: Box<str>,
+    len: u64,
+    named_parts: Option<NamedParts>,
+}
+
+#[derive(PartialEq, Eq, Hash, Serialize, Deserialize)]
+struct NamedParts {
+    mode: OpenMode,
+    parts: Box<[(Option<u32>, u64)]>,
+}
+
 impl Record {
     fn source_index(&self, range: usize) -> usize {
         if self.range_sources.is_empty() { 0 } else { self.range_sources[range] as usize }
@@ -90,7 +125,7 @@ impl Record {
             let source_index = self.source_index(range);
             let source = &self.sources[source_index];
             let mut refreshed = None;
-            hash.read(Path::new(&source.path), extent.start, extent.len, extent.reversed, |opened| {
+            hash.read(Path::new(source.path.as_ref()), extent.start, extent.len, extent.reversed, |opened| {
                 if short {
                     // The short read handle itself excludes writers and
                     // renames. Consult the USN journal only on a changed generation.
@@ -143,8 +178,6 @@ enum Delta<'a> {
     Journals(Vec<(String, String, u64)>),
     Ready,
     Pending,
-    // Old mapped indexes can contain different identities for the same reverse run.
-    BeginMapped(u8, u8, ConfiguredViews),
 }
 
 /// Hashing is deliberately outside Index's lock and the scheduler thread.
@@ -170,17 +203,19 @@ pub(super) fn consider(
     owner: &str,
     scope: &str,
     inputs: &[&ArchiveInput],
-    generation: Option<u64>,
+    generation: u64,
+    baseline: bool,
 ) -> io::Result<bool> {
     if inputs.is_empty() { return Ok(false); }
-    let Some(epoch) = index.lock().unwrap().admission_epoch(scope, generation) else {
+    // Both baseline and active requests may outlive a view-policy reset.
+    let Some(epoch) = index.lock().unwrap().admission_epoch(scope, Some(generation)) else {
         return Ok(false);
     };
     // Describing the sources opens files and queries NTFS/ReFS. Each job can
     // do that under its existing Watch work budget while other jobs commit.
     let Some(record) = describe(owner, scope, inputs)? else { return Ok(false); };
     let mut locked = index.lock().unwrap();
-    let Some(prepared) = locked.prepare(epoch, record, generation.is_some()) else {
+    let Some(prepared) = locked.prepare(epoch, record, baseline) else {
         return Ok(false);
     };
     let mut admission = locked.advance(prepared)?;
@@ -238,7 +273,7 @@ fn invalidate_records(
         // A missing directory proves absence only for its literal children.
         // The key index also includes case-folded spellings.
         missing.is_some_and(|path| sources.iter().any(|source| {
-            Path::new(&source.path).strip_prefix(path).is_ok_and(|tail| {
+            Path::new(source.path.as_ref()).strip_prefix(path).is_ok_and(|tail| {
                 tail.components().all(|part| matches!(part, std::path::Component::Normal(_)))
             })
         })) || sources.iter().any(|source| source.current_snapshot().is_none())
@@ -253,7 +288,7 @@ fn invalidate_records(
     index.remove_ids(ids)
 }
 
-type Signature = (u64, u64);
+type Signature = (u64, u64, LogicalLayout);
 const STALE_BATCH: usize = 16;
 
 type RecordIds = SmallOrderedSet<u64>;
@@ -303,9 +338,7 @@ impl Index {
                 let delta: Delta = wal::decode(&reader.payload)?;
                 match delta {
                     Delta::Begin(saved, saved_scope, views) if !begun && saved == mode_tag(mode)
-                        && saved_scope == scope_tag(scope) && views == index.views && !views.has_mapped_views() => begun = true,
-                    Delta::BeginMapped(saved, saved_scope, views) if !begun && saved == mode_tag(mode)
-                        && saved_scope == scope_tag(scope) && views == index.views && views.has_mapped_views() => begun = true,
+                        && saved_scope == scope_tag(scope) && views == index.views => begun = true,
                     Delta::Put(record) if begun => { index.insert(record.into_owned()); },
                     Delta::Remove(ids) if begun => { for id in ids { index.remove(id); } },
                     Delta::Journals(stamps) if begun => { index.apply_journals(&stamps); },
@@ -381,18 +414,14 @@ impl Index {
         self.append(&self.begin_record())
     }
     fn begin_record(&self) -> Delta<'static> {
-        let mode = mode_tag(self.mode);
-        let scope = scope_tag(self.scope);
-        let views = self.views.clone();
-        if views.has_mapped_views() { Delta::BeginMapped(mode, scope, views) }
-        else { Delta::Begin(mode, scope, views) }
+        Delta::Begin(mode_tag(self.mode), scope_tag(self.scope), self.views.clone())
     }
     fn prepare(&mut self, epoch: u64, mut record: Record, baseline: bool) -> Option<Prepared> {
         // Removing a scope with no resident entries can retire its journal
         // without bumping the epoch.
         if self.admission_epoch(&record.scope, None) != Some(epoch) { return None; }
         if let Some(saved) = self.owners.get(&record.owner).and_then(|id| self.records.get(id)).filter(|r| {
-            r.bytes == record.bytes && r.identities == record.identities
+            r.bytes == record.bytes && r.layout == record.layout && r.identities == record.identities
                 && (r.same_source_paths_and_versions(&record) || r.current())
         }) {
             if saved.admitted && saved.scope == record.scope { return None; }
@@ -460,7 +489,8 @@ impl Index {
         // A retry by its original owner is never suppressed by an alias that arrived later.
         let replaced = self.owners.get(&record.owner).copied();
         let own = replaced.and_then(|id| self.records.get(&id)).is_some_and(|r| {
-            r.admitted && r.scope == record.scope && r.bytes == record.bytes && r.identities == record.identities
+            r.admitted && r.scope == record.scope && r.bytes == record.bytes
+                && r.layout == record.layout && r.identities == record.identities
                 && (r.same_source_paths_and_versions(record) || r.current())
         });
         self.publish_representative(&mut prepared)?;
@@ -468,7 +498,7 @@ impl Index {
         loop {
             let record = &mut prepared.record;
             let signature = self.signature(record);
-            let objects = self.objects.get(&(signature, Arc::clone(&record.identities)));
+            let objects = self.objects.get(&(signature.clone(), Arc::clone(&record.identities)));
             let hashes = if self.mode == WatchDeduplication::Hash {
                 record.digest.and_then(|digest| self.hashes.get(&(signature, digest)))
             } else {
@@ -493,7 +523,7 @@ impl Index {
                     // After a miss, cheaply reject absent paths before the
                     // tracked open and USN query. A hit still needs full proof.
                     let missing = !stale.is_empty() && other.sources.iter().any(|source| {
-                        matches!(Path::new(&source.path).try_exists(), Ok(false))
+                        matches!(Path::new(source.path.as_ref()).try_exists(), Ok(false))
                     });
                     if !missing && other.current() {
                         matching = Some(other);
@@ -649,7 +679,11 @@ impl Index {
         scope
     }
     fn signature(&self, r: &Record) -> Signature {
-        (match self.scope { WatchDeduplicationScope::Root => self.domains[&r.scope], WatchDeduplicationScope::Global => 0 }, r.bytes)
+        let scope = match self.scope {
+            WatchDeduplicationScope::Root => self.domains[&r.scope],
+            WatchDeduplicationScope::Global => 0,
+        };
+        (scope, r.bytes, r.layout.clone())
     }
     fn insert(&mut self, mut r: Record) {
         r.scope = self.domain(&r.scope);
@@ -688,7 +722,7 @@ impl Index {
             if r.digest.is_none() { bucket.remove_pending(id); }
             if bucket.count == 0 { self.sizes.remove(&signature); }
         }
-        remove_bucket(&mut self.objects, &(signature, r.identities), id);
+        remove_bucket(&mut self.objects, &(signature.clone(), r.identities), id);
         if let Some(d) = r.digest { remove_bucket(&mut self.hashes, &(signature, d), id); }
     }
     fn append(&mut self, delta: &Delta<'_>) -> io::Result<()> {
@@ -730,12 +764,27 @@ fn remove_bucket<K: std::hash::Hash + Eq>(map: &mut HashMap<K, RecordIds>, key: 
     if map.get_mut(key).is_some_and(|ids| ids.remove(&id)) { map.remove(key); }
 }
 fn describe(owner: &str, scope: &str, inputs: &[&ArchiveInput]) -> io::Result<Option<Record>> {
+    describe_with_snapshots(owner, scope, inputs, |path| {
+        crate::filesystem::watch_ready_file_snapshot(path, None, physical_file_generation_from_metadata)
+    })
+}
+
+fn describe_with_snapshots(
+    owner: &str,
+    scope: &str,
+    inputs: &[&ArchiveInput],
+    mut snapshot: impl FnMut(&Path) -> io::Result<Option<SourceSnapshot>>,
+) -> io::Result<Option<Record>> {
+    let Some(first) = inputs.first() else { return Ok(None); };
     let mut identities = Vec::<Identity>::new();
     let mut sources: Vec<Source> = Vec::new();
     let mut range_sources = Vec::new();
-    let mut physical = HashMap::<String, u32>::new();
+    let mut physical = HashMap::<Arc<str>, u32>::new();
+    let mut bytes = 0u64;
+    let mut archives = Vec::new();
     for &input in inputs {
         if input.format_hint.is_empty() || input.analysis.missing_volume_evidence.is_some() { return Ok(None); }
+        let base = bytes;
         // A singleton fixed plan has no selection ambiguity. Reuse the canonical
         // materializer (including head trimming); never enumerate alternatives.
         let materialized;
@@ -747,57 +796,55 @@ fn describe(owner: &str, scope: &str, inputs: &[&ArchiveInput]) -> io::Result<Op
             if matches!(input.analysis.volume_completeness, Some(VolumeCompleteness::Missing | VolumeCompleteness::Unknown)) { return Ok(None); }
             &input.parts
         };
-        let mut push = |path: &str, start: u64, end: Option<u64>, whole: bool, reversed: bool, physical_size: Option<u64>| -> io::Result<bool> {
-            // Whole files and carriers with one spelling need no lookup table.
-            let (existing, path_id) = match sources.first() {
-                None => (None, None),
-                Some(first) if first.path == path => (Some(0), None),
-                Some(first) => {
-                    if physical.is_empty() {
-                        physical.insert(path_key(&first.path), 0);
-                    }
-                    let path_id = path_key(path);
-                    (physical.get(&path_id).copied(), Some(path_id))
-                }
+        let mut named_parts = input.uses_named_volumes().then(|| Vec::with_capacity(parts.len()));
+        let mut push = |path: &str, start: u64, end: Option<u64>, whole: bool, reversed: bool, view: Option<&ReadView>| -> io::Result<Option<u64>> {
+            // Consecutive spans usually share one exact descriptor path.
+            // Different case spellings can address distinct files on Windows.
+            let recent = range_sources.last().copied().unwrap_or(0);
+            let existing = match sources.get(recent as usize) {
+                Some(source) if source.path.as_ref() == path => Some(recent),
+                _ if sources.first().is_some_and(|source| source.path.as_ref() == path) => Some(0),
+                _ => physical.get(path).copied(),
             };
             let source = if let Some(id) = existing { id } else {
-                let Some(snapshot) = crate::filesystem::watch_ready_file_snapshot(
-                    Path::new(path), None, physical_file_generation_from_metadata,
-                )? else { return Ok(false); };
+                let Some(snapshot) = snapshot(Path::new(path))? else { return Ok(None); };
                 let id = sources.len() as u32;
+                let path: Arc<str> = Arc::from(path);
+                if id != 0 {
+                    physical.insert(Arc::clone(&path), id);
+                }
                 sources.push(Source {
-                    path: path.into(),
+                    path,
                     mtime: mtime_seconds(&snapshot.metadata),
                     usn: snapshot.change_usn(),
                     generation: snapshot.captured,
                 });
-                if let Some(path_id) = path_id {
-                    physical.insert(path_id, id);
-                }
                 id
             };
             let observed = &sources[source as usize];
-            let Some((volume, file)) = observed.generation.object_id() else { return Ok(false); };
+            let Some((volume, file)) = observed.generation.object_id() else { return Ok(None); };
             let size = observed.generation.len;
-            if physical_size.is_some_and(|expected| expected != size) { return Ok(false); }
-            let end = match end { Some(end) => end, None if whole => size, None => return Ok(false) };
-            let Some(len) = end.checked_sub(start) else { return Ok(false); };
-            if len == 0 || end > size { return Ok(false); }
+            if view.is_some_and(|view| view.physical_size != size || !view.matches_generation(Some(&observed.generation))) {
+                return Ok(None);
+            }
+            let end = match end { Some(end) => end, None if whole => size, None => return Ok(None) };
+            let Some(len) = end.checked_sub(start) else { return Ok(None); };
+            if len == 0 || end > size { return Ok(None); }
             // Adjacent runs from the same source share one identity and read.
-            if range_sources.last().copied().unwrap_or(0) == source {
+            if recent == source {
                 if let Some(last) = identities.last_mut() {
                     let last_end = last.start + last.len;
                     if !reversed && !last.reversed && last_end == start {
                         last.len += len;
-                        return Ok(true);
+                        return Ok(Some(len));
                     }
-                    if physical_size.is_some() || last.reversed {
+                    if view.is_some() || last.reversed || (last.len == 1 && len == 1) {
                         let mut run = Span { start: last.start, end: last_end, reverse: last.reversed };
                         if run.join(&Span { start, end, reverse: reversed }) {
                             last.start = run.start;
                             last.len = run.end - run.start;
                             last.reversed = run.reverse;
-                            return Ok(true);
+                            return Ok(Some(len));
                         }
                     }
                 }
@@ -807,35 +854,55 @@ fn describe(owner: &str, scope: &str, inputs: &[&ArchiveInput]) -> io::Result<Op
             }
             if !range_sources.is_empty() { range_sources.push(source); }
             identities.push(Identity { volume, file, start, len, reversed: reversed && len > 1 });
-            Ok(true)
+            Ok(Some(len))
         };
         if input.mode == OpenMode::File {
-            if !push(&input.entry_path, 0, None, true, false, None)? { return Ok(None); }
+            let Some(len) = push(&input.entry_path, 0, None, true, false, None)? else { return Ok(None); };
+            bytes = bytes.checked_add(len).ok_or_else(|| io::Error::other("deduplication byte length overflow"))?;
         } else {
             if parts.is_empty() { return Ok(None); }
             for p in parts.iter() {
-                if let Some(view) = &p.extent.view {
+                let len = if let Some(view) = &p.extent.view {
                     let length = view.len();
                     let end = p.extent.end.unwrap_or(length);
                     if end <= p.extent.start || end > length { return Ok(None); }
                     let mut valid = true;
                     view.visit(p.extent.start, end, |span| {
                         if valid {
-                            valid = push(&p.extent.path, span.start, Some(span.end), false, span.reverse, Some(view.physical_size))?;
+                            valid = push(&p.extent.path, span.start, Some(span.end), false, span.reverse, Some(view))?.is_some();
                         }
                         Ok(())
                     })?;
                     if !valid { return Ok(None); }
-                } else if !push(&p.extent.path, p.extent.start, p.extent.end, input.mode.structured(), false, None)? { return Ok(None); }
+                    end - p.extent.start
+                } else {
+                    let Some(len) = push(&p.extent.path, p.extent.start, p.extent.end, input.mode.structured(), false, None)? else { return Ok(None); };
+                    len
+                };
+                bytes = bytes.checked_add(len).ok_or_else(|| io::Error::other("deduplication byte length overflow"))?;
+                if let Some(named_parts) = &mut named_parts { named_parts.push((p.volume_number, len)); }
             }
         }
+        if inputs.len() > 1 || named_parts.is_some() {
+            archives.push(LogicalArchive {
+                format: input.format_hint.as_str().into(), len: bytes - base,
+                named_parts: named_parts.map(|parts| NamedParts { mode: input.mode, parts: parts.into_boxed_slice() }),
+            });
+        }
     }
+    // Preserve the boundaries seen by the decoder, including named volumes.
+    // Physical carriers and raw chunking leave the logical stream unchanged.
+    let layout = if archives.is_empty() {
+        LogicalLayout::single(&first.format_hint)
+    } else {
+        LogicalLayout::Archives(archives.into())
+    };
     Ok(Some(Record {
         id: 0,
         owner: Arc::from(path_key(owner)),
         scope: Arc::from(scope),
-        bytes: identities.iter().try_fold(0u64, |total, range| total.checked_add(range.len))
-            .ok_or_else(|| io::Error::other("deduplication byte length overflow"))?,
+        bytes,
+        layout,
         admitted: false,
         sources: sources.into(),
         range_sources: range_sources.into_boxed_slice(),

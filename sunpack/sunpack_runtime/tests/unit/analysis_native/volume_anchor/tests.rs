@@ -2,6 +2,44 @@ use super::*;
 use crate::password::rar::rar5_header_decryption_tests::{hex_bytes, PART1_HP_HEX, PART2_HP_HEX, SINGLE_HP_HEX};
 
 #[test]
+fn mapped_zip_carrier_search_reuses_its_checked_suffix() {
+    use crate::formats::zip::EOCD_SEARCH_BYTES;
+    use crate::io::view::{ReadView, Span, ViewMethod};
+
+    let size = 96 * 1024;
+    let padding = 17;
+    let bytes = vec![b'x'; size + padding];
+    let path = crate::test_support::temp_file("mapped_zip_tail", &bytes);
+    let physical = ManagedReader::open(&path).unwrap();
+    let view = Arc::new(ReadView {
+        generation: None,
+        method: ViewMethod::Apate,
+        depth: 1,
+        physical_size: physical.len(),
+        spans: vec![Span {
+            start: padding as u64,
+            end: physical.len(),
+            reverse: true,
+        }],
+    });
+    let mut anchor = VolumeAnchor {
+        path: path.to_str().unwrap().to_owned(),
+        view: Some(view),
+        size: size as u64,
+        format: "zip",
+        flags: ZIP_LOCAL_HEADER,
+        ..Default::default()
+    };
+    anchor = upgrade_relation_zip_tail(&anchor);
+    assert_eq!(anchor.bytes_read, EOCD_SEARCH_BYTES);
+    let physical_generation = physical.physical_generation().unwrap();
+    let resolved = upgrade_relation_zip_carrier_tail(&anchor, Some((0, physical_generation)));
+    assert_eq!(resolved.bytes_read, size as u64 + 3);
+    assert_eq!(resolved.zip_eocd_absent_generation(), physical.physical_generation());
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn standalone_gzip_reuses_sample_and_extends_long_headers() {
     use std::io::Write;
 

@@ -53,6 +53,7 @@ void check_chunked_request(const std::filesystem::path& archive) {
     const auto body = wire::object() + wire::key("job_id") + wire::text("chunked") +
         wire::key("archive_input") + wire::object() +
         wire::key("entry_path") + wire::text(path) +
+        wire::key("named_volumes") + wire::boolean(true) +
         wire::key("open_mode") + wire::text("native_volumes") +
         wire::key("format_hint") + wire::text("zip") +
         wire::key("volume_attempts") + wire::object() +
@@ -93,6 +94,7 @@ void check_chunked_request(const std::filesystem::path& archive) {
     const auto request = parse_worker_request(reader);
     const auto& plan = request.archive_input.volume_attempts;
     require(request.job_id == "chunked" && request.archive_input.validation_error.empty() &&
+            request.archive_input.mode == ArchiveOpenMode::NamedVolumes &&
             request.archive_input.archive_path == archive.wstring() && plan.sources.size() == 2 &&
             plan.sources[1].start == 40 && plan.layouts.size() == 1 && plan.layouts[0][1].name == L"two" &&
             plan.domains == std::vector<std::vector<std::size_t>>{{0, 1}} &&

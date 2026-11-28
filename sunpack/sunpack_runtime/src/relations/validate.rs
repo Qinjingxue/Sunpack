@@ -159,13 +159,11 @@ fn verify_seven_zip_mapping(validation: &ProposalValidation) -> std::io::Result<
 pub(super) fn raw_zip_directory_heads(
     heads: &HashMap<&[u8], Vec<(usize, crate::formats::zip::RelationLocalFields)>>,
     tail: &VolumeAnchor,
-    mut directory: crate::formats::zip::RelationDirectory,
+    directory: crate::formats::zip::RelationDirectory,
     competing_views: bool,
 ) -> Option<(Vec<usize>, HashMap<usize, Option<u64>>)> {
     use crate::formats::zip::{visit_relation_directory, RelationLocalFields};
-    // For byte-sliced ZIPs the saved offset is logical; the directory reader
-    // is opening only the physical tail and needs the local coordinate.
-    directory.offset = directory.end.checked_sub(directory.size)?;
+    let directory = directory.in_raw_tail()?;
     let mut matched = Vec::new();
     let mut members = HashMap::new();
     let complete = visit_relation_directory(&tail.open().ok()?, directory, |record, values| {

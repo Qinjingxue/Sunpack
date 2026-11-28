@@ -71,7 +71,7 @@ pub(crate) struct VolumeAnchor {
     pub(crate) carrier_limit: Option<u64>,
     pub(crate) expected_logical_size: Option<u64>,
     pub(crate) zip_eocd_offset: Option<u64>,
-    // Physical signature evidence from the bounded tail or full carrier scan.
+    // Signature evidence from this view's bounded tail or full carrier scan.
     pub(crate) zip_eocd_search: Option<Arc<ZipEocdSearch>>,
     pub(crate) zip_directory: Option<Arc<crate::formats::zip::RelationDirectory>>,
     // A two-disk directory can locate a carrier head without an interior disk.
@@ -126,6 +126,41 @@ impl VolumeAnchor {
         prefix.flags = prefix.flags & !(ZIP_TAIL_CHECKED | ZIP_CARRIER_CHECKED) | BOUNDED_SOURCE;
         Some(prefix)
     }
+
+    /// A CRC-valid Start Header can look standalone when a carrier extends past
+    /// its declared end. Check its Next Header before admitting shorter disks.
+    pub(crate) fn interrupted_seven_zip(
+        &self,
+        reader: &ManagedReader,
+        mask_end: u64,
+    ) -> std::io::Result<Option<Self>> {
+        let Some((start, header)) = self.structure_offset.zip(self.seven_zip_next_header.as_deref())
+        else { return Ok(None); };
+        if !self.standalone || self.payload_end.is_some() || header.size == 0
+            || reader.len() != self.size || self.view.as_ref() != reader.read_view()
+            || start.saturating_add(32) > mask_end || mask_end >= self.size
+            || self.expected_logical_size.is_none_or(|end| end <= mask_end)
+        {
+            return Ok(None);
+        }
+        // The directory's cheap proof may predate this open generation.
+        let prefix = reader.read_direct_at(start, 32)?;
+        let mut anchor = self.clone();
+        if !probe_seven_zip(&prefix, 0, reader.len() - start, &mut anchor)
+            || anchor.seven_zip_next_header.as_deref() != Some(header)
+            || crate::formats::seven_zip::relation_header_crc(reader, start + header.offset, *header)? == Some(true)
+        {
+            return Ok(None);
+        }
+        anchor.structure_offset = Some(start);
+        anchor.expected_logical_size = self.expected_logical_size;
+        anchor.standalone = false;
+        anchor.multivolume = true;
+        anchor.continuation_to_next = true;
+        anchor.flags |= SEVEN_ZIP_CARRIER_INTERRUPTED;
+        Ok(Some(anchor))
+    }
+
     pub(crate) fn open(&self) -> std::io::Result<ManagedReader> { ManagedReader::open(&self.path)?.with_view(self.view.as_ref()) }
     pub(crate) fn has_any(&self, flags: u32) -> bool {
         self.flags & flags != 0
@@ -347,7 +382,7 @@ pub(crate) fn probe_volume_anchor_record_cheap(
         .map_or_else(|| open_cheap_file(path), |scope| scope.open_reader(path))
         .and_then(|mut file| {
             file.read_exact(&mut prefix[..read_len])?;
-            Ok(probe_views.rejections(&file, size, &prefix[..read_len]))
+            Ok(probe_views.probe_evidence(&file, size, &prefix[..read_len]))
         });
     let anchor = match read {
         Ok(mask) => {
@@ -443,6 +478,7 @@ pub(crate) fn probe_volume_anchor_reader(mut result: VolumeAnchor, reader: &Mana
 
 pub(crate) fn probe_volume_anchor_prefix(mut result:VolumeAnchor, reader:&ManagedReader, prefix:&[u8]) -> VolumeAnchor {
     result.size = reader.len();
+    result.view = reader.read_view().cloned();
     result.bytes_read += prefix.len() as u64;
     probe_cheap_prefix(result, prefix, |offset, len| reader.read_direct_at(offset, len))
 }
@@ -786,12 +822,7 @@ fn probe_zip_reader(
     let recognized = probe_zip_eocd(prefix, tail, tail_start, out, eocd);
     if trailing
         && out.zip_directory.as_ref().is_none_or(|directory| {
-            let mut physical = **directory;
-            physical.end += base;
-            !matches!(
-                crate::formats::zip::visit_relation_directory(reader, physical, |_, _| {}),
-                Ok(true)
-            )
+            !valid_zip_tail_directory(reader, **directory, base, out.has_any(ZIP_TAIL_WITHOUT_HEAD))
         })
     {
         let bytes_read = out.bytes_read;
@@ -807,6 +838,17 @@ fn probe_zip_reader(
         }
     }
     recognized
+}
+
+fn valid_zip_tail_directory(
+    reader: &ManagedReader, mut directory: crate::formats::zip::RelationDirectory, base: u64, raw_tail: bool,
+) -> bool {
+    directory.end += base;
+    if raw_tail {
+        let Some(relative) = directory.in_raw_tail() else { return false; };
+        directory = relative;
+    }
+    matches!(crate::formats::zip::visit_relation_directory(reader, directory, |_, _| {}), Ok(true))
 }
 
 #[cfg(test)]
@@ -978,20 +1020,25 @@ pub(crate) fn apply_relation_zip_tail(out: &mut VolumeAnchor, reader: &ManagedRe
     if !probe_zip_reader(&[], tail, start, &mut terminal, reader, 0) {
         // A failed directory probe is insufficient. Skip a suffix only when
         // there is no possible fixed record starting anywhere in its bytes.
-        if out.has_any(ZIP_LOCAL_HEADER)
+        let local_head = out.has_any(ZIP_LOCAL_HEADER);
+        if (start == 0 || local_head)
+            && size == out.size
+            && size == reader.len()
             && tail.len() as u64 == size - start
             && memmem::find(
                 &tail[..tail.len().saturating_sub(22 - ZIP_EOCD.len())],
                 ZIP_EOCD,
             ).is_none()
         {
-            out.zip_eocd_search = reader.physical_generation()
-                .filter(|generation| generation.len == out.size)
-                .map(|generation| Arc::new(ZipEocdSearch {
-                    generation: generation.clone(),
-                    start,
-                    unique_offset: None,
-                }));
+            if start == 0 { out.flags |= ZIP_CARRIER_CHECKED; }
+            if local_head {
+                out.zip_eocd_search = reader.physical_generation()
+                    .map(|generation| Arc::new(ZipEocdSearch {
+                        generation: generation.clone(),
+                        start,
+                        unique_offset: None,
+                    }));
+            }
         }
         return;
     }
@@ -1019,9 +1066,8 @@ pub(crate) fn apply_relation_zip_tail(out: &mut VolumeAnchor, reader: &ManagedRe
     out.discard_zip_continuation_head();
 }
 
-/// Only a known ZIP bucket without a terminal enters this fallback. Scan its
-/// bytes in fixed windows; verify each candidate using the
-/// shared EOCD/directory parsers before accepting a carrier's logical end.
+/// Verify known EOCD evidence or scan the unresolved ZIP input in fixed windows.
+/// The shared directory parser confirms the carrier's logical end.
 pub(crate) fn upgrade_relation_zip_carrier_tail(
     anchor: &VolumeAnchor,
     known_eocd: Option<(u64, &PhysicalFileGeneration)>,
@@ -1038,11 +1084,13 @@ pub(crate) fn upgrade_relation_zip_carrier_tail(
     let checked_suffix = out.zip_eocd_search.take().filter(|search| {
         reader.physical_generation() == Some(&search.generation)
     });
+    // PreparedZipScan offsets belong to the physical stream. An anchor's
+    // own tail evidence belongs to its logical stream.
     let unique_eocd = known_eocd.filter(|(_, generation)| {
-        reader.physical_generation() == Some(*generation)
+        reader.read_view().is_none() && reader.physical_generation() == Some(*generation)
     }).map(|(offset, _)| offset).or_else(|| {
         checked_suffix.as_ref().and_then(|search| search.unique_offset)
-    });
+    }).filter(|offset| offset.checked_add(22).is_some_and(|end| end <= size));
     // Keep enough overlap to find a signature straddling the checked suffix.
     let mut end = checked_suffix.as_ref().map_or(size, |suffix| {
         if suffix.start == 0 { 0 } else { suffix.start + ZIP_EOCD.len() as u64 - 1 }
@@ -1108,10 +1156,7 @@ pub(crate) fn upgrade_relation_zip_carrier_tail(
             let Some(directory) = candidate.zip_directory.as_ref() else {
                 continue;
             };
-            if !matches!(
-                crate::formats::zip::visit_relation_directory(&reader, **directory, |_, _| {}),
-                Ok(true)
-            ) {
+            if !valid_zip_tail_directory(&reader, **directory, 0, candidate.has_any(ZIP_TAIL_WITHOUT_HEAD)) {
                 continue;
             }
             // The relation fallback found an older directory outside the
@@ -1140,6 +1185,7 @@ pub(crate) fn upgrade_relation_zip_carrier_tail(
                 out.flags &= !FIRST;
             }
             out.flags |= TERMINAL | candidate.flags | ZIP_CARRIER_CHECKED;
+            out.discard_zip_continuation_head();
             return out;
         }
         if start == 0 || unique_eocd.is_some() {
@@ -1152,11 +1198,10 @@ pub(crate) fn upgrade_relation_zip_carrier_tail(
         return upgrade_relation_zip_carrier_tail(&out, None);
     }
     out.flags |= ZIP_CARRIER_CHECKED;
-    if !possible_eocd && anchor.has_any(ZIP_LOCAL_HEADER) {
+    if !possible_eocd && anchor.has_any(ZIP_LOCAL_HEADER) && anchor.size == reader.len() {
         if let Some(generation) = reader.physical_generation().filter(|generation| {
-            generation.len == anchor.size
-                && capture_file_generation(std::path::Path::new(&out.path))
-                    .is_ok_and(|current| &current == *generation)
+            capture_file_generation(std::path::Path::new(&out.path))
+                .is_ok_and(|current| &current == *generation)
         }) {
             out.mark_zip_eocd_absent(generation.clone());
         }
@@ -1403,6 +1448,7 @@ pub(crate) fn probe_volume_anchor_reader_at_offset(
 ) -> std::io::Result<VolumeAnchor> {
     let mut result = VolumeAnchor {
         path: path.to_string(),
+        view: reader.read_view().cloned(),
         ..VolumeAnchor::default()
     };
     let size = reader.len();

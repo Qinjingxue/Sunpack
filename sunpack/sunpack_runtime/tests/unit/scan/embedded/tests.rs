@@ -59,6 +59,58 @@ fn zip_terminal_absence_preserves_split_headers_and_chunk_edges() {
 }
 
 #[test]
+fn opaque_root_reuses_eocd_evidence_from_its_complete_view() {
+    use crate::io::view::{ReadView, Span, ViewMethod};
+
+    let terminal = MAX_DISCOVERY_IOCP_CHUNK_SIZE - 2;
+    let mut data = vec![b'x'; MAX_DISCOVERY_IOCP_CHUNK_SIZE + 64];
+    data[terminal..terminal + 4].copy_from_slice(ZIP_EOCD);
+    data[terminal + 4..terminal + 22].fill(0);
+    data[terminal + 4] = 1; // A possible split terminal on the mapped stream.
+    data.reverse();
+    let path = temp_file("mapped_eocd_proof", &data);
+    let physical = ManagedReader::open(&path).unwrap();
+    let size = physical.len();
+    let view = Arc::new(ReadView {
+        generation: None,
+        method: ViewMethod::Apate,
+        depth: 1,
+        physical_size: size,
+        spans: vec![Span { start: 0, end: size, reverse: true }],
+    });
+    let mapped = view.bind(&physical).unwrap();
+    let root = VolumeAnchor { size, view: Some(view), ..Default::default() };
+    let mut opaque = root.clone();
+    scan_view_root(&mapped, &[b'x'; 512], None).unwrap().apply_zip_eocd_evidence(&mut opaque);
+    assert!(!opaque.has_any(ZIP_TAIL_CHECKED | ZIP_CARRIER_CHECKED));
+    let scan = scan_embedded_view(mapped, 1, None, None).unwrap();
+    scan.apply_zip_eocd_evidence(&mut opaque);
+    assert_eq!(opaque.zip_eocd_search.as_ref().and_then(|search| search.unique_offset), Some(terminal as u64));
+
+    let mut plain = VolumeAnchor { size, ..Default::default() };
+    scan_embedded_view(physical, 1, None, None).unwrap().apply_zip_eocd_evidence(&mut plain);
+    assert!(plain.has_any(ZIP_TAIL_CHECKED) && plain.has_any(ZIP_CARRIER_CHECKED));
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn short_scan_does_not_prove_an_opaque_root_lacks_a_zip_terminal() {
+    use crate::io::reader::ByteSource;
+
+    struct ShortRead;
+    impl ByteSource for ShortRead {
+        fn len(&self) -> u64 { 128 }
+        fn read_at(&self, _: u64, _: usize) -> io::Result<Vec<u8>> {
+            Ok(vec![b'x'; 64])
+        }
+    }
+    let reader = ManagedReader::new(Arc::new(ShortRead), ReaderConfig::default());
+    let mut root = VolumeAnchor { size: reader.len(), ..Default::default() };
+    scan_embedded_view(reader, 1, None, None).unwrap().apply_zip_eocd_evidence(&mut root);
+    assert!(!root.has_any(ZIP_TAIL_CHECKED | ZIP_CARRIER_CHECKED));
+}
+
+#[test]
 fn streaming_view_stops_at_the_cancelled_chunk() {
     use crate::io::{cancellation::{Cancellation, is_cancellation}, reader::ByteSource};
     struct CancelAfterFirstRead(Cancellation);
@@ -92,7 +144,7 @@ fn mapped_scans_reload_overlap_before_a_changed_span() {
     let file = ManagedReader::from_bytes(bytes, ReaderConfig::default());
     let mut shared = 0..0;
     let mut scan = |depth, spans| {
-        let view = Arc::new(ReadView { method: ViewMethod::Apate, depth, physical_size: size, spans });
+        let view = Arc::new(ReadView { method: ViewMethod::Apate, depth, physical_size: size, spans, generation: None });
         scan_embedded_archives_native_with_iocp(view.bind(&file).unwrap(), chunk, 2, 1, None, Some(&mut shared)).unwrap()
     };
     let span = |start, end, reverse| Span { start, end, reverse };

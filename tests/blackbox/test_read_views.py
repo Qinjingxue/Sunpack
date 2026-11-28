@@ -22,6 +22,23 @@ def _apate(data, mask):
     return mask + data[len(mask):] + data[:len(mask)][::-1] + len(mask).to_bytes(4, "little")
 
 
+@pytest.mark.parametrize("mapped", [False, True])
+def test_standalone_zip_with_spanned_extension(package, tmp_path, mapped):
+    package.configure(filesystem={"read_views": ["apate:1"] if mapped else ["plain"]})
+    payload = b"standalone ZIP with a misleading extension"
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as output:
+        output.writestr("inside.txt", payload)
+    data = archive.getvalue()
+    source = tmp_path / "mimic.z01"
+    source.write_bytes(_apate(data, bytes(len(data))) if mapped else data)
+
+    target = tmp_path / "extracted"
+    package.json("extract", "-o", target, "-c", "k", source)
+    inside, = target.rglob("inside.txt")
+    assert inside.read_bytes() == payload
+
+
 def test_stream_routes_share_formats_and_offsets_across_readers(package, tmp_path):
     package.configure(filesystem={"read_views": ["plain", "apate:1"]})
     sources = tmp_path / "sources"
@@ -40,6 +57,27 @@ def test_stream_routes_share_formats_and_offsets_across_readers(package, tmp_pat
         assert len(items) == len(expected)
         assert {Path(item["main_path"]).name: (item["format"], item.get("offset"),
                 item.get("end_offset"), item.get("views")) for item in items} == expected
+
+
+def test_mapped_archive_on_long_windows_path(package, tmp_path):
+    package.configure(filesystem={"read_views": ["apate:1"]})
+    folder = tmp_path / ("first-" + "x" * 80) / ("second-" + "y" * 80) / ("third-" + "z" * 80)
+    source = folder / "masked.blob"
+    assert len(str(source)) > 260
+    Path(f"\\\\?\\{folder}").mkdir(parents=True)
+    payload = b"archive on an extended Windows path"
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as output:
+        output.writestr("inside.txt", payload)
+    data = archive.getvalue()
+    Path(f"\\\\?\\{source}").write_bytes(_apate(data, bytes(len(data))))
+
+    item, = package.json("scan", source)["items"]
+    assert item["views"] == [{"method": "apate", "depth": 1}]
+    target = tmp_path / "extracted"
+    package.json("extract", "-o", target, "-c", "k", source)
+    inside, = target.rglob("inside.txt")
+    assert inside.read_bytes() == payload
 
 
 def test_exact_depth_and_multi_volume_scan_summary(package, tmp_path):
@@ -210,6 +248,7 @@ def test_intermediate_stream_masks_use_their_own_boundary(package, tmp_path):
     opaque = b"not an archive" * 200
     for i, (views, source_bytes, flags) in enumerate([
         (["plain", "apate:1"], _apate(opaque, ENC_VECTOR.read_bytes()), ()),
+        (["plain", "apate:2"], _apate(opaque, ENC_VECTOR.read_bytes()), ()),
         (["apate:1", "apate:2"], _apate(_apate(opaque, ENC_VECTOR.read_bytes()), b"JPG"), ("-d",)),
     ]):
         package.configure(filesystem={"read_views": views})
@@ -229,6 +268,51 @@ def test_intermediate_stream_masks_use_their_own_boundary(package, tmp_path):
     report = package.json("extract", "-o", output, "-c", "k", source)
     assert report["summary"]["failed_count"] == 0
     assert sorted(p.read_bytes() for p in output.rglob("*") if p.is_file()) == [b"cross-boundary gzip", b"restored ZIP"]
+
+
+def test_split_zip_uses_plain_mask_bounds_without_a_requested_mapped_view(package, tmp_path):
+    case = ArchiveFixtureFactory().create(
+        tmp_path, "zip", "zip", split=True, compression_level=0, password=PASSWORD,
+        payload_size=145 * 1024, split_volume_size=64 * 1024,
+    )
+    carriers = tmp_path / "carriers"
+    carriers.mkdir()
+    for index, part in enumerate(sorted(case.archive_dir.iterdir()), 1):
+        disk = part.read_bytes()
+        # Restoring one layer yields opaque bytes, so no requested depth-2 view exists.
+        (carriers / f"set.{index:03}.blob").write_bytes(_apate(bytes(2 * len(disk)), disk))
+    package.configure(filesystem={"read_views": ["plain", "apate:2"]})
+    expected = sorted((name, info["size"], info["crc32"])
+                      for name, info in case.metadata["expected_files"].items())
+    for flags, name in [((), "normal"), (("-d",), "deep")]:
+        output = tmp_path / name
+        package.json("extract", *flags, "-p", PASSWORD, "-c", "k", "-o", output, carriers)
+        assert _output_inventory(output) == expected
+
+
+def test_seven_zip_mask_bound_checks_the_actual_next_header(package, tmp_path):
+    case = ArchiveFixtureFactory().create(
+        tmp_path, "archive", "7z", split=True, compression_level=0, password=PASSWORD,
+        payload_size=145 * 1024, split_volume_size=64 * 1024,
+    )
+    carriers = tmp_path / "carriers"
+    carriers.mkdir()
+    disks = [part.read_bytes() for part in sorted(case.archive_dir.iterdir())]
+    for index, disk in enumerate(disks, 1):
+        # The first carrier is larger than the whole archive, but its valid
+        # Next Header is on the last disk, beyond this disk's mask boundary.
+        (carriers / f"set.{index:03}.blob").write_bytes(_apate(bytes(2 * len(disk)), disk))
+        member = b"archive prefix" + disk if index == 1 else disk
+        (carriers / f"prefixed.{index:03}.blob").write_bytes(_apate(bytes(2 * len(member)), member))
+    archive = b"".join(disks)
+    (carriers / "crossing.blob").write_bytes(_apate(bytes(64) + archive[64:], archive[:64]))
+    package.configure(filesystem={"read_views": ["plain", "apate:2"]})
+    expected = sorted((name, info["size"], info["crc32"])
+                      for name, info in case.metadata["expected_files"].items())
+    for flags, name in [((), "normal"), (("-d",), "deep")]:
+        output = tmp_path / name
+        package.json("extract", *flags, "-p", PASSWORD, "-c", "k", "-o", output, carriers)
+        assert _output_inventory(output) == sorted(expected * 3)
 
 
 def test_raw_zip_volume_views_with_indistinguishable_local_headers(package, tmp_path):
@@ -396,6 +480,133 @@ def test_two_volume_sets_with_shared_names_and_mask_disks(package, tmp_path, kin
     assert _output_inventory(output) == inventories[0]
 
 
+@pytest.mark.parametrize("mapped", [False, True])
+def test_raw_and_spanned_zip_sets_share_a_stem(package, tmp_path, mapped):
+    package.configure(filesystem={"read_views": ["plain", "apate:1"] if mapped else ["plain"]})
+    options = dict(password=PASSWORD, payload_size=150 * 1024, split_volume_size=64 * 1024)
+    raw = ArchiveFixtureFactory().create(tmp_path, "raw", "zip", split=True,
+                                         compression_level=0, **options)
+    spanned = create_zip_multidisk_archive(tmp_path, "spanned", **options)
+    sources = tmp_path / "shared-stem"
+    sources.mkdir()
+    expected = []
+    for label, case in (("raw", raw), ("spanned", spanned)):
+        disks = sorted(case.archive_dir.iterdir(), key=lambda p: (p.suffix == ".zip", p.name))
+        assert len(disks) == 3
+        for number, disk in enumerate(disks, 1):
+            data = disk.read_bytes()
+            if mapped and number != 2:
+                data = _apate(data, bytes(12))
+            (sources / f"set.{label}.{number:03}.blob").write_bytes(data)
+        expected.extend((name, item["size"], item["crc32"])
+                        for name, item in case.metadata["expected_files"].items())
+    output = tmp_path / "delivered"
+    package.json("extract", "-p", PASSWORD, "-c", "k", "-o", output, sources)
+    assert _output_inventory(output) == sorted(expected)
+
+
+@pytest.mark.parametrize(("kind", "deep"), [
+    ("spanned", False), ("spanned", True), ("raw", False), ("raw", True), ("plain-raw", True),
+])
+def test_zip_carrier_tail_resolves_in_its_own_coordinates(package, tmp_path, kind, deep):
+    package.configure(filesystem={"read_views": ["plain"] if kind == "plain-raw" else ["plain", "apate:1"]})
+    options = dict(password=PASSWORD, payload_size=150 * 1024, split_volume_size=64 * 1024)
+    raw_case = ArchiveFixtureFactory().create(
+        tmp_path, "raw", "zip", split=True, compression_level=0, **options)
+    inputs = tmp_path / "carriers"
+    inputs.mkdir()
+    raw = [disk.read_bytes() for disk in sorted(raw_case.archive_dir.iterdir())]
+    assert len(raw) == 3
+    padding = b"x" * (200 * 1024)
+    cases = [raw_case]
+    if kind == "plain-raw":
+        parts = sorted(raw_case.archive_dir.iterdir())
+        inputs = raw_case.archive_dir
+        parts[-1].write_bytes(raw[-1] + padding)
+        files = []
+    elif kind == "raw":
+        # The EOCD's directory offset is archive-relative on a byte-sliced ZIP.
+        files = [_apate(raw[0], bytes(12)), raw[1], _apate(raw[2] + padding, bytes(12))]
+    else:
+        # A raw terminal in one view does not close the native split head in another.
+        spanned_case = create_zip_multidisk_archive(tmp_path, "spanned", **options)
+        spanned = [
+            disk.read_bytes() for disk in sorted(
+                spanned_case.archive_dir.iterdir(), key=lambda path: (path.suffix == ".zip", path.name))
+        ]
+        assert len(spanned) == 3
+        files = [_apate(raw[0], spanned[0]), _apate(raw[1], spanned[1]), raw[2], spanned[2] + padding]
+        cases.append(spanned_case)
+    for index, data in enumerate(files, 1):
+        (inputs / f"set.{min(index, 3):03}.{index}.blob").write_bytes(data)
+
+    output = tmp_path / "out"
+    flags = ["-d"] if deep else []
+    package.json("extract", *flags, "-p", PASSWORD, "-c", "k", "-o", output, inputs)
+    assert _output_inventory(output) == sorted(
+        (name, item["size"], item["crc32"])
+        for case in cases for name, item in case.metadata["expected_files"].items()
+    )
+
+
+def test_spanned_zip_terminal_keeps_name_with_view_alternatives(package, tmp_path):
+    package.configure(filesystem={"read_views": ["plain", "apate:1"]})
+    case = create_zip_multidisk_archive(
+        tmp_path, "case2-128", payload_size=192 * 1024, split_volume_size=128 * 1024)
+    head = case.archive_dir / "case2-128.z01"
+    head.write_bytes(_apate(head.read_bytes(), b"small mask"))
+
+    scan = package.json("scan", case.archive_dir)
+    assert len(scan["items"]) == 1
+    plan = scan["items"][0]["volume_attempts"]
+    assert all(layout["slots"][-1]["canonical_name"] == "case2-128.zip"
+               for layout in plan["layouts"])
+
+    output = tmp_path / "out"
+    package.json("extract", "-c", "k", "-o", output, case.archive_dir)
+    assert _output_inventory(output) == sorted(
+        (Path(name).name, item["size"], item["crc32"])
+        for name, item in case.metadata["expected_files"].items()
+    )
+
+
+@pytest.mark.parametrize(("embedded", "orphan_tail"), [(False, False), (True, False), (False, True)])
+def test_independent_spanned_zips_share_a_tail_view_bucket(package, tmp_path, embedded, orphan_tail):
+    package.configure(filesystem={"read_views": ["plain", "apate:1"]},
+                      embedded_scan={"enabled": embedded})
+    sources = tmp_path / "shared-stem"
+    sources.mkdir()
+    expected = []
+    for name in ("one", "two"):
+        case = create_zip_multidisk_archive(
+            tmp_path, name, password=PASSWORD, payload_size=150 * 1024,
+            split_volume_size=64 * 1024,
+        )
+        disks = sorted(case.archive_dir.iterdir(), key=lambda path: (path.suffix == ".zip", path.name))
+        assert len(disks) == 3
+        for number, disk in enumerate(disks, 1):
+            if orphan_tail and name == "one" and number != 3:
+                continue
+            data = disk.read_bytes()
+            if name == "one":
+                data = _apate(data, bytes(12))
+            elif number == 3:
+                data = _apate(data + b"x" * (200 * 1024), bytes(50))
+            (sources / f"set.{number:03}.{name}.blob").write_bytes(data)
+        if not (orphan_tail and name == "one"):
+            expected.extend((name, item["size"], item["crc32"])
+                            for name, item in case.metadata["expected_files"].items())
+
+    output = tmp_path / "delivered"
+    result = package.json("extract", "-p", PASSWORD, "-c", "k", "-o", output, sources,
+                          code=int(orphan_tail))
+    assert result["summary"]["success_count"] == (1 if orphan_tail else 2)
+    if orphan_tail:
+        assert result["summary"]["failed_count"] == 1
+        assert "set.003.one.blob" in result["errors"][0]
+    assert _output_inventory(output) == sorted(expected)
+
+
 def test_recursive_ratio_keeps_selected_disks_peers(package, tmp_path):
     package.configure(filesystem={"read_views": ["plain", "apate:1", "apate:3"]},
                       embedded_scan={"recursive_candidate_ratio": 0.35})
@@ -487,6 +698,24 @@ def test_zip_discovery_and_missing_parity(package, tmp_path):
             for flags in [(), ("-d",)]:
                 item, = package.json("scan", *flags, path, code=1)["items"]
                 assert item["volume_completeness"] == "missing"
+
+
+def test_leading_zip_and_later_directory_project_both_archives(package, tmp_path):
+    archives = []
+    expected = {"first.txt": b"first ZIP", "second.txt": b"second independent ZIP"}
+    for name, content in expected.items():
+        stream = io.BytesIO()
+        with zipfile.ZipFile(stream, "w") as writer:
+            writer.writestr(name, content)
+        archives.append(stream.getvalue())
+    source = tmp_path / "joined.blob"
+    data = b"".join(archives)
+    for mapped, view in ((False, "plain"), (True, "apate:1")):
+        source.write_bytes(_apate(data, b"MASK") if mapped else data)
+        package.configure(filesystem={"read_views": [view]}, embedded_scan={"enabled": True})
+        output = tmp_path / view.split(":")[0]
+        package.json("extract", "-c", "k", "-o", output, source)
+        assert {file.name: file.read_bytes() for file in output.rglob("*.txt")} == expected
 
 
 @pytest.mark.parametrize("spanned", [False, True])

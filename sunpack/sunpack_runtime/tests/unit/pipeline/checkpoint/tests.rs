@@ -132,6 +132,7 @@ fn partial_retry_requires_fixed_mapping_and_facts_but_complete_admits_alternativ
         canonical_name: "archive.7z.001".into(),
     }].into_boxed_slice();
     input.parts[0].extent.view = Some(Arc::new(crate::io::view::ReadView {
+        generation: None,
         method: crate::io::view::ViewMethod::Apate, depth: 1, physical_size: 7,
         spans: vec![crate::io::view::Span { start: 0, end: 7, reverse: true }],
     }));

@@ -5,10 +5,9 @@
 #include <map>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <unordered_map>
-#include <unordered_set>
 #include <string>
-#include <string_view>
 #include <utility>
 #include <vector>
 #include "volume_attempts.hpp"
@@ -67,6 +66,7 @@ struct VolumeReadUncertainty {
     std::vector<std::size_t> variable_slots;
     std::atomic<bool> untracked_named_volume{false};
     void observe_named_volume(std::size_t slot) {
+        if (!observed && uncertain_read.load(std::memory_order_relaxed)) return;
         const auto it = std::lower_bound(variable_slots.begin(), variable_slots.end(), slot);
         if (it == variable_slots.end() || *it != slot) return;
         uncertain_read.store(true, std::memory_order_relaxed);
@@ -89,18 +89,15 @@ struct ExtractionReplay : VolumeReadUncertainty {
     VolumeAttemptCursor volumes;
     bool volume_password_uncertain = false;
     bool volume_password_ambiguous = false;
-    // Named volume reads resolve against the immutable request's source paths.
-    std::unordered_set<std::wstring_view> uncertain_paths;
 #ifdef SUP7Z_DEBUG
     std::size_t rejected_compositions = 0;
     std::size_t prepared_compositions = 0;
     std::size_t scheduled_volume_probes = 0;
 #endif
-    void observe_volume_read(std::uint64_t offset, std::uint32_t size, const std::wstring* physical = nullptr) {
-        if (!volumes.started) return;
-        if (!physical) observe_logical_read(offset, size);
-        else if (size && !uncertain_read.load(std::memory_order_relaxed) && uncertain_paths.count(*physical))
-            uncertain_read.store(true, std::memory_order_relaxed);
+    void observe_volume_read(std::uint64_t offset, std::uint32_t size, std::optional<std::size_t> named_slot) {
+        if (!volumes.started || !size) return;
+        if (named_slot) observe_named_volume(*named_slot);
+        else observe_logical_read(offset, size);
     }
     // Only output identity and confirmed byte intervals survive an attempt.
     // No archive handler, dictionary, output buffer or CPU credit is retained.

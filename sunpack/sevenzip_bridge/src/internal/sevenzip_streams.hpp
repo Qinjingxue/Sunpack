@@ -22,9 +22,13 @@
 
 #include <functional>
 
+#include <limits>
+
 #include <memory>
 
 #include <new>
+
+#include <optional>
 
 #include <string>
 #include <string_view>
@@ -52,14 +56,23 @@ namespace sunpack::sevenzip
         UInt32 window_bytes = 512 * 1024;
     };
 
+    constexpr bool uses_named_volume_streams(ArchiveOpenMode mode) noexcept
+    {
+        return mode == ArchiveOpenMode::NamedVolumes || mode == ArchiveOpenMode::SfxWithVolumes;
+    }
+
     inline InputPrefetchConfig input_prefetch_config(
-        std::wstring_view format_hint = {}, bool native_volume_input = false) noexcept
+        std::wstring_view format_hint = {}, ArchiveOpenMode mode = ArchiveOpenMode::File) noexcept
     {
         InputPrefetchConfig config;
 #ifdef SUP7Z_DEBUG
         if (const char *enabled = std::getenv("SUNPACK_SEVENZIP_PREFETCH"))
             return InputPrefetchConfig{enabled[0] != '0'};
 #endif
+
+        // Named-volume handlers retain streams for multiple disks. Let the
+        // filesystem cache serve them without private read-ahead per disk.
+        if (uses_named_volume_streams(mode)) return InputPrefetchConfig{false};
 
         // The format tags below have at most four characters.
         std::array<wchar_t, 4> folded;
@@ -75,7 +88,7 @@ namespace sunpack::sevenzip
         // of speculative reads/copies. Keep their direct input path by default.
         if (normalized == L"gz" || normalized == L"gzip" || normalized == L"xz" ||
             normalized == L"lz4" || normalized == L"zst" || normalized == L"zstd" || normalized == L"tar" ||
-            (native_volume_input &&
+            (mode == ArchiveOpenMode::NativeVolumes &&
              (normalized == L"rar" || normalized == L"rar4" || normalized == L"rar5")))
         {
             config.enabled = false;
@@ -86,6 +99,11 @@ namespace sunpack::sevenzip
     inline bool is_missing_input_file(HRESULT hr) noexcept
     {
         return hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) || hr == HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND);
+    }
+
+    inline std::uintmax_t input_file_size(const std::wstring &path, std::error_code &error)
+    {
+        return std::filesystem::file_size(win32_extended_path(path), error);
     }
 
     // Named streams share the first I/O error with their open callback.
@@ -120,11 +138,44 @@ namespace sunpack::sevenzip
         catch (const std::bad_alloc &) { trace->last_source_path.clear(); }
     }
 
+    inline HRESULT validate_file_generation(HANDLE file, const ReadView *view) noexcept
+    {
+        if (!view || !view->file_generation) return S_OK;
+        LARGE_INTEGER length{};
+        if (!GetFileSizeEx(file, &length)) return HRESULT_FROM_WIN32(GetLastError());
+        if (static_cast<UInt64>(length.QuadPart) != view->physical_size)
+            return HRESULT_FROM_WIN32(ERROR_FILE_INVALID);
+
+        FILE_ID_INFO id{};
+        FILE_BASIC_INFO basic{};
+        const bool have_id = GetFileInformationByHandleEx(file, FileIdInfo, &id, sizeof(id)) != FALSE;
+        const bool have_basic = GetFileInformationByHandleEx(file, FileBasicInfo, &basic, sizeof(basic)) != FALSE;
+        std::array<std::uint64_t, 4> current{};
+        if (have_id) {
+            current[0] = id.VolumeSerialNumber;
+            std::memcpy(current.data() + 1, id.FileId.Identifier, sizeof(id.FileId.Identifier));
+        }
+        if (have_basic) current[3] = static_cast<UInt64>(basic.LastWriteTime.QuadPart);
+        if (!have_id || !have_basic) {
+            // Match Rust's fallback for filesystems without the extended classes.
+            BY_HANDLE_FILE_INFORMATION legacy{};
+            if (!GetFileInformationByHandle(file, &legacy)) return HRESULT_FROM_WIN32(GetLastError());
+            if (!have_id) {
+                current[0] = legacy.dwVolumeSerialNumber;
+                current[1] = (UInt64{legacy.nFileIndexHigh} << 32) | legacy.nFileIndexLow;
+            }
+            if (!have_basic)
+                current[3] = (UInt64{legacy.ftLastWriteTime.dwHighDateTime} << 32) | legacy.ftLastWriteTime.dwLowDateTime;
+        }
+        return current == *view->file_generation ? S_OK : HRESULT_FROM_WIN32(ERROR_FILE_INVALID);
+    }
+
     struct PrefetchSource
     {
         const std::wstring *path = nullptr;
         UInt64 offset = 0;
         UInt64 length = 0;
+        const ReadView *view = nullptr;
     };
 
     // Single-consumer prefetch: two stable buffers and event-based OVERLAPPED
@@ -234,6 +285,7 @@ namespace sunpack::sevenzip
             OVERLAPPED overlapped{};
             HANDLE handle = INVALID_HANDLE_VALUE;
             const std::wstring *path = nullptr;
+            const ReadView *view = nullptr;
             std::unique_ptr<unsigned char[]> bytes;
             UInt64 offset = 0;
             UInt32 size = 0;
@@ -286,6 +338,7 @@ namespace sunpack::sevenzip
                 if (slot.handle != INVALID_HANDLE_VALUE) CloseHandle(slot.handle);
                 slot.handle = INVALID_HANDLE_VALUE;
                 slot.path = nullptr;
+                slot.view = nullptr;
                 slot.bytes.reset();
             }
             enabled_ = false;
@@ -326,16 +379,22 @@ namespace sunpack::sevenzip
                         return;
                     }
                 }
-                if (slot.handle == INVALID_HANDLE_VALUE || slot.path != source.path)
+                if (slot.handle == INVALID_HANDLE_VALUE || slot.path != source.path || slot.view != source.view)
                 {
                     if (slot.handle != INVALID_HANDLE_VALUE) CloseHandle(slot.handle);
                     slot.handle = CreateFileW(win32_extended_path(*source.path).c_str(), GENERIC_READ,
                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, nullptr);
                     slot.path = source.path;
+                    slot.view = source.view;
                     // Failed speculative opens remain recoverable: the direct
                     // path reports the error, and a later read can try again.
                     if (slot.handle == INVALID_HANDLE_VALUE) break;
+                    if (FAILED(validate_file_generation(slot.handle, source.view))) {
+                        CloseHandle(slot.handle);
+                        slot.handle = INVALID_HANDLE_VALUE;
+                        break;
+                    }
                 }
                 if (!slot.bytes) slot.bytes.reset(new unsigned char[window_bytes_]);
                 const HANDLE event = slot.overlapped.hEvent;
@@ -440,9 +499,6 @@ namespace sunpack::sevenzip
 
         HRESULT STDMETHODCALLTYPE Read(void *data, UInt32 size, UInt32 *processedSize) SUP7Z_NOEXCEPT override
         {
-            if (attempt_replay_) attempt_replay_->observe_volume_read(position_, size, &path_);
-
-
             if (processedSize)
             {
 
@@ -566,8 +622,6 @@ namespace sunpack::sevenzip
         }
 
     private:
-        ExtractionReplay* attempt_replay_ = current_extraction_replay;
-
         std::wstring path_;
 
         ExtractInputTrace *trace_ = nullptr;
@@ -618,6 +672,7 @@ namespace sunpack::sevenzip
         UInt64 virtual_offset = 0;
 
         bool reversed = false;
+        const ReadView *view = nullptr;
     };
 
     class MultiRangeInStream final : public CMyUnknownImp, public IInStream
@@ -637,16 +692,20 @@ namespace sunpack::sevenzip
             for (const auto &path : paths)
             {
                 std::error_code error;
-                const auto length = std::filesystem::file_size(path, error);
+                const auto length = input_file_size(path, error);
                 if (error)
                 {
                     open_hresult_ = HRESULT_FROM_WIN32(error.value());
                     record_input_error(trace_, path, open_hresult_);
                     continue;
                 }
-                ranges_.push_back({paths_.size(), 0, length, total_size_});
+                if (!append_range(paths_.size(), 0, length))
+                {
+                    open_hresult_ = E_INVALIDARG;
+                    record_input_error(trace_, path, open_hresult_);
+                    break;
+                }
                 paths_.push_back(path);
-                total_size_ += length;
             }
             initialize(prefetch_config);
         }
@@ -657,19 +716,20 @@ namespace sunpack::sevenzip
             InputPrefetchConfig prefetch_config = InputPrefetchConfig{false, 512 * 1024},
             VolumeReadUncertainty *probe_reads = nullptr,
             ArchiveOpenMode mode = ArchiveOpenMode::NativeVolumes)
-            : MultiRangeInStream(ranges.data(), mode == ArchiveOpenMode::SfxWithVolumes && !ranges.empty()
-                ? 1 : ranges.size(), trace, prefetch_config, false, probe_reads, {}) {}
+            : MultiRangeInStream(ranges.data(), uses_named_volume_streams(mode) && !ranges.empty()
+                ? 1 : ranges.size(), trace, prefetch_config, std::nullopt, probe_reads, {}) {}
 
         MultiRangeInStream(const ExtractInputRange &range, InputPrefetchConfig prefetch_config,
-                           NamedVolumeError volume_error)
-            : MultiRangeInStream(&range, 1, nullptr, prefetch_config, true, nullptr, std::move(volume_error)) {}
+                           NamedVolumeError volume_error, std::size_t named_slot)
+            : MultiRangeInStream(&range, 1, nullptr, prefetch_config, named_slot, nullptr, std::move(volume_error)) {}
 
     private:
         MultiRangeInStream(const ExtractInputRange *ranges, std::size_t count,
                            ExtractInputTrace *trace, InputPrefetchConfig prefetch_config,
-                           bool physical_volume, VolumeReadUncertainty *probe_reads, NamedVolumeError volume_error)
+                           std::optional<std::size_t> named_slot, VolumeReadUncertainty *probe_reads,
+                           NamedVolumeError volume_error)
             : probe_reads_(probe_reads), trace_(trace), volume_error_(std::move(volume_error)),
-              physical_volume_(physical_volume)
+              named_slot_(named_slot)
         {
             ranges_.reserve(count);
             paths_.reserve(count);
@@ -691,7 +751,7 @@ namespace sunpack::sevenzip
 #ifdef SUP7Z_DEBUG
                     ++observed_range_size_queries;
 #endif
-                    const auto size = std::filesystem::file_size(input.path, error);
+                    const auto size = input_file_size(input.path, error);
                     if (error)
                     {
                         open_hresult_ = HRESULT_FROM_WIN32(error.value());
@@ -704,11 +764,10 @@ namespace sunpack::sevenzip
 
                 const auto path_index = paths_.size() - 1;
                 if (input.view) {
+                    const auto *generation = input.view->file_generation ? input.view.get() : nullptr;
+                    if (generation) views_.push_back(input.view);
                     const HRESULT hr = visit_view_range(input, file_size, [&](UInt64 at, UInt64 length, bool reverse) {
-                        if (UINT64_MAX - total_size_ < length) return false;
-                        ranges_.push_back({path_index, at, length, total_size_, reverse});
-                        total_size_ += length;
-                        return true;
+                        return append_range(path_index, at, length, reverse, generation);
                     });
                     if (FAILED(hr)) {
                         open_hresult_ = hr;
@@ -735,9 +794,12 @@ namespace sunpack::sevenzip
                     continue;
                 }
 
-                ranges_.push_back({path_index, start, length, total_size_, false});
-
-                total_size_ += length;
+                if (!append_range(path_index, start, length))
+                {
+                    open_hresult_ = E_INVALIDARG;
+                    record_input_error(trace_, input.path, open_hresult_);
+                    break;
+                }
             }
 
             initialize(prefetch_config);
@@ -756,11 +818,6 @@ namespace sunpack::sevenzip
 
         HRESULT STDMETHODCALLTYPE Read(void *data, UInt32 size, UInt32 *processedSize) SUP7Z_NOEXCEPT override
         {
-            if (probe_reads_) probe_reads_->observe_logical_read(position_, size);
-            else if (attempt_replay_) attempt_replay_->observe_volume_read(position_, size,
-                !physical_volume_ || ranges_.empty() ? nullptr : &paths_[ranges_.front().path_index]);
-
-
             if (processedSize)
             {
 
@@ -772,6 +829,12 @@ namespace sunpack::sevenzip
                 return publish_named_volume_error(volume_error_, E_FAIL);
             }
 
+            if ((probe_reads_ || attempt_replay_) && position_ < total_size_) {
+                // Named volumes are opened independently of the first stream.
+                const auto covered = static_cast<UInt32>(std::min<UInt64>(size, total_size_ - position_));
+                if (probe_reads_) probe_reads_->observe_logical_read(position_, covered);
+                else attempt_replay_->observe_volume_read(position_, covered, named_slot_);
+            }
             auto *out = static_cast<unsigned char *>(data);
 
             if (prefetch_ && prefetch_->consume(position_, data, size))
@@ -869,20 +932,14 @@ namespace sunpack::sevenzip
                 }
 
                 cached_handle_position_ += read;
+                if (read == 0 || (range->reversed && read != want)) {
+                    // EOF inside an indexed extent means the backing file shrank.
+                    const HRESULT hr = HRESULT_FROM_WIN32(ERROR_HANDLE_EOF);
+                    record_input_error(trace_, path, hr, position_, source_offset, want);
+                    return publish_named_volume_error(volume_error_, hr);
+                }
                 if (range->reversed)
-                {
-                    if (read != want)
-                    {
-                        const HRESULT hr = HRESULT_FROM_WIN32(ERROR_HANDLE_EOF);
-                        record_input_error(trace_, path, hr, position_, source_offset, want);
-                        return publish_named_volume_error(volume_error_, hr);
-                    }
                     std::reverse(out + total_read, out + total_read + read);
-                }
-                if (read == 0)
-                {
-                    break;
-                }
                 total_read += read;
                 position_ += read;
             }
@@ -921,15 +978,16 @@ namespace sunpack::sevenzip
                 base = static_cast<Int64>(total_size_);
             }
 
-            const Int64 next = base + offset;
-
-            if (next < 0)
+            else if (seekOrigin != FILE_BEGIN)
             {
                 return publish_named_volume_error(volume_error_, E_INVALIDARG);
             }
 
+            if (offset < -base || offset > (std::numeric_limits<Int64>::max)() - base)
+                return publish_named_volume_error(volume_error_, E_INVALIDARG);
+
             const UInt64 prior_position = position_;
-            position_ = static_cast<UInt64>(next);
+            position_ = static_cast<UInt64>(base + offset);
 
             if (prefetch_ && prior_position != position_)
             {
@@ -946,6 +1004,16 @@ namespace sunpack::sevenzip
         }
 
     private:
+        bool append_range(std::size_t path_index, UInt64 start, UInt64 length, bool reversed = false,
+                          const ReadView *view = nullptr)
+        {
+            // Both IInStream::Seek and Windows file positions use signed offsets.
+            if (length > static_cast<UInt64>((std::numeric_limits<Int64>::max)()) - total_size_) return false;
+            ranges_.push_back({path_index, start, length, total_size_, reversed, view});
+            total_size_ += length;
+            return true;
+        }
+
         void initialize(InputPrefetchConfig prefetch_config)
         {
             if (ranges_.empty() && open_hresult_ == S_OK) open_hresult_ = E_FAIL;
@@ -961,7 +1029,8 @@ namespace sunpack::sevenzip
                         const auto &range = ranges_[index];
                         if (range.reversed) return false;
                         const UInt64 displacement = offset - range.virtual_offset;
-                        source = PrefetchSource{&paths_[range.path_index], range.start + displacement, range.length - displacement};
+                        source = PrefetchSource{&paths_[range.path_index], range.start + displacement,
+                            range.length - displacement, range.view};
                         return true;
                     }, trace_);
             }
@@ -1000,6 +1069,7 @@ namespace sunpack::sevenzip
             const auto path_index = ranges_[index].path_index;
             const auto &path = paths_[path_index];
             if (cached_handle_ != INVALID_HANDLE_VALUE &&
+                ranges_[cached_index_].view == ranges_[index].view &&
                 (ranges_[cached_index_].path_index == path_index ||
                  paths_[ranges_[cached_index_].path_index] == path))
             {
@@ -1020,6 +1090,11 @@ namespace sunpack::sevenzip
             {
 
                 return HRESULT_FROM_WIN32(GetLastError());
+            }
+            const HRESULT generation = validate_file_generation(cached_handle_, ranges_[index].view);
+            if (FAILED(generation)) {
+                close_cached_handle();
+                return generation;
             }
 
             cached_index_ = index;
@@ -1047,6 +1122,7 @@ namespace sunpack::sevenzip
 
 
         std::vector<NormalizedInputRange> ranges_;
+        std::vector<std::shared_ptr<const ReadView>> views_;
         // Slices of the same file share path storage and the prefetcher's handle key.
         std::vector<std::wstring> paths_;
 
@@ -1056,7 +1132,7 @@ namespace sunpack::sevenzip
 
         ExtractInputTrace *trace_ = nullptr;
         NamedVolumeError volume_error_;
-        bool physical_volume_ = false;
+        std::optional<std::size_t> named_slot_;
 
         HANDLE cached_handle_ = INVALID_HANDLE_VALUE;
 
@@ -1075,6 +1151,14 @@ namespace sunpack::sevenzip
         CMyComPtr<IInStream> stream;
         std::wstring callback_path;
         bool opened;
+
+        std::wstring handler_callback_path(bool zip, ArchiveOpenMode mode) const
+        {
+            // ZIP uses the callback name to infer disk roles before reading
+            // the directory. Only a resolved named-volume plan supplies them.
+            if (zip && !uses_named_volume_streams(mode)) return {};
+            return callback_path;
+        }
     };
 
     OpenedArchiveStream open_archive_stream(

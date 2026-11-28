@@ -431,10 +431,10 @@ fn byte_stream_identity_ignores_carrier_and_split_boundaries_but_tracks_every_so
     reversed.parts = [InputExtent { view: None, path: right.entry_path.clone(), start: 0, end: Some(3) },
         InputExtent { view: None, path: left.entry_path.clone(), start: 0, end: Some(3) }].into_iter().map(InputPart::range).collect();
     assert!(!admit(&mut index, &reversed, false));
-    // Two independent logical inputs are still compared as the requested ordered stream.
+    // Independent archives keep their boundaries even when their bytes join to the same stream.
     let multi_owner = dir.0.join("group").to_string_lossy().into_owned();
     let prepared = index.prepare_path(&multi_owner, "scope", &[&one, &two], false).unwrap().unwrap();
-    assert!(finish(&mut index, prepared));
+    assert!(!finish(&mut index, prepared));
     fs::write(&right.entry_path, b"XYZ").unwrap();
     index = invalidate_path(index, &right.entry_path);
     assert!(!index.owners.contains_key(path_key(&split.entry_path).as_str()));
@@ -448,6 +448,116 @@ fn byte_stream_identity_ignores_carrier_and_split_boundaries_but_tracks_every_so
     index = invalidate_path(index, &carrier.entry_path);
     assert!(!index.owners.contains_key(path_key(&carrier.entry_path).as_str()));
     assert_eq!(index.records.len(), 1);
+}
+
+#[test]
+fn logical_archive_boundaries_and_formats_survive_dedup_replay() {
+    use crate::io::archive_state::{InputExtent, InputPart};
+    use crate::io::view::{ReadView, ViewMethod};
+
+    let dir = Sandbox::new();
+    let folder = dir.0.join("index");
+    let open = || Index::open(&folder, WatchDeduplication::Hash, WatchDeduplicationScope::Root,
+        ConfiguredViews::parse([Some("plain"), Some("apate:1")].into_iter()).unwrap()).unwrap();
+    let range = |input: &ArchiveInput, view, start, end| {
+        let mut input = input.clone();
+        input.mode = OpenMode::FileRange;
+        input.parts = Box::new([InputPart::range(InputExtent {
+            path: input.entry_path.clone(), view, start, end: Some(end),
+        })]);
+        input
+    };
+    let joined = dir.file("joined", b"ABCDEF");
+    let carrier = dir.file("mapped", b"DEFjunkABC");
+    let view = Arc::new(ReadView {
+        generation: None,
+        method: ViewMethod::Apate,
+        depth: 1,
+        physical_size: 10,
+        spans: vec![
+            Span { start: 7, end: 10, reverse: false },
+            Span { start: 0, end: 3, reverse: false },
+        ],
+    });
+    let left = range(&carrier, Some(Arc::clone(&view)), 0, 3);
+    let right = range(&carrier, Some(view), 3, 6);
+
+    let mut index = open();
+    index.reconcile_journals(&[("scope".into(), "test-volume".into(), 1)]).unwrap();
+    assert!(!admit(&mut index, &joined, false));
+    let prepared = index.prepare_path(&carrier.entry_path, "scope", &[&left, &right], false).unwrap().unwrap();
+    assert!(!finish(&mut index, prepared));
+    index.finish_rebuild().unwrap();
+    drop(index);
+
+    let mut index = open();
+    assert!(!index.needs_rebuild());
+    let copy = dir.file("plain", b"ABCgapDEF");
+    let left = range(&copy, None, 0, 3);
+    let right = range(&copy, None, 6, 9);
+    let prepared = index.prepare_path(&copy.entry_path, "scope", &[&left, &right], false).unwrap().unwrap();
+    assert!(finish(&mut index, prepared));
+
+    let shifted = dir.file("shifted", b"ABCDEF");
+    let left = range(&shifted, None, 0, 2);
+    let right = range(&shifted, None, 2, 6);
+    let prepared = index.prepare_path(&shifted.entry_path, "scope", &[&left, &right], false).unwrap().unwrap();
+    assert!(!finish(&mut index, prepared));
+
+    let mut other_format = dir.file("other-format", b"ABCDEF");
+    other_format.format_hint = "rar".into();
+    assert!(!admit(&mut index, &other_format, false));
+
+    let spanned = |source: ArchiveInput, boundary| {
+        let mut input = source.clone();
+        input.mode = OpenMode::NativeVolumes;
+        input.analysis.zip_spanned = true;
+        input.parts = [(0, boundary), (boundary, 6)].into_iter().enumerate().map(|(i, (start, end))| {
+            let mut part = range(&source, None, start, end).parts.into_vec().pop().unwrap();
+            part.volume_number = Some(i as u32 + 1);
+            part
+        }).collect();
+        input
+    };
+    let first = spanned(dir.file("spanned-a", b"ABCDEF"), 3);
+    assert!(!admit(&mut index, &first, false));
+    let shifted = spanned(dir.file("spanned-b", b"ABCDEF"), 2);
+    assert!(!admit(&mut index, &shifted, false));
+    let same = spanned(dir.file("spanned-c", b"ABCDEF"), 3);
+    assert!(admit(&mut index, &same, false));
+}
+
+#[test]
+fn old_watch_request_cannot_index_a_disabled_view_after_reload() {
+    use crate::io::archive_state::{InputExtent, InputPart};
+    use crate::io::view::{ReadView, ViewMethod};
+
+    let dir = Sandbox::new();
+    let old_views = ConfiguredViews::parse([Some("plain"), Some("apate:1")].into_iter()).unwrap();
+    let mode = WatchDeduplication::FileId;
+    let scope = WatchDeduplicationScope::Root;
+    let mut index = Index::open(&dir.0.join("index"), mode, scope, old_views).unwrap();
+    let old_generation = index.generation();
+    index.reset(mode, scope, ConfiguredViews::default()).unwrap();
+    index.reconcile_journals(&[("scope".into(), "test-volume".into(), 1)]).unwrap();
+    index.finish_rebuild().unwrap();
+    let generation = index.generation();
+    let index = Mutex::new(index);
+    let input = dir.file("same-content", b"ABC");
+    let mut mapped = input.clone();
+    mapped.mode = OpenMode::FileRange;
+    mapped.parts = Box::new([InputPart::range(InputExtent {
+        path: input.entry_path.clone(), start: 0, end: Some(3), view: Some(Arc::new(ReadView {
+            generation: None,
+            method: ViewMethod::Apate, depth: 1, physical_size: 3,
+            spans: vec![Span { start: 0, end: 3, reverse: true }],
+        })),
+    })]);
+
+    assert!(!consider(&index, &mapped.entry_path, "scope", &[&mapped], old_generation, false).unwrap());
+    assert!(index.lock().unwrap().records.is_empty());
+    assert!(!consider(&index, &input.entry_path, "scope", &[&input], generation, false).unwrap());
+    assert_eq!(index.lock().unwrap().records.len(), 1);
 }
 
 #[test]
@@ -465,7 +575,7 @@ fn mapped_file_id_survives_different_reverse_run_boundaries_and_reload() {
         let mut input = ArchiveInput::file(path.clone(), "zip".into(), name.into());
         input.mode = OpenMode::FileRange;
         input.parts = Box::new([InputPart::range(InputExtent { path, start: 0, end: Some(6),
-            view: Some(Arc::new(ReadView { method: ViewMethod::Apate, depth: 1, physical_size: 6, spans })),
+            view: Some(Arc::new(ReadView { method: ViewMethod::Apate, depth: 1, physical_size: 6, spans, generation: None })),
         })]);
         input
     };
@@ -482,6 +592,51 @@ fn mapped_file_id_survives_different_reverse_run_boundaries_and_reload() {
     let mut index = open();
     assert!(admit(&mut index, &split, false));
     assert!(!admit(&mut index, &forward, false));
+}
+
+#[test]
+fn mapped_parts_keep_exact_physical_source_paths() {
+    use crate::io::archive_state::{InputExtent, InputPart};
+    use crate::io::view::{ReadView, ViewMethod};
+
+    let dir = Sandbox::new();
+    let first = dir.file("disk", b"ABCDEF");
+    let backing = dir.file("backing", b"GHIJKL");
+    let second = dir.0.join("DISK");
+    let mut input = first.clone();
+    input.mode = OpenMode::NativeVolumes;
+    input.parts = [
+        InputExtent { view: None, path: first.entry_path.clone(), start: 0, end: Some(3) },
+        InputExtent {
+            path: second.to_string_lossy().into_owned(),
+            start: 0,
+            end: Some(4),
+            view: Some(Arc::new(ReadView {
+                generation: None,
+                method: ViewMethod::Apate,
+                depth: 1,
+                physical_size: 6,
+                spans: vec![
+                    Span { start: 3, end: 6, reverse: true },
+                    Span { start: 1, end: 2, reverse: false },
+                ],
+            })),
+        },
+    ].into_iter().map(InputPart::range).collect();
+
+    // Use separate NTFS files for the snapshots even when the test directory
+    // cannot create two filenames that differ only in case.
+    let mut observed = Vec::new();
+    let record = describe_with_snapshots(&input.entry_path, "scope", &[&input], |path| {
+        observed.push(path.to_owned());
+        let actual = if path == second { Path::new(&backing.entry_path) } else { path };
+        crate::filesystem::watch_ready_file_snapshot(actual, None, physical_file_generation_from_metadata)
+    }).unwrap().unwrap();
+
+    assert_eq!(observed, [PathBuf::from(&first.entry_path), second]);
+    assert_eq!(&*record.range_sources, &[0, 1, 1]);
+    assert_ne!(record.identities[0].file, record.identities[1].file);
+    assert_eq!(record.identities[1].file, record.identities[2].file);
 }
 
 #[test]
