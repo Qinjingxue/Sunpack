@@ -1148,17 +1148,20 @@ namespace sunpack::sevenzip
     struct OpenedArchiveStream
     {
         CMyComPtr<IInStream> stream;
-        std::wstring callback_path;
         bool opened;
-
-        std::wstring take_handler_callback_path(bool zip, ArchiveOpenMode mode)
-        {
-            // ZIP uses the callback name to infer disk roles before reading
-            // the directory. Only a resolved named-volume plan supplies them.
-            if (zip && !uses_named_volume_streams(mode)) return {};
-            return std::move(callback_path);
-        }
     };
+
+    // These names belong to the input descriptor, not to a particular stream
+    // or handler attempt. Every fallback can borrow the same name.
+    inline const std::wstring *handler_callback_path(
+        const std::wstring &archive_path, const std::vector<std::wstring> &canonical_names,
+        bool zip, ArchiveOpenMode mode) noexcept
+    {
+        // ZIP uses the callback name to infer disk roles before reading
+        // the directory. Only a resolved named-volume plan supplies them.
+        if (zip && !uses_named_volume_streams(mode)) return nullptr;
+        return canonical_names.empty() ? &archive_path : &canonical_names.front();
+    }
 
     OpenedArchiveStream open_archive_stream(
 
@@ -1167,8 +1170,6 @@ namespace sunpack::sevenzip
         const std::vector<std::wstring> &part_paths,
 
         ExtractInputTrace *trace = nullptr,
-
-        const std::vector<std::wstring> &canonical_names = {},
 
         InputPrefetchConfig prefetch_config = input_prefetch_config(),
         const std::vector<ExtractInputRange> &input_ranges = {}, VolumeReadUncertainty* probe_reads = nullptr,

@@ -3375,9 +3375,10 @@ impl<'run, O: Observer> Run<'run, O> {
                         );
                         let stats = scan_output_stats(&output_string, false);
                         if let Some(manifest) = frame.manifest.take() {
-                            let (verified, excluded) = manifest.partial_inventory(&output_string, self.request.origin == Origin::Watch);
+                            let (verified, excluded) = manifest.partial_inventory(&output_string,
+                                self.request.origin == Origin::Watch, partial && depth <= self.request.max_depth);
                             if !excluded.is_empty() { self.observer.exclude_recovery_files(&result, excluded)?; }
-                            if partial && depth <= self.request.max_depth { inventory = verified; }
+                            inventory = verified;
                         }
                         // Retaining damaged payload is not partial success:
                         // main keeps nonempty failed output for manual recovery,

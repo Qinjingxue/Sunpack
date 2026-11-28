@@ -1337,8 +1337,11 @@ fn split_family_for_proposal<'a>(format: &str, style: &'a str) -> Cow<'a, str> {
 }
 
 pub(crate) fn get_logical_name(filename: &str, is_archive: bool) -> String {
-    // The display-name fallback also recognizes Unicode decimal digits.
-    if filename.bytes().any(|b| b.is_ascii_digit() || !b.is_ascii()) {
+    // A volume marker always follows a dot. The display fallback also accepts
+    // Unicode decimal digits, so non-ASCII suffixes still need the regexes.
+    if filename.split_once('.').is_some_and(|(_, suffix)| {
+        suffix.bytes().any(|b| b.is_ascii_digit() || !b.is_ascii())
+    }) {
         let regexes = regex_cache().acquire();
         if let Some(parsed) = primary_numbered_volume(basename(filename), &regexes) {
             return logical_name_from_parsed(&parsed);

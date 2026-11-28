@@ -1655,6 +1655,10 @@ fn admission_counts_unfinished_candidates_not_batches_or_claimed_members() {
             max_depth: usize::MAX,
             deep: false, root: String::new(), recovery: None, password_scope: base.clone(),
             passwords: Arc::default(),
+            groups: Arc::new(Mutex::new(SourceGroups {
+                owners: names.iter().map(|path| (watch_path_key(path), path.clone())).collect(),
+                ..SourceGroups::default()
+            })),
             inputs: names.into_iter().map(|path| (watch_path_key(&path), AdmittedInput {
                 candidate: WatchCandidateRow {
                     path, size: 1, mtime: 1.0,
@@ -1665,7 +1669,7 @@ fn admission_counts_unfinished_candidates_not_batches_or_claimed_members() {
                 quiet: quiet::Activity::default(),
             })).collect(),
             dirty: HashSet::new(), cancel,
-            groups: Arc::default(), claimed: Arc::default(), toast: None, request,
+            claimed: Arc::default(), toast: None, request,
         }
     };
     let names = (0..limit).map(|index| base.join(format!("{index}.zip")).to_string_lossy().into_owned()).collect::<Vec<_>>();
@@ -1694,7 +1698,7 @@ fn admission_counts_unfinished_candidates_not_batches_or_claimed_members() {
         let mut claimed = scheduler.active["first"].claimed.lock().unwrap();
         claimed.capture(&group.members).unwrap();
         claimed.capture(&names[2..3]).unwrap();
-        claimed.finished.extend(group.members.iter().map(|member| (watch_path_key(member), false)));
+        claimed.finished.extend(group.members.iter().map(|member| watch_path_key(member)));
     }
     let root = || RootCompleted {
         request: 1,
@@ -1706,6 +1710,7 @@ fn admission_counts_unfinished_candidates_not_batches_or_claimed_members() {
     scheduler.complete_root(root()).unwrap();
     assert_eq!(scheduler.admission_available(), 2);
     assert_eq!(scheduler.active["first"].inputs.len(), limit - 2);
+    assert_eq!(scheduler.active["first"].groups.lock().unwrap().owners.len(), limit - 2);
     {
         let claimed = scheduler.active["first"].claimed.lock().unwrap();
         assert_eq!(claimed.candidates.len(), 1);
@@ -1833,18 +1838,22 @@ fn root_handoff_preserves_alias_aggregates_and_live_shared_tail_owners() {
     let group = Arc::new(SourceGroup { path: head.into(),
         members: vec![head.to_string_lossy().into_owned(), alias.to_string_lossy().into_owned()] });
     let hub = Arc::new(Hub::new());
-    let mut observer = WatchObserver {
+    let observer = WatchObserver {
         dedup_generation: None,
         dedup: Arc::new(Mutex::new(dedup::Index::open(&directory, crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root, Default::default()).unwrap())),
         dedup_scope: NativeDiscoveryScope::new(directory.to_string_lossy().into_owned(), None, Vec::new()),
         deep: false,
         catalog: Arc::new(NativeWatchCatalog::new(&crate::watch_store::NativeWatchState::new(), None)),
         journal: Arc::new(journal::Journal::open(&directory, 7).unwrap()),
-        owners: HashMap::from([(key(alias), alias.to_string_lossy().into_owned())]),
         outputs: Mutex::new(ObservedOutputs::from(BTreeMap::from([(key(output), alias.to_string_lossy().into_owned()),
             (key(other_output), other.to_string_lossy().into_owned())]))),
         batch: Arc::from("batch"), toast: None, hub: Arc::clone(&hub),
-        groups: Arc::new(Mutex::new({ let mut groups = SourceGroups::default(); groups.insert(Arc::clone(&group)); groups })),
+        groups: Arc::new(Mutex::new({
+            let owners = HashMap::from([(key(alias), alias.to_string_lossy().into_owned())]);
+            let mut groups = SourceGroups { owners, ..SourceGroups::default() };
+            groups.insert(Arc::clone(&group));
+            groups
+        })),
         claimed: Arc::default(),
     };
     // Cancellation winning the mutex first must not turn an already
@@ -1884,13 +1893,17 @@ fn root_handoff_preserves_alias_aggregates_and_live_shared_tail_owners() {
     // admitted and the unrelated root remains active.
     let mut unique = SourceGroups::default();
     unique.insert(Arc::clone(&group));
-    *observer.groups.lock().unwrap() = unique;
+    {
+        let mut groups = observer.groups.lock().unwrap();
+        unique.owners = std::mem::take(&mut groups.owners);
+        *groups = unique;
+    }
     let mut early = Box::pin(observer.root_finished(2, head, outcome, 1));
     assert!(early.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
     let root = hub.wait(None).roots.into_iter().next().unwrap();
     assert_eq!(root.groups[&key(alias)].path, head);
     assert_eq!(root.completed.outputs.len(), 1);
-    assert!(observer.claimed.lock().unwrap().finished.contains_key(&key(alias)));
+    assert!(observer.claimed.lock().unwrap().finished.contains(&key(alias)));
     let outcome = root.completed.result.unwrap();
     root.reply.complete(Ok(Outcome::default()));
     assert!(matches!(early.as_mut().poll(&mut Context::from_waker(&waker)), Poll::Ready(Ok(_))));
@@ -1899,8 +1912,10 @@ fn root_handoff_preserves_alias_aggregates_and_live_shared_tail_owners() {
     observer.groups.lock().unwrap().insert(group);
 
     // Directly admitted roots still settle independently of their peers.
-    observer.owners.insert(key(head), head.to_string_lossy().into_owned());
-    observer.owners.insert(key(other), other.to_string_lossy().into_owned());
+    observer.groups.lock().unwrap().owners.extend([
+        (key(head), head.to_string_lossy().into_owned()),
+        (key(other), other.to_string_lossy().into_owned()),
+    ]);
     observer.roots_planned([
         (head.to_str().unwrap(), &[][..]),
         (other.to_str().unwrap(), &[][..]),
@@ -1920,8 +1935,8 @@ fn root_handoff_preserves_alias_aggregates_and_live_shared_tail_owners() {
     assert_eq!(root.completed.outputs.len(), 1);
     assert_eq!(observer.groups.lock().unwrap().roots[&key(other)].path, other);
     assert_eq!(observer.outputs.lock().unwrap().paths.len(), 1);
-    assert!(!observer.claimed.lock().unwrap().finished.contains_key(&key(alias)));
-    assert!(observer.claimed.lock().unwrap().finished.contains_key(&key(head)));
+    assert!(!observer.claimed.lock().unwrap().finished.contains(&key(alias)));
+    assert!(observer.claimed.lock().unwrap().finished.contains(&key(head)));
     root.reply.complete(root.completed.result);
     let Poll::Ready(result) = future.as_mut().poll(&mut Context::from_waker(&waker)) else {
         panic!("disabled notifications must not enqueue a report wait");
@@ -2042,12 +2057,14 @@ fn restored_checkpoint_routes_nested_outputs_to_the_durable_owner() {
             deep: false,
             catalog: Arc::new(NativeWatchCatalog::new(journal.state(), None)),
             journal: Arc::clone(&journal),
-            owners: HashMap::from([(key(&source), owner.to_owned())]),
             outputs: Mutex::new(outputs.into()),
             batch: Arc::from("restored"),
             toast: None,
             hub: Arc::new(Hub::new()),
-            groups: Arc::default(),
+            groups: Arc::new(Mutex::new(SourceGroups {
+                owners: HashMap::from([(key(&source), owner.to_owned())]),
+                ..SourceGroups::default()
+            })),
             claimed: Arc::default(),
             };
         assert_eq!(observer.owner_for_path(&output.join("nested.zip")).as_deref(), Some(owner));

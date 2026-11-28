@@ -373,7 +373,7 @@ namespace sunpack::sevenzip
                 // Rewind it instead of reopening and restating its volumes.
                 if (!input.stream || input.stream->Seek(0, STREAM_SEEK_SET, nullptr) != S_OK)
                     input = open_archive_stream(archive_path, part_paths, &result.input_trace,
-                        canonical_names, prefetch_config, input_ranges, nullptr, mode);
+                        prefetch_config, input_ranges, nullptr, mode);
             }
 
             if (!input.opened)
@@ -403,7 +403,7 @@ namespace sunpack::sevenzip
                 PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::CallbackSetup);
 #endif
                 return new OpenCallback(
-                    password, input.take_handler_callback_path(format.Data4[5] == 0x01, mode),
+                    password, handler_callback_path(archive_path, canonical_names, format.Data4[5] == 0x01, mode),
                     part_paths, canonical_names, prefetch_config, cancel_token, input_ranges);
             }();
             CMyComPtr<IArchiveOpenCallback> open_callback(raw_open_callback);
@@ -561,6 +561,7 @@ namespace sunpack::sevenzip
                 archive->Close();
                 archive.Release();
                 input.stream.Release();
+                raw_open_callback->retire_volume_lookup();
             }
             {
 #ifdef SUP7Z_DEBUG

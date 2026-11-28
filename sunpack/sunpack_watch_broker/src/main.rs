@@ -350,22 +350,33 @@ fn read_directory_query(
         return Ok(None);
     }
     let sampled_bytes = first + remaining.min(buffer.len());
-    let mut parents = HashMap::with_capacity(sampled_bytes / FILE_ID_BYTES);
-    let mut next_index = 0usize;
-    let mut insert = |parents: &mut HashMap<_, _>, bytes: &[u8]| {
-        let ids = bytes.as_chunks::<FILE_ID_BYTES>().0;
-        for group in ids.chunk_by(|left, right| left == right) {
-            next_index += group.len();
-            parents.insert(group[0], (next_index - 1) as u16);
-        }
+    let same_id = |left: &[u8; FILE_ID_BYTES], right: &[u8; FILE_ID_BYTES]| left == right;
+    let mut first_groups = buffer[..first].as_chunks::<FILE_ID_BYTES>().0.chunk_by(same_id);
+    let first_group = first_groups.next().expect("validated query is nonempty");
+    // A full repeated fragment provides no evidence for preallocating more IDs.
+    let capacity = if first_group.len() == first / FILE_ID_BYTES {
+        1
+    } else {
+        sampled_bytes / FILE_ID_BYTES
     };
-    insert(&mut parents, &buffer[..first]);
+    let mut parents = HashMap::with_capacity(capacity);
+    let mut next_index = 0usize;
+    let mut insert = |parents: &mut HashMap<_, _>, group: &[[u8; FILE_ID_BYTES]]| {
+        next_index += group.len();
+        parents.insert(group[0], (next_index - 1) as u16);
+    };
+    insert(&mut parents, first_group);
+    for group in first_groups {
+        insert(&mut parents, group);
+    }
     while remaining != 0 {
         let size = remaining.min(buffer.len());
         if !receive_query_fragment(read(&mut buffer[..size])?, size, remaining) {
             return Ok(None);
         }
-        insert(&mut parents, &buffer[..size]);
+        for group in buffer[..size].as_chunks::<FILE_ID_BYTES>().0.chunk_by(same_id) {
+            insert(&mut parents, group);
+        }
         // A single distinct prefix can precede runs of the same directory.
         // Reserve for the rest only after two fragments confirm distinct IDs.
         if remaining == id_bytes - first && parents.len() == sampled_bytes / FILE_ID_BYTES {

@@ -250,7 +250,7 @@ void check_completed_outputs_release_past_decoder_failure()
 void check_open_callback()
 {
     std::printf("OpenCallback\n");
-    auto *raw = new OpenCallback(L"", L"", std::vector<std::wstring>{});
+    auto *raw = new OpenCallback(L"");
     CMyComPtr<IArchiveOpenCallback> callback(raw);
     auto *probe = raw;
 
@@ -283,7 +283,7 @@ void check_open_callback_canonical_range()
     const std::vector<std::wstring> canonical_names{name, variable_name};
 
     // A one-file descriptor still permits the configured entry as a volume.
-    auto *single = new OpenCallback(L"", path, {}, {}, InputPrefetchConfig{false});
+    auto *single = new OpenCallback(L"", &path, {}, {}, InputPrefetchConfig{false});
     CMyComPtr<IArchiveOpenCallback> single_callback(single);
     CMyComPtr<IInStream> source;
     const auto basename = std::filesystem::path(path).filename().wstring();
@@ -304,8 +304,9 @@ void check_open_callback_canonical_range()
     replay.volumes.started = true;
     replay.variable_slots = {1};
     ExtractionReplayScope replay_scope(&replay);
+    const std::wstring head_name = L"archive.part1.rar";
     auto *raw = new OpenCallback(
-        L"", L"archive.part1.rar", {}, canonical_names, InputPrefetchConfig{false}, {},
+        L"", &head_name, {}, canonical_names, InputPrefetchConfig{false}, {},
         ranges);
     CMyComPtr<IArchiveOpenCallback> callback(raw);
 
@@ -352,8 +353,25 @@ void check_open_archive_stream_ownership()
     const std::vector<std::wstring> names{L"logical.part1.exe", L"logical.part2.rar"};
     std::ofstream(std::filesystem::path(head)).put('a');
     std::ofstream(std::filesystem::path(tail)).put('b');
+    // A failed handler releases its callback before the next attempt borrows
+    // the same canonical name. ZIP must still suppress unbound disk names.
+    for (int attempt = 0; attempt != 2; ++attempt)
     {
-        auto input = open_archive_stream(head, parts, nullptr, names, InputPrefetchConfig{false},
+        const auto *name = handler_callback_path(head, names, false, ArchiveOpenMode::SfxWithVolumes);
+        auto *raw = new OpenCallback(L"", name);
+        CMyComPtr<IArchiveOpenCallback> callback(raw);
+        PROPVARIANT property{};
+        check(name == &names.front() && raw->GetProperty(kpidName, &property) == S_OK &&
+              property.vt == VT_BSTR && names.front() == property.bstrVal,
+              "every handler attempt sees the same canonical head name");
+        PropVariantClear(&property);
+    }
+    check(handler_callback_path(head, {}, false, ArchiveOpenMode::File) == &head &&
+          handler_callback_path(head, names, true, ArchiveOpenMode::NativeVolumes) == nullptr &&
+          handler_callback_path(head, names, true, ArchiveOpenMode::NamedVolumes) == &names.front(),
+          "handler naming distinguishes named ZIP volumes from unnamed byte splits");
+    {
+        auto input = open_archive_stream(head, parts, nullptr, InputPrefetchConfig{false},
                                          {}, nullptr, ArchiveOpenMode::SfxWithVolumes);
         IUnknown *unknown = as_unknown(input.stream.Interface());
         const ULONG after_add_ref = unknown->AddRef();
@@ -363,9 +381,8 @@ void check_open_archive_stream_ownership()
 
         char bytes[2]{};
         UInt32 read = 0;
-        check(input.opened && input.callback_path == names.front() &&
-              input.stream->Read(bytes, sizeof(bytes), &read) == S_OK && read == 1 && bytes[0] == 'a',
-              "SFX mode opens the head and gives the canonical name to the volume callback");
+        check(input.opened && input.stream->Read(bytes, sizeof(bytes), &read) == S_OK && read == 1 && bytes[0] == 'a',
+              "SFX mode opens the head as a separate volume");
         auto view = std::make_shared<ReadView>();
         view->physical_size = 1;
         view->spans.push_back({0, 1, true});
@@ -375,7 +392,7 @@ void check_open_archive_stream_ownership()
             VolumeReadUncertainty observed;
             observed.uncertain_ranges = {{0, 1}, {1, 2}};
             observed.observed = std::make_unique<std::atomic<bool>[]>(2);
-            auto mapped = open_archive_stream(head, {}, nullptr, names, InputPrefetchConfig{false},
+            auto mapped = open_archive_stream(head, {}, nullptr, InputPrefetchConfig{false},
                                               ranges, &observed, mode);
             check(mapped.opened && mapped.stream->Read(bytes, sizeof(bytes), &read) == S_OK &&
                   read == 1 && bytes[0] == 'a' && mapped.stream->Read(bytes, sizeof(bytes), &read) == S_OK &&
@@ -387,13 +404,13 @@ void check_open_archive_stream_ownership()
         stale->physical_size = 2;
         ranges.front().view = stale;
         ExtractInputTrace trace;
-        auto rejected = open_archive_stream(head, {}, &trace, names, InputPrefetchConfig{false},
+        auto rejected = open_archive_stream(head, {}, &trace, InputPrefetchConfig{false},
                                             ranges, nullptr, ArchiveOpenMode::SfxWithVolumes);
         check(!rejected.opened && FAILED(static_cast<HRESULT>(trace.read_hresult)),
               "an invalidated view records an input-open error");
     }
     {
-        auto input = open_archive_stream(head, parts, nullptr, names, InputPrefetchConfig{false},
+        auto input = open_archive_stream(head, parts, nullptr, InputPrefetchConfig{false},
                                          {}, nullptr, ArchiveOpenMode::NativeVolumes);
         char bytes[2]{};
         UInt32 read = 0;

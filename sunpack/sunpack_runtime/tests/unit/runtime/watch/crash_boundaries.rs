@@ -178,10 +178,14 @@ fn hard_death_replays_delete_receipt_without_reissuing_wal_or_deleting_replaceme
             dedup: Arc::new(Mutex::new(dedup::Index::open(&base.join("state"),
                 config::WatchDeduplication::None, config::WatchDeduplicationScope::Root, Default::default()).unwrap())),
             dedup_scope: NativeDiscoveryScope::new(base.to_string_lossy().into_owned(), None, Vec::new()),
-            catalog, journal: Arc::clone(&journal), owners: HashMap::from([(key(&source), path.into())]),
+            catalog, journal: Arc::clone(&journal),
             outputs: Mutex::new(ObservedOutputs::from(BTreeMap::new())),
             batch: Arc::from("crashed"), toast: None, hub: Arc::new(Hub::new()),
-            groups: Arc::default(), claimed: Arc::default(),
+            groups: Arc::new(Mutex::new(SourceGroups {
+                owners: HashMap::from([(key(&source), path.into())]),
+                ..SourceGroups::default()
+            })),
+            claimed: Arc::default(),
         };
         let mut archive = super::tests::completion_archive(path, 1, None);
         observer.register_output(&archive, &output).unwrap();
@@ -370,7 +374,6 @@ fn claimed_release_reobserves_cancelled_replacement_and_remembers_late_sibling()
                 dedup_scope: NativeDiscoveryScope::new(base.join("state").to_string_lossy().into_owned(), None, Vec::new()),
                 catalog: Arc::clone(&scheduler.catalog),
                 deep: false, journal: Arc::clone(&scheduler.journal),
-                owners: HashMap::new(),
                 outputs: Mutex::new(ObservedOutputs::from(BTreeMap::new())),
                 batch: Arc::from("new-success"), toast: None, hub: Arc::clone(&scheduler.hub),
                 groups: Arc::default(), claimed: Arc::default(),

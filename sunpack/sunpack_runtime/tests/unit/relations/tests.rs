@@ -72,6 +72,7 @@ fn ordinary_words_and_invalid_part_numbers_are_not_volumes() {
     }
     assert_eq!(get_logical_name("Counterpart2.zip", true), "Counterpart2");
     assert_eq!(get_logical_name("Rampart1.rar", true), "Rampart1");
+    assert_eq!(get_logical_name("图表.zip.１２３.tmp", false), "图表");
     assert!(!relations_size_filter_split_family_keys("Counterpart2.zip")
         .iter()
         .any(|key| key.starts_with("rar:part")));

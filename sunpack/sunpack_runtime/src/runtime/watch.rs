@@ -2319,8 +2319,7 @@ struct ClaimedSources {
     deduplicated: HashSet<String>,
     candidates: HashMap<String, Option<WatchCandidateRow>>,
     // A settled member protects the handoff from concurrent cancellation.
-    // Only original owners used by the failure report need to outlive it.
-    finished: HashMap<String, bool>,
+    finished: HashSet<String>,
 }
 
 impl ClaimedSources {
@@ -2452,6 +2451,8 @@ fn source_group_record<'a, T: serde::Serialize>(
 // Logical tasks own groups; physical members may have several live consumers.
 #[derive(Default)]
 struct SourceGroups {
+    // Original admissions still needed for output ownership or failure reports.
+    owners: HashMap<String, String>,
     planned: HashMap<String, Vec<String>>,
     roots: HashMap<String, Arc<SourceGroup>>,
     members: HashMap<String, usize>,
@@ -2479,12 +2480,12 @@ impl SourceGroups {
         self.roots.insert(root, group);
     }
 
-    fn can_finish_alias(&self, root: &str, owners: &HashMap<String, String>) -> bool {
+    fn can_finish_alias(&self, root: &str) -> bool {
         let Some(group) = self.roots.get(root) else { return false; };
         let mut has_owner = false;
         for member in &group.members {
             let member = watch_path_key(member);
-            if owners.contains_key(&member) {
+            if self.owners.contains_key(&member) {
                 if self.shared_owners.contains(&member) || self.members.get(&member) != Some(&1) {
                     return false;
                 }
@@ -5810,7 +5811,7 @@ impl Scheduler {
             .as_ref()
             .and_then(|_| candidates.first())
             .map(|(_, input)| PathBuf::from(&input.candidate.path));
-        let groups = Arc::new(Mutex::new(SourceGroups::default()));
+        let groups = Arc::new(Mutex::new(SourceGroups { owners, ..SourceGroups::default() }));
         let worker_groups = Arc::clone(&groups);
         let claimed = Arc::new(Mutex::new(ClaimedSources { layout_checked_at, ..ClaimedSources::default() }));
         let worker_claimed = Arc::clone(&claimed);
@@ -5826,7 +5827,6 @@ impl Scheduler {
             dedup_scope: scope.clone(),
             catalog: Arc::clone(&self.catalog),
             journal,
-            owners,
             outputs: Mutex::new(ObservedOutputs::from(outputs)),
             batch: worker_batch,
             toast: worker_toast,
@@ -5843,23 +5843,22 @@ impl Scheduler {
             if let (Some(toast), Some(path)) = (&observer.toast, report_path) {
                 let claimed = observer.claimed.lock().unwrap();
                 let groups = observer.groups.lock().unwrap();
-                let groups = &groups.roots;
                 let outputs = observer.outputs.lock().unwrap();
                 if result.is_err() {
                     let mut reported = HashSet::new();
-                    let sources = observer.owners.iter().filter_map(|(source_key, source)| {
-                        if claimed.finished.contains_key(source_key) { return None; }
-                        let source = groups.get(source_key).map_or(Path::new(source), |group| group.path.as_path());
+                    let sources = groups.owners.iter().filter_map(|(source_key, source)| {
+                        if claimed.finished.contains(source_key) { return None; }
+                        let source = groups.roots.get(source_key).map_or(Path::new(source), |group| group.path.as_path());
                         reported.insert(key(source)).then_some(source)
                     });
                     toast.record(sources, &result, cancelled,
-                        |path| completion_owner(path, &outputs.paths, groups));
+                        |path| completion_owner(path, &outputs.paths, &groups.roots));
                 } else {
                     toast.record(
                         [path.as_path()],
                         &result,
                         cancelled,
-                        |path| completion_owner(path, &outputs.paths, groups),
+                        |path| completion_owner(path, &outputs.paths, &groups.roots),
                     );
                 }
             }
@@ -5950,7 +5949,7 @@ impl Scheduler {
         let mut interrupted = crate::watch_store::NativeWatchOperations::empty();
         for input in active.inputs.values().map(|input| &input.candidate).chain(siblings) {
             let id = watch_path_key(&input.path);
-            if claimed.finished.contains_key(&id)
+            if claimed.finished.contains(&id)
                 || self.hub.claims.lock().unwrap().get(&id).is_some_and(|owner| owner.as_ref() != batch)
                 || self.pending.get(&id).is_some_and(|pending| quiet::changed(input, &pending.candidate))
                 || recorded_file_is_absent(&input.path)
@@ -6057,7 +6056,7 @@ impl Scheduler {
         let (outcome, _) = result?;
         let active = &self.active[&root.batch];
         let mut claimed = active.claimed.lock().unwrap();
-        let groups = active.groups.lock().unwrap();
+        let mut groups = active.groups.lock().unwrap();
         let mut retired = members;
         retired.retain(|member| !groups.members.contains_key(member));
         // Completion has consumed the observations, including dirty paths.
@@ -6065,12 +6064,15 @@ impl Scheduler {
         for member in &retired {
             claimed.candidates.remove(member);
             claimed.deduplicated.remove(member);
-            if claimed.finished.get(member) == Some(&false) {
-                claimed.finished.remove(member);
-            }
+            claimed.finished.remove(member);
+            groups.owners.remove(member);
         }
         crate::collections::trim_map(&mut claimed.candidates);
-        crate::collections::trim_map(&mut claimed.finished);
+        crate::collections::trim_map(&mut groups.owners);
+        if claimed.finished.capacity() > 256.max(claimed.finished.len().saturating_mul(4)) {
+            let remaining = claimed.finished.len();
+            claimed.finished.shrink_to(remaining.saturating_mul(2));
+        }
         if claimed.deduplicated.capacity() > 256.max(claimed.deduplicated.len().saturating_mul(4)) {
             let remaining = claimed.deduplicated.len();
             claimed.deduplicated.shrink_to(remaining.saturating_mul(2));
@@ -7388,7 +7390,6 @@ struct WatchObserver {
     dedup_scope: NativeDiscoveryScope,
     catalog: Arc<NativeWatchCatalog>,
     journal: Arc<journal::Journal>,
-    owners: HashMap<String, String>,
     outputs: Mutex<ObservedOutputs>,
     batch: Arc<str>,
     toast: Option<super::toast::Activity>,
@@ -7403,10 +7404,13 @@ impl WatchObserver {
     }
 
     fn owner_for_sources(&self, path: &Path, sources: &[PathBuf]) -> Option<String> {
-        std::iter::once(path)
-            .chain(sources.iter().map(PathBuf::as_path))
-            .find_map(|path| self.owners.get(&key(path)).cloned())
-            .or_else(|| self.owner_for_path(path))
+        let owner = {
+            let groups = self.groups.lock().unwrap();
+            std::iter::once(path)
+                .chain(sources.iter().map(PathBuf::as_path))
+                .find_map(|path| groups.owners.get(&key(path)).cloned())
+        };
+        owner.or_else(|| self.owner_for_path(path))
     }
 
     fn owner_for_path(&self, path: &Path) -> Option<String> {
@@ -7477,7 +7481,7 @@ impl Observer for WatchObserver {
         }
         let groups = &mut *groups;
         groups.shared_owners.extend(groups.members.iter().filter_map(|(path, &count)| {
-            (count > 1 && self.owners.contains_key(path)).then(|| path.clone())
+            (count > 1 && groups.owners.contains_key(path)).then(|| path.clone())
         }));
     }
 
@@ -7492,17 +7496,14 @@ impl Observer for WatchObserver {
         let mut groups = self.groups.lock().unwrap();
         // A tail can own the WAL and outputs of several independent heads.
         // Keep their aggregate until request finish, even after a peer settles.
-        if !self.owners.contains_key(&root) && !groups.can_finish_alias(&root, &self.owners) {
+        if !groups.owners.contains_key(&root) && !groups.can_finish_alias(&root) {
             return Ok(outcome);
         }
         let aliases = groups.take(&root);
         drop(groups);
         let members = aliases.keys().map(String::as_str)
             .chain((!aliases.contains_key(&root)).then_some(root.as_str()));
-        claimed.finished.extend(members.clone().map(|member| {
-            let retain_for_report = self.toast.is_some() && self.owners.contains_key(member);
-            (member.to_owned(), retain_for_report)
-        }));
+        claimed.finished.extend(members.clone().map(str::to_owned));
         drop(claimed);
         let mut shared_outputs = self.outputs.lock().unwrap();
         let outputs = shared_outputs.take_owners(members);

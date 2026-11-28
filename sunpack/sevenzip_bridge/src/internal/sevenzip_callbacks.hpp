@@ -55,7 +55,7 @@ namespace sunpack::sevenzip
     public:
         explicit OpenCallback(
             std::wstring password,
-            std::wstring archive_path = L"",
+            const std::wstring *archive_path = nullptr,
             const std::vector<std::wstring> &part_paths = {},
             const std::vector<std::wstring> &canonical_names = {},
             InputPrefetchConfig volume_prefetch_config = input_prefetch_config(),
@@ -65,7 +65,7 @@ namespace sunpack::sevenzip
 
             : password_(std::move(password)),
 
-              archive_path_(std::move(archive_path)),
+              archive_path_(archive_path),
 
               part_paths_(part_paths.empty() ? nullptr : &part_paths),
               part_ranges_(part_ranges.empty() ? nullptr : &part_ranges), probe_reads_(probe_reads),
@@ -96,12 +96,12 @@ namespace sunpack::sevenzip
 
             value->vt = VT_EMPTY;
 
-            if (propID == kpidName && !archive_path_.empty())
+            if (propID == kpidName && archive_path_ && !archive_path_->empty())
             {
 
                 value->vt = VT_BSTR;
 
-                value->bstrVal = SysAllocString(archive_path_.c_str());
+                value->bstrVal = SysAllocString(archive_path_->c_str());
 
                 return value->bstrVal ? S_OK : E_OUTOFMEMORY;
             }
@@ -154,7 +154,7 @@ namespace sunpack::sevenzip
 
                 const auto *range = part_ranges_ && *index < part_ranges_->size() ? &(*part_ranges_)[*index] : nullptr;
                 const auto &path = range ? range->path : part_paths_ && *index < part_paths_->size()
-                    ? (*part_paths_)[*index] : archive_path_;
+                    ? (*part_paths_)[*index] : *archive_path_;
                 if (!input_error_) input_error_ = std::make_shared<std::atomic<HRESULT>>(S_OK);
                 const auto finish_open = [&](auto *stream) -> HRESULT {
                     CMyComPtr<IInStream> stream_holder(stream);
@@ -187,6 +187,7 @@ namespace sunpack::sevenzip
         bool password_requested() const { return password_requested_; }
         const std::wstring &missing_volume_name() const { return missing_volume_name_; }
         const std::wstring &failed_volume_name() const { return failed_volume_name_; }
+        void retire_volume_lookup() noexcept { volume_paths_.reset(); }
 
         HRESULT STDMETHODCALLTYPE CryptoGetTextPassword(BSTR *password) SUP7Z_NOEXCEPT override
         {
@@ -230,10 +231,10 @@ namespace sunpack::sevenzip
                 const auto found = volume_paths_->find(base);
                 if (found != volume_paths_->end()) return found->second;
             }
-            else if (!archive_path_.empty())
+            else if (archive_path_ && !archive_path_->empty())
             {
-                const auto entry = lower_text(archive_path_);
-                if (base == entry || (!base.empty() && base == filename_lower(archive_path_)) ||
+                const auto entry = lower_text(*archive_path_);
+                if (base == entry || (!base.empty() && base == filename_lower(*archive_path_)) ||
                     lower_text(name) == entry) return 0;
             }
             return std::nullopt;
@@ -242,10 +243,9 @@ namespace sunpack::sevenzip
 
         std::wstring password_;
 
-        std::wstring archive_path_;
-
-        // Both production callers own their input lists until the handler
-        // releases this callback, including the password batch's cache.
+        // Both production callers own the name and input lists until the
+        // handler releases this callback, including the password batch's cache.
+        const std::wstring *const archive_path_;
         const std::vector<std::wstring> *part_paths_;
         const std::vector<ExtractInputRange> *part_ranges_;
         VolumeReadUncertainty* probe_reads_;
@@ -466,17 +466,18 @@ namespace sunpack::sevenzip
             if (replay_) {
                 for (const auto &item : replay_->files)
                     if (!item.second.path.empty())
-                        used_.insert(normalized_output_path_key(std::filesystem::path(item.second.path).lexically_relative(root_)));
+                        names_->used.insert(normalized_output_path_key(std::filesystem::path(item.second.path).lexically_relative(root_)));
                 for (const auto &directory : directories_)
-                    used_.insert(normalized_output_path_key(directory.second));
+                    names_->used.insert(normalized_output_path_key(directory.second));
             }
         }
-        void reserve(std::size_t count) { used_.reserve(count); }
+        void reserve(std::size_t count) { names_->used.reserve(count); }
+        void retire_names() noexcept { names_.reset(); }
 #ifdef SUP7Z_DEBUG
-        std::size_t path_buckets_for_test() const noexcept { return used_.bucket_count(); }
+        std::size_t path_buckets_for_test() const noexcept { return names_->used.bucket_count(); }
         std::size_t path_key_units_for_test() const noexcept {
             std::size_t units = 0;
-            for (const auto &key : used_) units += key.size();
+            for (const auto &key : names_->used) units += key.size();
             return units;
         }
 #endif
@@ -525,27 +526,28 @@ namespace sunpack::sevenzip
 
         std::filesystem::path allocate_name(std::filesystem::path requested, bool initially_empty, bool is_directory)
         {
+            auto &used = names_->used;
             // The components were sanitized before allocation, and the
             // resolved parent uses native separators. Only case varies here.
             auto key = lower_text(requested.native());
             // Keep the common empty-output case to one hash-set insertion.
             if (initially_empty)
             {
-                const auto reservation = used_.insert(std::move(key));
+                const auto reservation = used.insert(std::move(key));
                 if (reservation.second) { return requested; }
                 key = *reservation.first;
             }
-            if (!initially_empty && used_.find(key) == used_.end())
+            if (!initially_empty && used.find(key) == used.end())
             {
                 std::error_code error;
                 const auto status = std::filesystem::status(root_ / requested, error);
                 if (!std::filesystem::exists(status) || (is_directory && std::filesystem::is_directory(status)))
                 {
-                    used_.insert(std::move(key));
+                    used.insert(std::move(key));
                     return requested;
                 }
             }
-            auto &next = next_numbers_[key];
+            auto &next = names_->next_numbers[key];
             if (next == 0) { next = 1; }
             const auto parent = requested.parent_path();
             const auto stem = (is_directory ? requested.filename() : requested.stem()).wstring();
@@ -556,7 +558,7 @@ namespace sunpack::sevenzip
                 auto candidate_key = lower_text(candidate.native());
                 if (available(candidate, candidate_key))
                 {
-                    used_.insert(std::move(candidate_key));
+                    used.insert(std::move(candidate_key));
                     return candidate;
                 }
             }
@@ -567,13 +569,17 @@ namespace sunpack::sevenzip
         {
             // A queued or failed async write still owns its name. Never wait
             // for it to appear on disk; every conflict advances the number.
-            if (used_.find(key) != used_.end()) { return false; }
+            const auto &used = names_->used;
+            if (used.find(key) != used.end()) { return false; }
             std::error_code error;
             return !std::filesystem::exists(root_ / path, error);
         }
 
-        std::unordered_set<std::wstring> used_;
-        std::unordered_map<std::wstring, std::size_t> next_numbers_;
+        struct ReservedNames {
+            std::unordered_set<std::wstring> used;
+            std::unordered_map<std::wstring, std::size_t> next_numbers;
+        };
+        std::optional<ReservedNames> names_{std::in_place};
         std::unordered_map<std::wstring, std::filesystem::path> local_directories_;
         decltype(local_directories_) &directories_;
         std::filesystem::path root_;
@@ -813,8 +819,9 @@ namespace sunpack::sevenzip
                 return;
             }
             archive_ = nullptr; // metadata needed below was captured during GetStream
-            // Decoder callbacks are over. Directory reservations survive until
-            // the final snapshot, so a late interruption can replay collisions.
+            // Decoder callbacks are over. Release per-file collision names
+            // before waiting for output, keeping only directory replay data.
+            output_paths_->retire_names();
             decltype(last_created_directory_){}.swap(last_created_directory_);
             // Archives without hard links have no further use for member names.
             if (hard_links_.empty()) decltype(hard_link_names_){}.swap(hard_link_names_);

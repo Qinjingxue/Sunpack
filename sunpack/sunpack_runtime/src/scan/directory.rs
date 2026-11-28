@@ -281,10 +281,12 @@ impl NativeWorkerManifest {
 
     /// Failed jobs may have written intact archives whose enclosing member failed CRC.
     /// Keep only decoder-confirmed rows for discovery, even when the bytes look valid.
-    pub(crate) fn partial_inventory(self, root: &str, watch: bool) -> (Option<NativeOutputInventory>, Vec<String>) {
+    pub(crate) fn partial_inventory(self, root: &str, watch: bool, collect_rows: bool) -> (Option<NativeOutputInventory>, Vec<String>) {
         let ManifestFiles::Rows(mut files) = self.files else { return (None, Vec::new()); };
+        if !collect_rows && !watch { return (None, Vec::new()); }
         let mut excluded = Vec::new();
-        Arc::make_mut(&mut files).retain(|row| {
+        let rows = Arc::make_mut(&mut files);
+        rows.retain(|row| {
             if row.status == 1 { return true; }
             if watch {
                 if let Some(path) = inventory_file_path(Path::new(root), row) {
@@ -293,7 +295,10 @@ impl NativeWorkerManifest {
             }
             false
         });
-        let inventory = (!files.is_empty()).then(|| NativeOutputInventory {
+        if collect_rows && rows.capacity() > 256.max(rows.len().saturating_mul(4)) {
+            rows.shrink_to_fit();
+        }
+        let inventory = (collect_rows && !files.is_empty()).then(|| NativeOutputInventory {
             root: root.to_owned(), files: OutputInventoryFiles::Manifest(files),
         });
         (inventory, excluded)
@@ -341,28 +346,30 @@ impl NativeOutputInventory {
         options: &NativeDirectoryScanOptions,
     ) -> std::io::Result<(NativeDirectorySnapshot, NativeDirectorySnapshot)> {
         let root = lexical_normalize_path(Path::new(&self.root));
-        let (mut files, directory_ends, manifest_rows, deduplicate_paths, errors) = match self.files {
+        let (mut files, directory_ends, manifest_prefixes, deduplicate_paths, errors) = match self.files {
             OutputInventoryFiles::Disk(inventory) => {
                 (inventory.files, Some(inventory.directory_ends), None, inventory.lossy_paths, inventory.errors)
             }
             OutputInventoryFiles::Manifest(manifest) => {
+                let manifest = Arc::unwrap_or_clone(manifest);
                 let mut records = Vec::with_capacity(manifest.len());
-                let mut item_indices = Vec::with_capacity(manifest.len());
-                for (index, item) in manifest.iter().enumerate() {
-                    let Some(path) = inventory_file_path(&root, item) else {
+                let mut prefixes = Vec::with_capacity(manifest.len());
+                for item in manifest {
+                    let Some(path) = inventory_file_path(&root, &item) else {
                         continue;
                     };
                     records.push(output_file_record(path_to_string(&path), item.size, item.mtime_ns));
-                    item_indices.push(index);
+                    // Filtering now owns the path and metadata. Keep only the probe bytes.
+                    prefixes.push(item.magic);
                 }
-                (records, None, Some((manifest, item_indices)), true, DirectoryReadErrors::default())
+                (records, None, Some(prefixes), true, DirectoryReadErrors::default())
             }
         };
         let (directories, filtered) = build_inventory_snapshot_views(
             &root,
             &mut files,
             directory_ends,
-            manifest_rows,
+            manifest_prefixes,
             &options.options,
             deduplicate_paths,
         );
@@ -789,7 +796,7 @@ fn build_inventory_snapshot_views(
     root: &Path,
     raw_files: &mut [DirectoryEntryRecord],
     directory_ends: Option<Vec<usize>>,
-    manifest_rows: Option<(Arc<Vec<OutputFileRecord>>, Vec<usize>)>,
+    manifest_prefixes: Option<Vec<Box<[u8]>>>,
     options: &DirectoryScanOptions,
     deduplicate_paths: bool,
 ) -> (Vec<DirectoryEntryRecord>, Vec<usize>) {
@@ -844,23 +851,12 @@ fn build_inventory_snapshot_views(
         }
     }
 
-    if let Some((manifest, indices)) = manifest_rows {
-        for (record, index) in raw_files.iter_mut().zip(indices) {
-            let item = &manifest[index];
-            if record.relation_member_eligible
-                && record.relation_anchor.is_none()
-                && item.magic.len() >= item.size.min(512) as usize
-            {
-                record.relation_anchor = Some(probe_volume_anchor_from_head(
-                    &record.path,
-                    item.size,
-                    &item.magic,
-                ));
-            }
+    if let Some(prefixes) = manifest_prefixes {
+        for (record, prefix) in raw_files.iter_mut().zip(prefixes) {
+            if !record.relation_member_eligible || record.relation_anchor.is_some() { continue; }
+            let Some(size) = record.size.filter(|&size| prefix.len() >= size.min(512) as usize) else { continue; };
+            record.relation_anchor = Some(probe_volume_anchor_from_head(&record.path, size, &prefix));
         }
-        // The path projection and prefix probes now own everything needed
-        // from the wire rows. Free them before building the snapshot views.
-        drop(manifest);
     }
 
     // Keep parents of files accepted before the final mtime filter, even

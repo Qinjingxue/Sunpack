@@ -9,14 +9,11 @@ namespace sunpack::sevenzip
         const std::wstring &archive_path,
         const std::vector<std::wstring> &part_paths,
         ExtractInputTrace *trace,
-        const std::vector<std::wstring> &canonical_names,
         InputPrefetchConfig prefetch_config,
         const std::vector<ExtractInputRange> &input_ranges, VolumeReadUncertainty* probe_reads, ArchiveOpenMode mode)
     {
-        const auto &callback_path = canonical_names.empty() ? archive_path : canonical_names.front();
         const auto opened_stream = [&](auto *stream) {
-            const bool opened = stream->is_open();
-            return OpenedArchiveStream{CMyComPtr<IInStream>(stream), opened ? callback_path : std::wstring{}, opened};
+            return OpenedArchiveStream{CMyComPtr<IInStream>(stream), stream->is_open()};
         };
         if (!input_ranges.empty())
         {

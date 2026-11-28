@@ -830,7 +830,7 @@ namespace sunpack::sevenzip
             // and password change as it tries keys or alternate formats.
             if (!input.stream || input.stream->Seek(0, STREAM_SEEK_SET, nullptr) != S_OK) {
                 input = open_archive_stream(archive_path, part_paths, &cache.input_trace,
-                    canonical_names, InputPrefetchConfig{false}, input_ranges, volumes.observer(), mode);
+                    InputPrefetchConfig{false}, input_ranges, volumes.observer(), mode);
             }
 
             if (!input.opened)
@@ -854,7 +854,8 @@ namespace sunpack::sevenzip
                 return result;
             }
 
-            auto *raw_open_callback = new OpenCallback(password, input.take_handler_callback_path(format.Data4[5] == 0x01, mode),
+            auto *raw_open_callback = new OpenCallback(
+                password, handler_callback_path(archive_path, canonical_names, format.Data4[5] == 0x01, mode),
                 part_paths, canonical_names, InputPrefetchConfig{false}, native_job_cancel_token(), input_ranges,
                 volumes.observer(), !final_read_only);
             CMyComPtr<IArchiveOpenCallback> open_callback(raw_open_callback);
