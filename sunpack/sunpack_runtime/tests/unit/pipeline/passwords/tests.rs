@@ -107,7 +107,7 @@ fn encrypted_empty_rar_crc_failure_uses_verified_direct_password_plan() {
     let candidates = CandidateSet::new(Arc::from([Arc::from("fixture-secret")]), None, &cache, None);
     let plan = candidates.plan(&mut input, None, &Cancellation::new(), Mode::Extract).unwrap().unwrap();
     assert_eq!(plan.verified_password.as_deref(), Some("fixture-secret"));
-    assert!(plan.candidates.is_empty(), "must not use the all-rejected candidate fallback");
+    assert!(plan.candidates().is_empty(), "must not use the all-rejected candidate fallback");
     std::fs::remove_file(source).unwrap();
 }
 
@@ -217,31 +217,6 @@ fn failure_signatures_share_lazy_explicit_digest_without_changing_candidates() {
 }
 
 #[test]
-fn large_dictionary_reuses_recent_membership_across_inputs() {
-    let recent = RecentPasswords::default();
-    let values: Vec<Arc<str>> = (0..1024).map(|index| format!("item-{index}").into()).collect();
-    recent.remember_recent(values[900].clone());
-    recent.remember_recent(Arc::from("from-another-request"));
-    let candidates = CandidateSet::new(values.clone().into(), None, &recent, None);
-    PRIORITY_CANDIDATES.set(0);
-    for index in 0..32 {
-        let path = format!("archive-{index}.zip");
-        let scope = ScopedCandidates::new(candidates.scope_buckets(&path));
-        let order: Vec<_> = candidates.for_scope(&scope, &recent.snapshot()).take(3).map(AsRef::as_ref).collect();
-        assert_eq!(order, ["item-900", "item-0", "item-1"]);
-    }
-    assert_eq!(PRIORITY_CANDIDATES.get(), values.len());
-
-    // The next snapshot changes priority, including across nested scopes.
-    recent.remember_recent(values[800].clone());
-    let nested = candidates.with_scope(Some(Path::new(r"C:\parent")));
-    let scope = ScopedCandidates::new(nested.scope_buckets(r"C:\output\inner.zip"));
-    let order: Vec<_> = nested.for_scope(&scope, &recent.snapshot()).take(3).map(AsRef::as_ref).collect();
-    assert_eq!(order, ["item-800", "item-900", "item-0"]);
-    assert_eq!(PRIORITY_CANDIDATES.get(), values.len() * 2);
-}
-
-#[test]
 fn nearest_directory_controls_builtin_candidates_even_when_recent() {
     let parent = r"C:\parent";
     let child = r"C:\parent\child";
@@ -304,6 +279,21 @@ fn scoped_recent_priority_reuses_global_lookup_and_preserves_order() {
     assert!(Arc::ptr_eq(&scoped, &passwords(r"C:\parent\another\second.zip")));
     assert!(Arc::ptr_eq(&unscoped, &passwords(r"C:\elsewhere\second.zip")));
     assert_eq!(PRIORITY_CANDIDATES.get(), 1026 + 3);
+
+    // The next snapshot only looks up the new password in the base dictionary.
+    recent.remember_recent(Arc::from("explicit"));
+    let nested = candidates.with_scope(Some(Path::new(r"C:\parent")));
+    let scope = ScopedCandidates::new(nested.scope_buckets(r"C:\output\inner.zip"));
+    let order: Vec<_> = nested.for_scope(&scope, &recent.snapshot()).take(5).map(AsRef::as_ref).collect();
+    assert_eq!(order, ["explicit", "item-800", "scoped", "item-900", "item-0"]);
+    assert_eq!(PRIORITY_CANDIDATES.get(), 1026 + 3 + 2 + 3);
+
+    // Reordering both a known password and a cached miss performs no base lookup.
+    recent.remember_recent(Arc::from("item-900"));
+    recent.remember_recent(Arc::from("from-another-request"));
+    let order: Vec<_> = nested.for_scope(&scope, &recent.snapshot()).take(5).map(AsRef::as_ref).collect();
+    assert_eq!(order, ["item-900", "explicit", "item-800", "scoped", "item-0"]);
+    assert_eq!(PRIORITY_CANDIDATES.get(), 1026 + 3 + 2 + 3 + 3);
 }
 
 #[test]
@@ -360,7 +350,7 @@ fn sole_enc_candidate_uses_rust_only_when_scanning() {
         .plan(&mut input, None, &Cancellation::new(), Mode::Extract)
         .unwrap()
         .unwrap();
-    assert_eq!(plan.candidates.as_slice(), [Arc::<str>::from("confirm-in-worker")]);
+    assert_eq!(plan.candidates(), [Arc::<str>::from("confirm-in-worker")]);
     assert_eq!(plan.encrypted, Some(true));
     assert!(plan.verified_password.is_none());
     let failure = candidates.plan(&mut input, None, &Cancellation::new(), Mode::Scan)
@@ -380,7 +370,7 @@ fn explicit_empty_enc_candidate_is_not_absent_or_implicit() {
     let cache = RecentPasswords::default();
     let empty = CandidateSet::new(Arc::from([Arc::from("")]), None, &cache, None);
     let plan = empty.plan(&mut input, None, &Cancellation::new(), Mode::Extract).unwrap().unwrap();
-    assert_eq!(plan.candidates.as_slice(), [Arc::<str>::from("")]);
+    assert_eq!(plan.candidates(), [Arc::<str>::from("")]);
     let absent = CandidateSet::new(Arc::from([]), None, &cache, None);
     assert_eq!(absent.plan(&mut input, None, &Cancellation::new(), Mode::Extract).unwrap()
         .err().unwrap().kind, FailureKind::WrongPassword);
@@ -389,7 +379,7 @@ fn explicit_empty_enc_candidate_is_not_absent_or_implicit() {
     attempts.reject(key.clone(), &[Arc::from("wrong")]);
     let mixed = CandidateSet::new(Arc::from([Arc::from("wrong"), Arc::from("")]), None, &cache, None);
     let plan = mixed.plan(&mut input, None, &Cancellation::new(), Mode::Extract).unwrap().unwrap();
-    assert_eq!(plan.candidates.as_slice(), [Arc::<str>::from("")]);
+    assert_eq!(plan.candidates(), [Arc::<str>::from("")]);
     attempts.remember_proof(key, Some(Arc::from("")));
     let cached = empty.plan(&mut input, None, &Cancellation::new(), Mode::Extract).unwrap().unwrap();
     assert_eq!(cached.verified_password.as_deref(), Some(""));
@@ -498,7 +488,7 @@ fn copy_payload_hands_off_unfilterable_candidate_suffix_without_reprobing() {
     let batches = PLANNED_BATCHES.with(|value| value.borrow_mut().take().unwrap());
     assert_eq!(batches.len(), 1);
     assert!(plan.verified_password.is_none());
-    assert_eq!(&plan.candidates[1..], values.as_slice());
+    assert_eq!(&plan.candidates()[1..], values.as_slice());
     std::fs::remove_file(source).unwrap();
 }
 

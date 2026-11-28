@@ -108,8 +108,10 @@ std::int64_t NativeMemoryManager::sample_locked(bool fresh) {
     // Reconcile external changes on the existing active-only observation
     // interval. Between samples every managed commit/free debits/refunds this
     // ledger under the same mutex; concurrent dictionaries cannot spend it twice.
-    const bool requested = resample_.exchange(false, std::memory_order_acq_rel);
-    if (fresh || requested || now - sampled_at_ >= 250) {
+    if (fresh || resample_.load(std::memory_order_acquire) || now - sampled_at_ >= 250) {
+        // Clear only when we will query. Requests arriving during the query
+        // stay set for the next call.
+        resample_.store(false, std::memory_order_release);
 #ifdef SUP7Z_DEBUG
         if (query_) cached_headroom_ = query_();
         else
@@ -131,6 +133,7 @@ void NativeMemoryManager::set_admission_locked(NativeMemoryJob &job, std::uint64
 }
 void NativeMemoryManager::begin(NativeMemoryJob &job, std::function<void()> wake) {
     std::lock_guard<std::mutex> lock(mutex_);
+    const bool was_idle = jobs_.empty() && waiters_.empty();
     job.running = true;
     job.wake_pending = false;
     job.failed_headroom = -1;
@@ -145,7 +148,7 @@ void NativeMemoryManager::begin(NativeMemoryJob &job, std::function<void()> wake
     job.cancel->store(false, std::memory_order_release);
     job.wake = std::move(wake);
     add_job_locked(job);
-    SetEvent(change_);
+    if (was_idle) SetEvent(change_);
 }
 void NativeMemoryManager::end(NativeMemoryJob &job) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -160,7 +163,9 @@ void NativeMemoryManager::end(NativeMemoryJob &job) {
         jobs_.pop_back();
         job.manager_index = SIZE_MAX;
     }
-    SetEvent(change_);
+    // A waiter can use the refunded reservation or become the next probe.
+    // Wake on the final job too so the monitor can disarm the active timer.
+    if (!waiters_.empty() || jobs_.empty()) SetEvent(change_);
 }
 void NativeMemoryManager::set_wake(NativeMemoryJob &job, std::function<void()> wake) {
     std::lock_guard<std::mutex> lock(mutex_);

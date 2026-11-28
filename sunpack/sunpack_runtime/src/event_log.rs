@@ -622,7 +622,7 @@ impl Projection {
             drop(dirty);
             self.tasks
                 .iter()
-                .map(|(id, task)| (id.clone(), project_status(task)))
+                .filter_map(|(id, task)| project_status(task).map(|row| (id.clone(), Some(row))))
                 .collect()
         } else {
             dirty

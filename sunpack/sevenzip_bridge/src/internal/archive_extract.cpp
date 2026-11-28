@@ -403,7 +403,7 @@ namespace sunpack::sevenzip
                 PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::CallbackSetup);
 #endif
                 return new OpenCallback(
-                    password, input.handler_callback_path(format.Data4[5] == 0x01, mode),
+                    password, input.take_handler_callback_path(format.Data4[5] == 0x01, mode),
                     part_paths, canonical_names, prefetch_config, cancel_token, input_ranges);
             }();
             CMyComPtr<IArchiveOpenCallback> open_callback(raw_open_callback);

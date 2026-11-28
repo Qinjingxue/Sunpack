@@ -83,14 +83,16 @@ void NativeCpuBudget::release(std::size_t count) noexcept
     }
 }
 
+#ifdef SUP7Z_DEBUG
 std::size_t NativeCpuBudget::reserved_credits() const noexcept
 {
     return reserved_credits_.load(std::memory_order_acquire);
 }
+#endif
 
 bool NativeCpuBudget::can_acquire_base() const noexcept
 {
-    return reserved_credits() < nominal_capacity_;
+    return reserved_credits_.load(std::memory_order_acquire) < nominal_capacity_;
 }
 
 NativeCpuJobContext::NativeCpuJobContext(

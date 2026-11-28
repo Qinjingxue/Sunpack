@@ -296,6 +296,7 @@ void read_volume_plan(wire::RequestReader& reader, WorkerArchiveInput& input) {
 ArchiveOpenMode read_input_mode(std::string_view mode) {
     if (mode == "file_range") return ArchiveOpenMode::FileRange;
     if (mode == "native_volumes") return ArchiveOpenMode::NativeVolumes;
+    if (mode == "named_volumes") return ArchiveOpenMode::NamedVolumes;
     if (mode == "sfx_with_volumes") return ArchiveOpenMode::SfxWithVolumes;
     return ArchiveOpenMode::File;
 }
@@ -303,7 +304,6 @@ ArchiveOpenMode read_input_mode(std::string_view mode) {
 void read_input_parts(wire::RequestReader& reader, WorkerArchiveInput& input) {
     if (input.mode == ArchiveOpenMode::File) { reader.skip(); return; }
     const bool structured = input.mode != ArchiveOpenMode::FileRange;
-    bool has_ranges = false;
     std::uint64_t previous = 0;
     read_array(reader, [&] {
         sunpack::sevenzip::ExtractInputRange range;
@@ -332,26 +332,29 @@ void read_input_parts(wire::RequestReader& reader, WorkerArchiveInput& input) {
             if (!input.missing_volume_number && number != previous + 1)
                 input.missing_volume_number = static_cast<int>(previous + 1);
             previous = number;
-            has_ranges |= range.start != 0 || range.has_end || bool(range.view);
-            input.ranges.push_back(std::move(range));
+            if (input.ranges.empty() && range.start == 0 && !range.has_end && !range.view) {
+                input.part_paths.push_back(std::move(range.path));
+            } else {
+                // Keep whole-file volumes in the compact path representation.
+                // Upgrade the already parsed prefix only if an extent needs it.
+                if (!input.part_paths.empty()) {
+                    input.ranges.reserve(input.part_paths.size() + 1);
+                    for (auto& path : input.part_paths) input.ranges.push_back({std::move(path)});
+                    decltype(input.part_paths){}.swap(input.part_paths);
+                }
+                input.ranges.push_back(std::move(range));
+            }
             input.canonical_names.push_back(std::move(name));
         }
     });
-    if (structured && !has_ranges) {
-        input.part_paths.reserve(input.ranges.size());
-        for (auto& range : input.ranges) input.part_paths.push_back(std::move(range.path));
-        std::vector<sunpack::sevenzip::ExtractInputRange>().swap(input.ranges);
-    }
 }
 
 WorkerArchiveInput read_archive_input(wire::RequestReader& reader) {
     WorkerArchiveInput input;
     bool attempts = false;
-    bool named_volumes = false;
     read_object(reader, [&](auto key) {
         if (key == "entry_path") input.archive_path = utf8_to_wide(reader.text());
         else if (key == "open_mode") input.mode = read_input_mode(reader.text());
-        else if (key == "named_volumes") named_volumes = reader.boolean();
         else if (key == "format_hint") input.format_hint = utf8_to_wide(reader.text());
         else if (key == "parts") read_input_parts(reader, input);
         else if (key == "volume_attempts") {
@@ -367,8 +370,6 @@ WorkerArchiveInput read_archive_input(wire::RequestReader& reader) {
             });
         } else reader.skip();
     });
-    if (named_volumes && input.mode == ArchiveOpenMode::NativeVolumes)
-        input.mode = ArchiveOpenMode::NamedVolumes;
     if (!attempts && input.validation_error.empty()) {
         if (input.mode == ArchiveOpenMode::FileRange && input.ranges.empty())
             input.validation_error = "file_range descriptor requires canonical parts with extents";
@@ -562,7 +563,8 @@ bool verified_file(const sunpack::sevenzip::ExtractOutputItemTrace& item) {
     return !item.is_dir && item.done && !item.failed && item.operation_result == 0;
 }
 
-std::string verified_manifest_wire(const std::string& job_id, sunpack::sevenzip::ExtractArchiveResult& result, bool include_rows, bool partial) {
+std::string verified_manifest_wire(const std::string& job_id, sunpack::sevenzip::ExtractArchiveResult& result,
+    bool include_rows, bool partial, std::size_t& complete_files) {
     std::optional<WorkerChunks> chunks;
     if (include_rows) {
         chunks.emplace(job_id, "manifest_chunk", "rows");
@@ -583,7 +585,13 @@ std::string verified_manifest_wire(const std::string& job_id, sunpack::sevenzip:
         row += wire::array();
         wire::append_text(row, wide_to_utf8(item.output_path));
         wire::append_number(row, item.has_expected_size ? item.expected_size : item.bytes_written);
-        wire::append_number(row, partial ? (verified_file(item) ? 1 : 2) : (item.done ? 1 : item.failed ? 2 : 0));
+        if (partial) {
+            const bool verified = verified_file(item);
+            complete_files += verified;
+            wire::append_number(row, verified ? 1 : 2);
+        } else {
+            wire::append_number(row, item.done ? 1 : item.failed ? 2 : 0);
+        }
         if (item.has_mtime_ns) wire::append_number(row, item.mtime_ns);
         else row.push_back(wire::kNull);
         wire::append_text(row, std::string_view(reinterpret_cast<const char*>(item.magic.data()), item.magic.size()), wire::kBytes);
@@ -1789,6 +1797,10 @@ RequestOutcome run_request(
     const auto& job_id = request.job_id;
     const bool ok = result.status == PasswordTestStatus::Ok;
     const bool include_inventory = request.output_inventory;
+    // The request is retired before serializing the manifest. Capture every
+    // routing decision while it still belongs to this extraction.
+    const bool partial_inventory = !ok && !result.output_trace.items.empty() &&
+        (include_inventory || request.from_watch);
     std::string volume_selection;
     if (ok && !request.archive_input.volume_attempts.layouts.empty()) {
         const auto& cursor = current_extraction_replay->volumes;
@@ -1800,12 +1812,13 @@ RequestOutcome run_request(
     if (retire_extraction) retire_extraction();
     NativeMemoryScope response_memory(nullptr);
     // A preexisting output root needs a directory scan to include its old files.
-    const auto complete_files = !ok ? std::count_if(
-        result.output_trace.items.begin(), result.output_trace.items.end(), verified_file) : 0;
-    const bool partial_inventory = !ok && !result.output_trace.items.empty() &&
-        (include_inventory || request.from_watch);
+    std::size_t complete_files = 0;
     const std::string manifest_field = (ok && result.output_inventory_complete) || partial_inventory
-        ? wire::key("verified_manifest") + verified_manifest_wire(job_id, result, include_inventory || partial_inventory, !ok) : "";
+        ? wire::key("verified_manifest") + verified_manifest_wire(
+            job_id, result, include_inventory || partial_inventory, !ok, complete_files) : "";
+    if (!ok && !partial_inventory) {
+        complete_files = std::count_if(result.output_trace.items.begin(), result.output_trace.items.end(), verified_file);
+    }
     const std::string failure_fields = ok ? "" :
         wire::key("failure_stage") + wire::text(result.failure_stage) +
         wire::key("failure_kind") + wire::text(result.failure_kind) +
@@ -2013,14 +2026,14 @@ public:
         print_job_event(job_id, "job_accepted");
     }
 
-    bool cancel(const std::string& job_id) noexcept {
+    void cancel(const std::string& job_id) noexcept {
         std::shared_ptr<std::atomic<bool>> token;
         std::shared_ptr<sunpack::sevenzip::AsyncFileWriter> writer_to_wake;
         {
             std::lock_guard<std::mutex> lock(cancel_mutex_);
             const auto found = cancel_tokens_.find(job_id);
             if (found == cancel_tokens_.end()) {
-                return false;
+                return;
             }
             token = found->second.cancel_token;
             token->store(true, std::memory_order_release);
@@ -2032,7 +2045,7 @@ public:
         // Cancellation is rare: withdraw queued jobs here rather than making
         // them wait for a CPU credit just to acknowledge their terminal state.
         std::optional<Job> withdrawn;
-        std::deque<Job> retired_queue;
+        std::optional<std::deque<Job>> retired_queue;
         bool drained = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -2051,7 +2064,7 @@ public:
                 break;
             }
         }
-        retired_queue.clear();
+        retired_queue.reset();
         if (withdrawn) {
             if (withdrawn->execution) memory_.end(withdrawn->execution->memory);
             erase_cancel_token(job_id);
@@ -2061,7 +2074,7 @@ public:
                 (wire::key("status") + wire::text("cancelled") + wire::key("native_status") + wire::text("cancelled") + wire::key("hresult") + wire::number(-2147467260) + wire::end()));
             print_job_event(job_id, "job_finished");
             if (drained) drain_condition_.notify_all();
-            return true;
+            return;
         }
 #ifdef _WIN32
         // Wake only the facility this job writes to, whose producer may be parked in that backpressure wait; a reclaimed facility leaves an expired weak_ptr.
@@ -2069,7 +2082,6 @@ public:
             writer_to_wake->wake_waiters();
         }
 #endif
-        return true;
     }
 
     bool had_job_failure() const noexcept { return any_job_failed_; }
@@ -2206,12 +2218,17 @@ private:
             oversized |= jobs.size() > warm_capacity;
         }
 
-        void retire_if_drained(std::deque<Job>& retired) noexcept {
+        void retire_if_drained(std::optional<std::deque<Job>>& retired) noexcept {
             // MSVC retains the deque's raw blocks after pop/erase. Keep one
             // worker wave warm; detach larger drained piles before freeing.
             if (oversized && jobs.empty()) {
-                jobs.swap(retired);
-                oversized = false;
+                try {
+                    retired.emplace();
+                    jobs.swap(*retired);
+                    oversized = false;
+                } catch (const std::bad_alloc&) {
+                    // The empty deque remains usable under memory pressure.
+                }
             }
         }
     };
@@ -2299,7 +2316,7 @@ private:
                 // drain would otherwise tie up a host. Creation failure falls
                 // back to the original blocking path.
                 if (spare_workers_.size() == drain_loans_)
-                    spare_workers_.emplace_back([this] { worker_loop(true); });
+                    spare_workers_.emplace_back([this, generation = spare_generation_] { worker_loop(generation); });
             } catch (const std::exception&) {
                 return false;
             }
@@ -2318,7 +2335,7 @@ private:
         if (cpu_budget_.can_acquire_base()) notify_cpu_waiter_locked();
     }
 
-    Job pop_next_job_locked(std::deque<Job>& retired) {
+    Job pop_next_job_locked(std::optional<std::deque<Job>>& retired) {
         auto& selected = foreground_queue_.jobs.empty() ? background_queue_ : foreground_queue_;
         Job job = std::move(selected.jobs.front());
         selected.jobs.pop_front();
@@ -2430,18 +2447,32 @@ private:
         for (;;) {
             auto deadline = writer_registry_.reap_idle(std::chrono::steady_clock::now());
             space_monitor_.tick(std::chrono::steady_clock::now());
+            std::vector<std::thread> retired;
             std::unique_lock<std::mutex> lock(monitor_mutex_);
             const auto now = std::chrono::steady_clock::now();
             {
                 std::lock_guard<std::mutex> jobs_lock(mutex_);
-                if (key_cache_deadline_ && now >= *key_cache_deadline_) {
+                if (idle_cleanup_deadline_ && now >= *idle_cleanup_deadline_) {
                     NCrypto::N7z::ClearGlobalKeyCache();
                     NCrypto::NRar5::ClearGlobalKeyCache();
-                    key_cache_deadline_.reset();
+                    if (!spare_workers_.empty() && spare_waiters_ == spare_workers_.size()) {
+                        ++spare_generation_;
+                        spare_waiters_ = 0;
+                        retired.swap(spare_workers_);
+                        spare_condition_.notify_all();
+                    }
+                    idle_cleanup_deadline_.reset();
                 }
-                if (key_cache_deadline_ && (!deadline || *key_cache_deadline_ < *deadline)) {
-                    deadline = key_cache_deadline_;
+                if (idle_cleanup_deadline_ && (!deadline || *idle_cleanup_deadline_ < *deadline)) {
+                    deadline = idle_cleanup_deadline_;
                 }
+            }
+            if (!retired.empty()) {
+                // Retire only scheduler waiters. Joining must leave both
+                // scheduler and monitor notifications free to advance.
+                lock.unlock();
+                for (auto& worker : retired) worker.join();
+                continue;
             }
             if (const auto space = space_monitor_.next_poll_deadline();
                 space && (!deadline || *space < *deadline)) deadline = space;
@@ -2454,14 +2485,19 @@ private:
         }
     }
 
+    bool arm_idle_cleanup_locked() noexcept {
+        if (active_jobs_ != 0 || idle_cleanup_deadline_) return false;
+        const bool idle_spares = !spare_workers_.empty() && spare_waiters_ == spare_workers_.size();
+        if (!idle_spares && !NCrypto::N7z::HasGlobalKeyCache() && !NCrypto::NRar5::HasGlobalKeyCache())
+            return false;
+        idle_cleanup_deadline_ = std::chrono::steady_clock::now() + writer_config_.idle_timeout;
+        return true;
+    }
+
     bool finish_attempt_locked() noexcept {
         --active_jobs_;
         if (drain_loans_ != 0) spare_condition_.notify_one();
-        if (active_jobs_ == 0 && (NCrypto::N7z::HasGlobalKeyCache() || NCrypto::NRar5::HasGlobalKeyCache())) {
-            key_cache_deadline_ = std::chrono::steady_clock::now() + writer_config_.idle_timeout;
-            return true;
-        }
-        return false;
+        return arm_idle_cleanup_locked();
     }
 
     // Fallback routing key: an unknown volume gets its own isolated facility rather than sharing another volume's writer.
@@ -2484,22 +2520,36 @@ private:
         }
     }
 
-    void worker_loop(bool spare = false) noexcept {
-        std::deque<Job> retired_queue;
+    void worker_loop(std::optional<std::size_t> spare_generation = std::nullopt) noexcept {
+        const bool spare = spare_generation.has_value();
         for (;;) {
             Job job;
+            std::optional<std::deque<Job>> retired_queue;
             bool wake_next_job = false;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
                 auto& admission = spare ? spare_condition_ : condition_;
-                admission.wait(lock, [this, spare] {
-                    if (spare && stopping_) return true;
+                if (spare) {
+                    if (stopping_ || *spare_generation != spare_generation_) break;
+                    ++spare_waiters_;
+                    if (arm_idle_cleanup_locked()) {
+                        lock.unlock();
+                        request_monitor_recheck();
+                        lock.lock();
+                    }
+                }
+                admission.wait(lock, [this, spare_generation, spare] {
+                    if (spare && (stopping_ || *spare_generation != spare_generation_)) return true;
                     const bool empty = queues_empty_locked();
                     return (!empty && drain_resumers_ == 0 && cpu_budget_.can_acquire_base() &&
                             (!spare || (drain_loans_ != 0 && active_jobs_ < worker_count_ + drain_loans_ &&
                                 can_overlap_output_locked(draining_volume_)))) ||
                         (stopping_ && empty && parked_jobs_ == 0);
                 });
+                if (spare) {
+                    if (*spare_generation != spare_generation_) break;
+                    --spare_waiters_;
+                }
                 if (stopping_ && (spare || (queues_empty_locked() && parked_jobs_ == 0))) {
                     break;
                 }
@@ -2508,7 +2558,7 @@ private:
                 }
 
                 job = pop_next_job_locked(retired_queue);
-                if (active_jobs_++ == 0) key_cache_deadline_.reset();
+                if (active_jobs_++ == 0) idle_cleanup_deadline_.reset();
                 if (queues_empty_locked()) {
                     // On canceling shutdown the first broadcast can reach
                     // idle workers before a parked job is requeued. Removing
@@ -2524,7 +2574,7 @@ private:
             if (wake_next_job) {
                 condition_.notify_one();
             }
-            retired_queue.clear();
+            retired_queue.reset();
 
             const bool replaying = job.execution != nullptr;
             if (!job.execution) {
@@ -2560,7 +2610,6 @@ private:
                 }
 #ifdef SUP7Z_DEBUG
                 static const bool cpu_diagnostics = std::getenv("SUNPACK_NATIVE_CPU_DIAGNOSTICS") != nullptr;
-                const std::string cpu_diag_id = cpu_diagnostics ? job_id : std::string{};
 #endif
                 sunpack::sevenzip::NativeCpuJobContext cpu_job_context(cpu_budget_, handoff);
                 sunpack::sevenzip::NativeCpuContextScope cpu_scope(&cpu_job_context);
@@ -2620,7 +2669,7 @@ private:
                 if (cpu_diagnostics) {
                     const auto usage = cpu_job_context.snapshot();
                     print_frame((wire::object() + wire::key("type") + wire::text("cpu_activation") +
-                        wire::key("job_id") + wire::text(cpu_diag_id) +
+                        wire::key("job_id") + wire::text(job_id) +
                         wire::key("peak_extra") + wire::number(usage.peak_extra_credits) +
                         wire::key("remaining_extra") + wire::number(usage.current_extra_credits) + wire::end()));
                 }
@@ -2630,14 +2679,14 @@ private:
             // retain neither dictionaries, writer leases nor execution threads.
             cpu_budget_.release(1);
             memory_.end(memory_job);
-            bool key_cache_armed;
+            bool idle_cleanup_armed;
             if (outcome.code == kMemoryRetry) {
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
-                    key_cache_armed = finish_attempt_locked();
+                    idle_cleanup_armed = finish_attempt_locked();
                     ++parked_jobs_;
                 }
-                if (key_cache_armed) request_monitor_recheck();
+                if (idle_cleanup_armed) request_monitor_recheck();
 #ifdef SUP7Z_DEBUG
                 print_frame((wire::object() + wire::key("type") + wire::text("native_memory") + wire::key("job_id")) + wire::text(job_id) +
                     (wire::key("event") + wire::text("memory_reclaimed") + wire::key("required_bytes")) + wire::number(memory_job.required) + wire::end());
@@ -2673,14 +2722,14 @@ private:
             bool drained = false;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
-                key_cache_armed = finish_attempt_locked();
+                idle_cleanup_armed = finish_attempt_locked();
                 drained = queues_empty_locked() && active_jobs_ == 0 && parked_jobs_ == 0;
                 any_job_failed_ = any_job_failed_ || outcome.code != 0;
             }
             if (!job_id.empty()) erase_cancel_token(job_id);
             const auto finished_job_id = std::move(job.request.job_id);
             job = {};
-            if (key_cache_armed) request_monitor_recheck();
+            if (idle_cleanup_armed) request_monitor_recheck();
 
             // cpu_budget_.release(1) wakes at most one queued admission waiter.
             // Drain waiters use a separate condition variable, while the
@@ -2723,6 +2772,8 @@ private:
     std::atomic<bool> output_drain_backlog_{false}; // Hint; rechecked under mutex_ before lending.
     std::size_t drain_loans_ = 0;
     std::size_t drain_resumers_ = 0;
+    std::size_t spare_waiters_ = 0;
+    std::size_t spare_generation_ = 0;
 
     // Cancellation bookkeeping is not scheduler state and must not contend
     // with admission or queue selection.
@@ -2740,8 +2791,8 @@ private:
     const std::size_t queue_capacity_;
     sunpack::sevenzip::NativeCpuBudget cpu_budget_;
     std::size_t active_jobs_ = 0;
-    // Armed only when the last executing attempt leaves a populated cache.
-    std::optional<std::chrono::steady_clock::time_point> key_cache_deadline_;
+    // Shared idle deadline for decoder caches and borrowed execution threads.
+    std::optional<std::chrono::steady_clock::time_point> idle_cleanup_deadline_;
     std::size_t parked_jobs_ = 0;
     bool any_job_failed_ = false;
     bool stopping_ = false;
@@ -2753,10 +2804,7 @@ void run_message(
 ) {
     const std::string& command = request.worker_command;
     if (command == "cancel") {
-        const std::string& job_id = request.job_id;
-        const bool accepted = executor.cancel(job_id);
-        print_frame((wire::object() + wire::key("type") + wire::text("cancel_ack") + wire::key("job_id")) + wire::text(job_id) +
-            wire::key("accepted") + wire::boolean(accepted) + wire::end());
+        executor.cancel(request.job_id);
         return;
     }
     if (command == "set_process_mode") {

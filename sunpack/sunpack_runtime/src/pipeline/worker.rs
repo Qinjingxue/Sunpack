@@ -144,7 +144,8 @@ pub(super) struct WorkerRequest {
     pub output_volume_key: String,
     #[serde(serialize_with = "serialize_archive_input")]
     pub archive_input: Arc<ArchiveInput>,
-    pub password_candidates: Arc<Vec<Arc<str>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password_candidates: Option<Arc<Vec<Arc<str>>>>,
     #[serde(flatten)]
     pub layout_passwords: crate::password::evidence::LayoutPasswords,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1230,14 +1231,14 @@ fn dispatch_stdout(mut output: impl Read, shared: &Shared) -> io::Result<()> {
         if count == 0 {
             return decoder.finish();
         }
-        for frame in decoder.feed(&buffer[..count])? {
+        decoder.feed(&buffer[..count], |frame| {
             if string(&frame.summary, "type") == "worker_fatal" {
                 return Err(io::Error::new(io::ErrorKind::InvalidData,
                     string(&frame.summary, "message").to_owned()));
             }
             shared.event(frame);
-        }
-        decoder.check()?;
+            Ok(())
+        })?;
     }
 }
 
@@ -1306,11 +1307,7 @@ impl Process {
 
     pub(super) fn test_event(&self, summary: Value) {
         let bytes = encode_worker_frame(&summary).unwrap();
-        let mut decoder = NativeWorkerFrameDecoder::default();
-        for frame in decoder.feed(&bytes).unwrap() {
-            self.shared.event(frame);
-        }
-        decoder.finish().unwrap();
+        dispatch_stdout(bytes.as_slice(), &self.shared).unwrap();
     }
 
     pub(super) fn test_wait_startup_abandoned(&self) {

@@ -18,30 +18,72 @@ pub(crate) fn case_key_unit(unit: u16) -> u16 {
 }
 
 pub(crate) fn case_key(value: &str) -> String {
+    let mut key = String::with_capacity(value.len());
+    case_key_into(value, &mut key);
+    key
+}
+
+pub(crate) fn case_key_into(value: &str, key: &mut String) {
+    key.clear();
     if value.is_ascii() {
-        return value.to_ascii_lowercase();
+        key.push_str(value);
+        key.make_ascii_lowercase();
+        return;
     }
-    value
-        .chars()
-        .map(|ch| {
-            #[cfg(windows)]
-            if ch as u32 <= u16::MAX as u32 {
-                // NT's filesystem mapping is independent of the process locale
-                // and does not expand characters or fold surrogate pairs.
-                return char::from_u32(case_key_unit(ch as u16) as u32).unwrap_or(ch);
-            }
-            ch.to_ascii_lowercase()
-        })
-        .collect()
+    key.reserve(value.len());
+    key.extend(value.chars().map(|ch| {
+        #[cfg(windows)]
+        if ch as u32 <= u16::MAX as u32 {
+            // NT's filesystem mapping is independent of the process locale
+            // and does not expand characters or fold surrogate pairs.
+            return char::from_u32(case_key_unit(ch as u16) as u32).unwrap_or(ch);
+        }
+        ch.to_ascii_lowercase()
+    }));
 }
 
 pub(crate) fn path_key(value: &str) -> String {
-    let key = case_key(value);
-    if key.contains('/') {
-        key.replace('/', "\\")
-    } else {
-        key
+    let mut key = String::with_capacity(value.len());
+    path_key_into(value, &mut key);
+    key
+}
+
+pub(crate) fn path_key_into(value: &str, key: &mut String) {
+    case_key_into(value, key);
+    if let Some(first) = memchr::memchr(b'/', key.as_bytes()) {
+        // Replacing one ASCII separator with another preserves UTF-8.
+        for byte in unsafe { key.as_bytes_mut() }[first..].iter_mut() {
+            if *byte == b'/' {
+                *byte = b'\\';
+            }
+        }
     }
+}
+
+/// Join groups that refer to the same physical path, including transitive overlaps.
+pub(crate) fn path_components<'a>(
+    groups: impl ExactSizeIterator<Item = impl Iterator<Item = &'a str>>,
+) -> (Vec<usize>, std::collections::HashMap<String, usize>) {
+    let mut parents: Vec<_> = (0..groups.len()).collect();
+    let mut owners = std::collections::HashMap::new();
+    for (index, paths) in groups.enumerate() {
+        for path in paths {
+            if let Some(other) = owners.insert(path_key(path), index) {
+                let left = component_root(&mut parents, index);
+                let right = component_root(&mut parents, other);
+                parents[left] = right;
+            }
+        }
+    }
+    (parents, owners)
+}
+
+pub(crate) fn component_root(parents: &mut [usize], mut index: usize) -> usize {
+    while parents[index] != index {
+        parents[index] = parents[parents[index]];
+        index = parents[index];
+    }
+    index
 }
 
 pub(crate) fn path_ancestors(key: &str) -> impl Iterator<Item = &str> {

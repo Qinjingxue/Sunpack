@@ -191,68 +191,49 @@ fn frame_size(header: &[u8]) -> io::Result<usize> {
 #[derive(Default)]
 pub(crate) struct NativeWorkerFrameDecoder {
     pending: Vec<u8>,
-    failure: Option<String>,
 }
 impl NativeWorkerFrameDecoder {
-    #[cfg(test)]
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
+    /// Dispatch each complete frame before decoding the next, so a damaged
+    /// suffix cannot prevent delivery of the valid prefix.
     pub(crate) fn feed(
         &mut self,
         mut data: &[u8],
-    ) -> io::Result<Vec<super::worker_event::WorkerFrame>> {
-        self.check()?;
-        let mut events = Vec::new();
-        let decoded = (|| -> io::Result<()> {
-            while !data.is_empty() {
-                if self.pending.is_empty() && data.len() >= 8 {
-                    let size = frame_size(data)?;
-                    if data.len() >= size {
-                        events.push(super::worker_event::parse_worker_transport_event(
-                            &data[..size],
-                        )?);
-                        data = &data[size..];
-                        continue;
-                    }
+        mut dispatch: impl FnMut(super::worker_event::WorkerFrame) -> io::Result<()>,
+    ) -> io::Result<()> {
+        use super::worker_event::parse_worker_transport_event;
+
+        while !data.is_empty() {
+            if self.pending.is_empty() && data.len() >= HEADER.len() {
+                let size = frame_size(data)?;
+                if data.len() >= size {
+                    dispatch(parse_worker_transport_event(&data[..size])?)?;
+                    data = &data[size..];
+                    continue;
                 }
-                let target = if self.pending.len() < 8 {
-                    8
-                } else {
-                    frame_size(&self.pending)?
-                };
-                let count = (target - self.pending.len()).min(data.len());
+                self.pending.extend_from_slice(data);
+                break;
+            }
+            if self.pending.len() < HEADER.len() {
+                let count = (HEADER.len() - self.pending.len()).min(data.len());
                 self.pending.extend_from_slice(&data[..count]);
                 data = &data[count..];
-                if self.pending.len() >= 8 && self.pending.len() == frame_size(&self.pending)? {
-                    events.push(super::worker_event::parse_worker_transport_event(
-                        &self.pending,
-                    )?);
-                    // Drop the backing allocation before an idle pipe wait.
-                    self.pending = Vec::new();
+                if self.pending.len() < HEADER.len() {
+                    break;
                 }
             }
-            Ok(())
-        })();
-        if let Err(error) = decoded {
-            self.pending = Vec::new();
-            self.failure = Some(error.to_string());
-            if events.is_empty() {
-                return Err(error);
+            let size = frame_size(&self.pending)?;
+            let count = (size - self.pending.len()).min(data.len());
+            self.pending.extend_from_slice(&data[..count]);
+            data = &data[count..];
+            if self.pending.len() == size {
+                // Drop the backing allocation before dispatch or an idle wait.
+                let frame = parse_worker_transport_event(&std::mem::take(&mut self.pending))?;
+                dispatch(frame)?;
             }
-        }
-        Ok(events)
-    }
-    /// Deliver complete preceding frames before reporting a damaged suffix.
-    /// Call after dispatching each batch, before waiting for more pipe input.
-    pub(crate) fn check(&self) -> io::Result<()> {
-        if let Some(error) = &self.failure {
-            return Err(protocol_error(error.clone()));
         }
         Ok(())
     }
     pub(crate) fn finish(&mut self) -> io::Result<()> {
-        self.check()?;
         if !self.pending.is_empty() {
             self.pending = Vec::new();
             return Err(protocol_error("truncated worker frame at EOF"));

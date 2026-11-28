@@ -21,9 +21,14 @@ export default {
   computed: {
     passwordScope() { return this.passwordHistoryTarget?'@history':this.directorySelection||'@all'; },
     shownRootRows() {
-      let q=this.rootQuery.toLowerCase(),rows=this.rootNew.concat(this.rootRows),ids=new Set(rows.map(r=>r.id));
-      for(let d of Object.values(this.rootDrafts)) if(!ids.has(d.id)&&(d.pending||this.rootCell===d.id)) rows.push(d);
-      return rows.filter(r=>{let d=this.rootDraft(r);return r.id===this.rootCell||d.pending||!q||d.input.toLowerCase().includes(q)||d.output.toLowerCase().includes(q);});
+      let q=this.rootQuery.toLowerCase(),drafts=Object.values(this.rootDrafts);
+      let rows=this.rootNew.length||drafts.length?this.rootNew.concat(this.rootRows):this.rootRows;
+      if(drafts.length) {
+        let ids=new Set(rows.map(r=>r.id));
+        for(let d of drafts) if(!ids.has(d.id)&&(d.pending||this.rootCell===d.id)) rows.push(d);
+      }
+      if(!q) return rows;
+      return rows.filter(r=>{let d=this.rootDraft(r);return r.id===this.rootCell||d.pending||d.input.toLowerCase().includes(q)||d.output.toLowerCase().includes(q);});
     },
     errorList() { return Object.keys(this.errors).map(k=>k+': '+this.errors[k]); },
     shownDirectories() { if(!this.directoryQuery) return this.directories; let q=this.directoryQuery.toLowerCase(); return this.directories.filter(d=>d.path.toLowerCase().includes(q)||d.name.toLowerCase().includes(q)); },
@@ -55,7 +60,11 @@ export default {
       });
       return groups;
     },
-    matchingBlocks() { return this.configBlocks.filter(g=>(!this.configCategory||g.category===this.configCategory)&&(!this.configQuery.trim()||this.matchesConfig([g.label,...g.fields.map(f=>this.configText(f))].join(' ')))); },
+    matchingBlocks() {
+      let category=this.configCategory,query=this.configQuery.trim().toLowerCase(),blocks=this.configBlocks;
+      if(!category&&!query) return blocks;
+      return blocks.filter(g=>(!category||g.category===category)&&(!query||[g.label,...g.fields.map(f=>this.configText(f))].join(' ').toLowerCase().includes(query)));
+    },
     showStartupSetting() { return !this.configCategory&&this.matchesConfig([this.texts.startup,this.startupEnabled?this.texts.startupOff:this.texts.startupOn].join(' ')); },
     showThemeSetting() { return !this.configCategory&&this.matchesConfig([this.texts.theme,this.texts.system,this.texts.light,this.texts.dark].join(' ')); },
     contextMenuAction() { return this.contextMenuEnabled?this.texts.contextMenuOff:this.texts.contextMenuOn; },
@@ -104,7 +113,7 @@ export default {
       else if(direction<0&&this.taskCursors.length) this.requestTaskPage('prepend',this.taskCursors[this.taskCursors.length-1],range);
     },
     inlineTaskError(error) { return error.replace(/[\r\n]+/g,' '); },
-    matchesConfig(text) { return !this.configQuery.trim()||text.toLowerCase().includes(this.configQuery.trim().toLowerCase()); },
+    matchesConfig(text) { let query=this.configQuery.trim().toLowerCase(); return !query||text.toLowerCase().includes(query); },
     // Filtering and highlighting share labels/options and actual editor values.
     // Placeholder bindings are presentation only, never value fallbacks here.
     // Text without a widget ID can filter (e.g. an unselected option).

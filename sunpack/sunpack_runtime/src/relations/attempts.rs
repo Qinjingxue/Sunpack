@@ -27,7 +27,8 @@ pub(super) struct VolumeAttempts {
     pub directory_id: Option<Arc<str>>,
     pub head_size_from_total: Option<u64>,
     pub minimum_size: Option<u64>,
-    pub tail_totals: Vec<(usize, u64)>,
+    // Sparse entries in source index order.
+    tail_totals: Vec<(usize, u64)>,
 }
 
 #[derive(Debug)]
@@ -78,34 +79,39 @@ impl VolumeAttempts {
         &self.sources[..self.base_source_count]
     }
 
+    fn sources_with_totals(&self) -> impl ExactSizeIterator<Item = (&AttemptSource, Option<u64>)> + '_ {
+        let mut totals = self.tail_totals.iter().peekable();
+        self.sources.iter().enumerate().map(move |(index, source)| {
+            let total = totals.next_if(|&&(i, _)| i == index).map(|&(_, total)| total);
+            (source, total)
+        })
+    }
+
     // Several terminal directories can validate the same logical head. Retain
     // each directory's layouts as alternatives of one input, so a damaged
     // earlier tail cannot retire a later one. Domains stay local to a layout.
     pub(super) fn join_zip_directories(plans: Vec<Self>) -> Self {
-        let totals: Vec<HashMap<_, _>> = plans.iter().map(|p| p.tail_totals.iter().copied().collect()).collect();
         let mut sources = Vec::new();
         let mut indexes = HashMap::new();
         let mut tail_totals = Vec::new();
-        let mut intern = |p: usize, i: usize| {
-            let s = &plans[p].sources[i];
-            let total = totals[p].get(&i).copied();
-            *indexes.entry((s.key_with_end(s.end), total)).or_insert_with(|| {
+        let mut intern = |source, total| {
+            *indexes.entry((AttemptSource::key_with_end(source, source.end), total)).or_insert_with(|| {
                 let index = sources.len();
-                sources.push(s.clone());
+                sources.push(source.clone());
                 if let Some(total) = total { tail_totals.push((index, total)); }
                 index
             })
         };
         let mut base = HashSet::new();
-        for (p, plan) in plans.iter().enumerate() {
-            for (i, s) in plan.base_sources().iter().enumerate() {
-                if base.insert(&s.path) { intern(p, i); }
+        for plan in &plans {
+            for (source, total) in plan.sources_with_totals().take(plan.base_source_count) {
+                if base.insert(&source.path) { intern(source, total); }
             }
         }
         let mut domains = Domains::default();
         let mut layouts = Layouts::default();
-        for (p, plan) in plans.iter().enumerate() {
-            let remap: Vec<_> = (0..plan.sources.len()).map(|i| intern(p, i)).collect();
+        for plan in &plans {
+            let remap: Vec<_> = plan.sources_with_totals().map(|(source, total)| intern(source, total)).collect();
             let mut mapped = HashMap::new();
             for layout in &plan.layouts {
                 let slots = layout.slots.iter().map(|(n, choices)| {
@@ -1040,10 +1046,8 @@ impl VolumeAttempts {
         let mut remap = Vec::new();
         let mut tail_totals = Vec::new();
         let mut indexed = HashMap::new();
-        let totals: HashMap<_, _> = self.tail_totals.iter().copied().collect();
         let variants = self.sources.len() != self.base_source_count;
-        for (i, source) in self.sources.iter().enumerate() {
-            let total = totals.get(&i).copied();
+        for (source, total) in self.sources_with_totals() {
             let next = sources.len();
             if variants {
                 // A file-level transform may move the same ordered runs to a

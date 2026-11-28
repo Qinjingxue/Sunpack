@@ -433,62 +433,110 @@ fn command_reply<T: Default>() -> (CommandReply<T>, Arc<Reply<T>>) {
     (CommandReply(Some(Arc::clone(&reply))), reply)
 }
 
-// Concurrent stop requests can share terminal completion.
 #[derive(Default)]
-struct RunCompletion(Mutex<(Option<Result<(), (io::ErrorKind, String)>>, Vec<Waker>)>);
-impl RunCompletion {
-    fn complete(&self, result: &io::Result<()>) {
-        let wakes = {
-            let mut state = self.0.lock().unwrap();
-            state.0 = Some(result.as_ref().copied().map_err(|e| (e.kind(), e.to_string())));
-            std::mem::take(&mut state.1)
-        };
-        for wake in wakes { wake.wake(); }
+struct WatchWaiters {
+    next: AtomicU64,
+    wakers: Mutex<HashMap<u64, Waker>>,
+}
+
+impl WatchWaiters {
+    fn register(&self) -> WatchWait<'_> {
+        WatchWait { waiters: self, id: self.next.fetch_add(1, Ordering::Relaxed) }
     }
-    async fn wait(&self) -> io::Result<()> {
-        poll_fn(|cx| {
-            let mut state = self.0.lock().unwrap();
-            if let Some(result) = &state.0 { Poll::Ready(result.clone().map_err(|(kind, text)| io::Error::new(kind, text))) }
-            else {
-                if !state.1.iter().any(|wake| wake.will_wake(cx.waker())) { state.1.push(cx.waker().clone()); }
-                Poll::Pending
-            }
-        }).await
+
+    fn wake_all(&self) {
+        let wakers = std::mem::take(&mut *self.wakers.lock().unwrap());
+        for wake in wakers.into_values() { wake.wake(); }
+    }
+
+    fn remove(&self, id: u64) -> Option<Waker> {
+        let mut wakers = self.wakers.lock().unwrap();
+        let wake = wakers.remove(&id);
+        if wakers.capacity() > 256 { crate::collections::trim_map(&mut wakers); }
+        wake
     }
 }
-struct FinishRun(Arc<RunCompletion>);
+
+struct WatchWait<'a> { waiters: &'a WatchWaiters, id: u64 }
+impl WatchWait<'_> {
+    fn poll<T>(&self, cx: &std::task::Context<'_>, ready: impl FnOnce() -> Poll<T>) -> Poll<T> {
+        let mut wakers = self.waiters.wakers.lock().unwrap();
+        let result = ready();
+        if result.is_pending() {
+            wakers.entry(self.id).and_modify(|wake| wake.clone_from(cx.waker()))
+                .or_insert_with(|| cx.waker().clone());
+        }
+        result
+    }
+}
+impl Drop for WatchWait<'_> {
+    fn drop(&mut self) { self.waiters.remove(self.id); }
+}
+
+// Publish the result after the scheduler releases its resources. This is
+// also the activity boundary, independent of the OS thread's epilogue.
+#[derive(Default)]
+struct RunCompletion {
+    result: OnceLock<Result<(), (io::ErrorKind, String)>>,
+    waiters: WatchWaiters,
+}
+impl RunCompletion {
+    async fn wait(&self) -> io::Result<()> {
+        let result = |value: &Result<(), (io::ErrorKind, String)>|
+            value.clone().map_err(|(kind, text)| io::Error::new(kind, text));
+        if let Some(value) = self.result.get() { return result(value); }
+        let wait = self.waiters.register();
+        poll_fn(|cx| wait.poll(cx, || self.result.get().map_or(Poll::Pending, |v| Poll::Ready(result(v))))).await
+    }
+}
+struct FinishRun(Arc<Hub>);
+impl FinishRun {
+    fn complete(&self, result: &io::Result<()>) {
+        let hub = &self.0;
+        hub.clear_idle_completed_families();
+        {
+            let mut signals = hub.signals.lock().unwrap_or_else(|error| error.into_inner());
+            hub.stopped.store(true, Ordering::Release);
+            let saved = result.as_ref().copied().map_err(|error| (error.kind(), error.to_string()));
+            let _ = hub.completion.result.set(saved);
+            let pending = std::mem::take(&mut *signals);
+            drop(signals);
+            for root in pending.roots {
+                root.reply.complete(Err(io::ErrorKind::Interrupted.into()));
+            }
+        }
+        hub.completion.waiters.wake_all();
+        hub.publish_status();
+        if let Some(wake) = &hub.wake_host { wake(); }
+    }
+}
 impl Drop for FinishRun {
     fn drop(&mut self) {
-        let missing = self.0.0.lock().unwrap().0.is_none();
-        if missing { self.0.complete(&Err(io::Error::other("Watch thread failed"))); }
+        if self.0.completion.result.get().is_none() {
+            self.complete(&Err(io::Error::other("Watch thread failed")));
+        }
     }
 }
 
 #[derive(Default)]
 struct WatchStatus {
     revision: AtomicU64,
-    next: AtomicU64,
-    waiters: Mutex<HashMap<u64, Waker>>,
+    waiters: WatchWaiters,
     phase: Mutex<&'static str>,
     shutdown: AtomicBool,
 }
 impl WatchStatus {
     fn notify(&self) {
         self.revision.fetch_add(1, Ordering::AcqRel);
-        let waiters = std::mem::take(&mut *self.waiters.lock().unwrap());
-        for wake in waiters.into_values() { wake.wake(); }
-    }
-
-    fn remove_waiter(&self, id: u64) -> Option<Waker> {
-        let mut waiters = self.waiters.lock().unwrap();
-        let wake = waiters.remove(&id);
-        if waiters.capacity() > 256 { crate::collections::trim_map(&mut waiters); }
-        wake
+        self.waiters.wake_all();
     }
 }
-struct StatusWait<'a> { status: &'a WatchStatus, id: u64 }
-impl Drop for StatusWait<'_> {
-    fn drop(&mut self) { self.status.remove_waiter(self.id); }
+
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub(super) struct WatchActivity {
+    running: bool,
+    enabled: bool,
+    phase: &'static str,
 }
 
 pub(super) struct Watch {
@@ -554,36 +602,33 @@ impl Watch {
             .lock()
             .unwrap()
             .as_ref()
-            .is_some_and(|run| !run.thread.is_finished())
+            .is_some_and(Running::active)
     }
 
     pub(super) fn status_revision(&self) -> u64 { self.status.revision.load(Ordering::Acquire) }
     pub(super) fn shutdown_requested(&self) -> bool { self.status.shutdown.load(Ordering::Acquire) }
     pub(super) async fn wait_status_change(&self, revision: u64, cancel: &Cancellation) -> io::Result<()> {
-        let guard = StatusWait { status: &self.status, id: self.status.next.fetch_add(1, Ordering::Relaxed) };
+        let guard = self.status.waiters.register();
         let status = Arc::downgrade(&self.status);
         let id = guard.id;
         let _subscription = cancel.subscribe(move || {
-            if let Some(waker) = status.upgrade().and_then(|status| status.remove_waiter(id)) {
+            if let Some(waker) = status.upgrade().and_then(|status| status.waiters.remove(id)) {
                 waker.wake();
             }
         });
-        poll_fn(|cx| {
+        poll_fn(|cx| guard.poll(cx, || {
             // Cancellation removes its waiter under this same lock. It
             // either sees the registration or is visible to this check.
-            let mut waiters = self.status.waiters.lock().unwrap();
             if let Err(error) = cancel.check_io() { return Poll::Ready(Err(error)); }
             if self.status_revision() != revision { return Poll::Ready(Ok(())); }
-            waiters.entry(id).and_modify(|wake| wake.clone_from(cx.waker()))
-                .or_insert_with(|| cx.waker().clone());
             Poll::Pending
-        }).await
+        })).await
     }
 
     pub(super) fn foreground_finished(&self, when_unwatched: impl FnOnce()) {
         let running = self.running.lock().unwrap();
         let external = self.external.current.read().unwrap();
-        let delivered = running.as_ref().filter(|run| !run.thread.is_finished()).is_some_and(|run| {
+        let delivered = running.as_ref().filter(|run| run.active()).is_some_and(|run| {
             run.hub.update(|signals| signals.foreground_finished = true)
         });
         let defer_priority = delivered && external.as_ref().is_some_and(|external| !external.scopes.is_empty());
@@ -596,14 +641,34 @@ impl Watch {
 
     pub(super) fn generation(&self) -> u64 { self.generation.load(Ordering::Acquire) }
 
+    pub(super) fn activity(&self) -> WatchActivity {
+        let slot = self.running.lock().unwrap();
+        let run = slot.as_ref().filter(|run| run.active());
+        self.read_activity(run)
+    }
+
+    fn read_activity(&self, run: Option<&Running>) -> WatchActivity {
+        WatchActivity {
+            running: run.is_some(),
+            enabled: run.is_some_and(|run| run.hub.enabled.load(Ordering::Acquire)),
+            phase: if run.is_some() { *self.status.phase.lock().unwrap() } else { "stopped" },
+        }
+    }
+
     pub(super) fn status(&self, cwd: &Path) -> io::Result<Value> {
         let state_dir = state_dir(cwd)?;
-        let slot = self.running.lock().unwrap();
-        let run = slot.as_ref().filter(|run| !run.thread.is_finished());
+        let (activity, generation, pending) = {
+            let slot = self.running.lock().unwrap();
+            let run = slot.as_ref().filter(|run| run.active());
+            (
+                self.read_activity(run),
+                self.generation.load(Ordering::Relaxed),
+                run.map_or(0, |run| run.hub.pending_count.load(Ordering::Relaxed)),
+            )
+        };
         Ok(json!({
-            "running": run.is_some(), "enabled": run.is_some_and(|run| run.hub.enabled.load(Ordering::Acquire)),
-            "phase": if run.is_some() { *self.status.phase.lock().unwrap() } else { "stopped" }, "generation": self.generation.load(Ordering::Relaxed),
-            "pending": run.map_or(0, |run| run.hub.pending_count.load(Ordering::Relaxed)),
+            "running": activity.running, "enabled": activity.enabled, "phase": activity.phase,
+            "generation": generation, "pending": pending,
             "last_error": self.last_error.lock().unwrap().as_deref().unwrap_or(""),
             "state_dir": state_dir,
         }))
@@ -617,7 +682,7 @@ impl Watch {
         let lifecycle = self.lifecycle.lock().await;
         let previous = {
             let mut slot = self.running.lock().unwrap();
-            if slot.as_ref().is_some_and(|run| !run.thread.is_finished()) {
+            if slot.as_ref().is_some_and(Running::active) {
                 super::diagnostics::event("watch_start_reused", || json!({}));
                 return Ok(json!({"running":true,"started":false,"generation":self.generation.load(Ordering::Relaxed)}));
             }
@@ -663,18 +728,14 @@ impl Watch {
         *hub.initial_enabled.lock().unwrap() = intent;
         hub.set_phase("starting");
         let hub = Arc::new(hub);
-        let worker_hub = Arc::clone(&hub);
-        let wake = Arc::clone(&self.wake_host);
         let external = Arc::clone(&self.external);
         let last_error = Arc::clone(&self.last_error);
         let (ready, wait) = command_reply();
-        let completion = Arc::new(RunCompletion::default());
-        let status = Arc::clone(&self.status);
-        let finished = FinishRun(Arc::clone(&completion));
+        let finished = FinishRun(Arc::clone(&hub));
         stage("watch_start", &cancel).await?;
         self.generation.fetch_add(1, Ordering::Relaxed);
         let thread = thread::Builder::new().name("sunpack-watch".into()).spawn(move || {
-            let result = match Scheduler::open(cwd, engine, worker_hub, tray, external, snapshot) {
+            let result = match Scheduler::open(cwd, engine, Arc::clone(&finished.0), tray, external, snapshot) {
                 Ok(scheduler) => {
                     ready.send(Ok(()));
                     scheduler.run_service(&last_error)
@@ -688,29 +749,32 @@ impl Watch {
                 *last_error.lock().unwrap() = Some(error.to_string());
                 super::diagnostics::event("watch_failed", || json!({"error":error.to_string()}));
             }
-            finished.0.complete(&result);
-            status.notify();
-            wake();
+            finished.complete(&result);
             result
         })?;
-        Ok((Running { hub, thread, completion }, wait))
+        Ok((Running { hub, thread }, wait))
     }
 
     async fn join_run(running: Running) -> io::Result<()> {
-        let _ = running.completion.wait().await;
+        let _ = running.hub.completion.wait().await;
         // Completion precedes only thread epilogue. Join/reap is blocking work,
         // never an await on a live scheduler while holding an executor slot.
-        stage("watch_close", &Cancellation::new()).await?;
+        if !running.thread.is_finished() {
+            stage("watch_close", &Cancellation::new()).await?;
+        }
         running.thread.join().map_err(|_| io::Error::other("Watch thread failed"))?
     }
 
     pub(super) async fn stop_async(&self) -> io::Result<Value> {
         let lifecycle = self.lifecycle.lock().await;
         let generation = self.generation.load(Ordering::Relaxed);
-        let current = self.running.lock().unwrap().as_ref()
-            .filter(|run| !run.thread.is_finished())
-            .map(|run| (Arc::clone(&run.hub), Arc::clone(&run.completion), !run.thread.is_finished()));
-        let Some((hub, completion, stopped)) = current else {
+        let (current, retired) = {
+            let mut slot = self.running.lock().unwrap();
+            let retired = slot.take_if(|run| !run.active());
+            (slot.as_ref().map(|run| Arc::clone(&run.hub)), retired)
+        };
+        drop(retired);
+        let Some(hub) = current else {
             super::diagnostics::event("watch_stop_ignored", || json!({}));
             return Ok(json!({"running":false,"stopped":false,"generation":generation}));
         };
@@ -721,21 +785,17 @@ impl Watch {
         // Concurrent start sees that service; concurrent stop joins the same
         // completion rather than serializing a new lifecycle transaction.
         drop(lifecycle);
-        let result = completion.wait().await;
+        let result = hub.completion.wait().await;
         let _lifecycle = self.lifecycle.lock().await;
         let running = {
             let mut slot = self.running.lock().unwrap();
             if slot.as_ref().is_some_and(|run| Arc::ptr_eq(&run.hub, &hub)) { slot.take() } else { None }
         };
         let joined = if let Some(running) = running { Self::join_run(running).await } else { Ok(()) };
-        self.status.notify();
-        (self.wake_host)();
-        if stopped {
-            result?;
-            joined?;
-        }
+        result?;
+        joined?;
         super::diagnostics::event("watch_stopped", || json!({}));
-        Ok(json!({"running":false,"stopped":stopped,"generation":self.generation.load(Ordering::Relaxed)}))
+        Ok(json!({"running":false,"stopped":true,"generation":self.generation.load(Ordering::Relaxed)}))
     }
 
     pub(super) async fn set_enabled_async(&self, cwd: &Path, engine: Arc<Engine>, enabled: bool) -> io::Result<Value> {
@@ -757,7 +817,7 @@ impl Watch {
     }
 
     async fn reload_result(&self) -> io::Result<Option<io::Result<bool>>> {
-        let hub = self.running.lock().unwrap().as_ref().filter(|run| !run.thread.is_finished()).map(|run| Arc::clone(&run.hub));
+        let hub = self.running.lock().unwrap().as_ref().filter(|run| run.active()).map(|run| Arc::clone(&run.hub));
         let Some(hub) = hub else { return Ok(None); };
         let (ready, wait) = command_reply();
         hub.queue_reload(Some(ready));
@@ -766,8 +826,6 @@ impl Watch {
 
     // Final shutdown can run after the control driver has stopped.
     pub(super) fn stop(&self) -> io::Result<Value> { block_on(self.stop_async()) }
-    #[cfg(test)]
-    pub(super) fn reload(&self) -> io::Result<Value> { block_on(self.reload_async()) }
 
     pub(super) fn roots(&self, cwd: &Path) -> io::Result<(PathBuf, Vec<PathBuf>)> {
         let path = roots_path(cwd)?;
@@ -907,7 +965,7 @@ impl Watch {
             .lock()
             .unwrap()
             .as_ref()
-            .filter(|run| !run.thread.is_finished())
+            .filter(|run| run.active())
             .map(|run| Arc::clone(&run.hub));
         if let Some(hub) = hub {
             let (send, receive) = command_reply();
@@ -927,7 +985,7 @@ impl Watch {
             .lock()
             .unwrap()
             .as_ref()
-            .filter(|run| !run.thread.is_finished())
+            .filter(|run| run.active())
             .map(|run| Arc::clone(&run.hub));
         let Some(hub) = hub else {
             return false;
@@ -1055,7 +1113,10 @@ fn validate_outputs(roots: &[Root]) -> io::Result<()> {
 struct Running {
     hub: Arc<Hub>,
     thread: JoinHandle<io::Result<()>>,
-    completion: Arc<RunCompletion>,
+}
+
+impl Running {
+    fn active(&self) -> bool { self.hub.completion.result.get().is_none() }
 }
 
 // Keep the native volume facts until roots can be selected without filesystem IO.
@@ -1164,13 +1225,18 @@ impl RootChanges {
     fn root_changed(&mut self, id: &str, paths: impl IntoIterator<Item = (PathBuf, PathChange)>) {
         let changed = self.changed_roots.entry(id.to_owned()).or_default();
         for (path, change) in paths {
-            let first_for_root = changed.insert(path.clone());
-            let current = self.paths.entry(path).or_default();
-            current.modified_only = change.modified_only && (first_for_root || current.modified_only);
-            if current.event.is_none() { current.event = change.event; }
-            // A later notification invalidates the earlier snapshot even
-            // when its probe returned no file.
-            current.observation = change.observation;
+            changed.insert(path.clone());
+            match self.paths.entry(path) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let current = entry.get_mut();
+                    current.modified_only &= change.modified_only;
+                    if current.event.is_none() { current.event = change.event; }
+                    // A later notification invalidates the earlier snapshot
+                    // even when its probe returned no file.
+                    current.observation = change.observation;
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => { entry.insert(change); }
+            }
         }
     }
 
@@ -1217,6 +1283,7 @@ struct Hub {
     completed_families: CompletedFamilies,
     activities: Arc<quiet::Activities>,
     pending_count: AtomicUsize,
+    completion: RunCompletion,
 }
 
 type SourceGenerations = HashMap<String, PhysicalFileGeneration>;
@@ -1432,6 +1499,7 @@ impl Hub {
             completed_families: CompletedFamilies::default(),
             activities: Arc::default(),
             pending_count: AtomicUsize::new(0),
+            completion: RunCompletion::default(),
         }
     }
 
@@ -1452,18 +1520,30 @@ impl Hub {
     fn clear_idle_completed_families(&self) {
         // Drop both entries and their allocated tables at the existing idle
         // maintenance boundary, as main clears completed Watch generations.
-        *self.completed_families.0.lock().unwrap() = CompletedFamilyCache::default();
+        let retired = std::mem::take(&mut *self.completed_families.0.lock()
+            .unwrap_or_else(|error| error.into_inner()));
+        drop(retired);
     }
 
     fn root_completed(&self, root: RootCompleted) {
-        self.signals.lock().unwrap().roots.push(root);
+        let mut signals = self.signals.lock().unwrap_or_else(|error| error.into_inner());
+        if self.completion.result.get().is_some() {
+            drop(signals);
+            root.reply.complete(Err(io::ErrorKind::Interrupted.into()));
+            return;
+        }
+        signals.roots.push(root);
+        drop(signals);
         self.wake.notify_one();
     }
 
     fn batch_completed(&self, batch: String) {
         // Intake is stopped before drain, but in-flight completions still own
         // the wake that lets drain finish without polling or blocking joins.
-        self.signals.lock().unwrap().completed.push(batch);
+        let mut signals = self.signals.lock().unwrap_or_else(|error| error.into_inner());
+        if self.completion.result.get().is_some() { return; }
+        signals.completed.push(batch);
+        drop(signals);
         self.wake.notify_one();
     }
 
@@ -2238,7 +2318,9 @@ struct ClaimedSources {
     coalesced: bool,
     deduplicated: HashSet<String>,
     candidates: HashMap<String, Option<WatchCandidateRow>>,
-    finished: HashSet<String>,
+    // A settled member protects the handoff from concurrent cancellation.
+    // Only original owners used by the failure report need to outlive it.
+    finished: HashMap<String, bool>,
 }
 
 impl ClaimedSources {
@@ -2269,6 +2351,11 @@ fn completion_claims<'a>(
     groups.keys().chain(task.is_none().then_some(&claimed.candidates).into_iter().flat_map(HashMap::keys))
 }
 
+struct AdmittedInput {
+    candidate: WatchCandidateRow,
+    quiet: quiet::Activity,
+}
+
 struct Active {
     max_depth: usize,
     deep: bool,
@@ -2276,8 +2363,7 @@ struct Active {
     recovery: Option<Arc<Recovery>>,
     password_scope: PathBuf,
     passwords: Arc<crate::core::passwords::PasswordSnapshot>,
-    inputs: HashMap<String, WatchCandidateRow>,
-    quiet: HashMap<String, quiet::Activity>,
+    inputs: HashMap<String, AdmittedInput>,
     dirty: HashSet<String>,
     cancel: Cancellation,
     groups: Arc<Mutex<SourceGroups>>,
@@ -2455,6 +2541,7 @@ struct DedupRebuild {
     cancel: Cancellation,
     handle: Option<crate::pipeline::scheduling::Join<()>>,
     roots: VecDeque<(Root, NativeDiscoveryScope)>,
+    baseline_paths: Option<Arc<HashSet<Arc<str>>>>,
 }
 impl Drop for DedupRebuild {
     fn drop(&mut self) {
@@ -2522,7 +2609,9 @@ impl Scheduler {
     /// A mode/scope rebuild uses the ordinary executor, not the service thread.
     /// Pending proposals keep collecting USN/quiet evidence until this baseline
     /// has been indexed, and control/configuration commands remain responsive.
-    fn rebuild_dedup(&mut self, scopes_changed: bool, refresh_journals: bool) -> io::Result<()> {
+    fn rebuild_dedup(
+        &mut self, scopes_changed: bool, refresh_journals: bool, live_policy_change: bool,
+    ) -> io::Result<()> {
         if self.settings.watch.deduplication == config::WatchDeduplication::None { return Ok(()); }
         if refresh_journals {
             self.engine.run_stage("watch_dedup_journal", Origin::Watch, || {
@@ -2547,12 +2636,24 @@ impl Scheduler {
             index.begin_rebuild()?;
             index.generation()
         };
+        let baseline_paths = (live_policy_change && self.enabled() && !scopes_changed).then(|| {
+            let mut paths = self.catalog.dedup_baseline_paths(self.roots.values().map(|(_, scope)| scope));
+            // Do not confer an owner exemption on an admission that was still
+            // queued at cutover. Durable recovery keeps its separate ownership.
+            for (key, pending) in &self.pending {
+                if pending.recovery.is_none() && self.journal.state().entry_by_key(key).is_none() {
+                    paths.remove(key.as_str());
+                }
+            }
+            Arc::new(paths)
+        });
         self.dedup_job_id += 1;
         self.dedup_rebuild = Some(DedupRebuild {
             id: self.dedup_job_id,
             generation,
             cancel: Cancellation::new(), handle: None,
             roots: self.roots.values().cloned().collect(),
+            baseline_paths,
         });
         self.advance_dedup_rebuild()
     }
@@ -2582,12 +2683,20 @@ impl Scheduler {
         request.watch_catalog = Some(Arc::clone(&self.catalog));
         let index = Arc::clone(&self.dedup);
         let journal = Arc::clone(&self.journal);
+        let baseline_paths = job.baseline_paths.clone();
         let generation = job.generation;
         let id = job.id;
         let hub = Arc::clone(&self.hub);
         job.handle = Some(self.engine.submit_discovery(request, move |owner, inputs| {
-            if inputs.iter().flat_map(|input| input.physical_paths()).any(|path| !scope.contains(path)) { return Ok(()); }
-            let result = dedup::consider(&index, &owner.to_string_lossy(), scope.key(), inputs, generation, true);
+            let owner = owner.to_string_lossy();
+            let in_baseline = |path: &str| baseline_paths.as_ref().is_none_or(|paths| {
+                paths.contains(crate::path_keys::path_key(path).as_str())
+            });
+            if !in_baseline(&owner) || inputs.iter().flat_map(|input| input.physical_paths())
+                .any(|path| !scope.contains(path) || !in_baseline(path)) {
+                return Ok(());
+            }
+            let result = dedup::consider(&index, &owner, scope.key(), inputs, generation, true);
             if let Err(error) = result {
                 journal.log(json!({"event":"watch_dedup_unavailable","path":owner,"error":error.to_string()}));
             }
@@ -2767,7 +2876,7 @@ impl Scheduler {
         scheduler.reconcile_roots(false)?;
         scheduler.activate_scan_options()?;
         scheduler.retire_missing_entries(None, true)?;
-        scheduler.rebuild_dedup(false, true)?;
+        scheduler.rebuild_dedup(false, true, false)?;
         scheduler.reconcile_shell();
         if enabled {
             scheduler.recover_pending(None)?;
@@ -3255,7 +3364,7 @@ impl Scheduler {
             // A no-op reload can retry an abandoned rebuild, but a running
             // baseline and a ready index already have their journal stamps.
             let retry_dedup = self.dedup_rebuild.is_none() && self.dedup.lock().unwrap().needs_rebuild();
-            self.rebuild_dedup(roots_changed, roots_changed || dedup_changed || retry_dedup)?;
+            self.rebuild_dedup(roots_changed, roots_changed || dedup_changed || retry_dedup, dedup_changed)?;
             if !self.enabled() { return Ok(()); }
             if scheduler_changed { self.recover_pending(None)?; }
             self.checkpoint_reload(scheduler_changed || roots_changed)?;
@@ -3280,7 +3389,7 @@ impl Scheduler {
                 if dedup_changed {
                     self.dedup_rebuild.take();
                     self.dedup.lock().unwrap().reset(self.settings.watch.deduplication, self.settings.watch.deduplication_scope, self.settings.filesystem.read_views.clone())?;
-                    self.rebuild_dedup(false, true)?;
+                    self.rebuild_dedup(false, true, true)?;
                 }
                 let (latest_roots_changed, latest_policy_changed) = self.reconcile_roots(false)?;
                 self.activate_scan_options()?;
@@ -3472,7 +3581,11 @@ impl Scheduler {
     }
 
     fn run(&mut self) -> io::Result<()> {
-        let mut result = self.run_inner();
+        let mut result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.run_inner()))
+            .unwrap_or_else(|_| {
+                self.hub.stop();
+                Err(io::Error::other("Watch scheduler panicked"))
+            });
         if result.is_ok() { self.hub.stop(); }
         self.dedup_rebuild.take();
         let _ = self.drain_active(&mut result);
@@ -3512,6 +3625,7 @@ impl Scheduler {
                     self.engine.run_stage("catalog_commit", Origin::Watch, || {
                         // A gap between bursts is not the idle-cache deadline.
                         self.catalog.commit(false);
+                        self.journal.commit(false, |_| Ok(crate::watch_store::NativeWatchOperations::empty()))?;
                         self.journal.compact()
                     })??;
                 }
@@ -3534,7 +3648,7 @@ impl Scheduler {
             let mut signals = self.hub.wait(deadline.into_iter().chain(reload_retry).min());
             self.candidate_diagnostics.clear_expired(Instant::now());
             // The checkpoint already reconciled the journal stamps.
-            if signals.dedup_rebuild { self.rebuild_dedup(false, false)?; }
+            if signals.dedup_rebuild { self.rebuild_dedup(false, false, false)?; }
             for (id, result) in signals.dedup_completed.drain(..) {
                 if !self.dedup_rebuild.as_ref().is_some_and(|job| job.id == id) { continue; }
                 match result {
@@ -3550,7 +3664,7 @@ impl Scheduler {
             }
             // Claims arrive from pipeline workers. Remove each queued deadline
             // once; keep its observation for generation-safe completion.
-            {
+            if !signals.claimed.is_empty() {
                 let claims = self.hub.claims.lock().unwrap();
                 park_claimed_deadlines(&self.pending, &mut self.due, &claims, signals.claimed);
             }
@@ -4331,7 +4445,7 @@ impl Scheduler {
             .entries_in_scope(path_key, recursive)
             .into_iter()
             .filter_map(|entry| {
-                let id = crate::path_keys::path_key(&entry.path);
+                let id = watch_path_key(&entry.path);
                 if self.claimed_continuation(&entry, &id) { return None; }
                 let root = containing_root(&self.roots, &id)
                     .map(|(_, (root, _))| &root.path)
@@ -4343,7 +4457,7 @@ impl Scheduler {
                     })?;
                 (*available.entry(root).or_insert_with(|| root.is_dir())
                     && recorded_file_is_absent(&entry.path))
-                .then(|| (watch_path_key(&entry.path), entry, root))
+                .then_some((id, entry, root))
             })
             .collect::<Vec<_>>();
         if missing.is_empty() {
@@ -4954,12 +5068,8 @@ impl Scheduler {
         let journal = Arc::clone(&self.journal);
         let state = journal.state();
         let flatten_owners: HashSet<_> = state
-            .runtime_keys("flatten|")
+            .project_runtime("flatten|", |_, record| record["owner"].as_str().map(watch_path_key))
             .into_iter()
-            .filter_map(|key| {
-                let record = state.runtime_record(&key)?;
-                record["owner"].as_str().map(watch_path_key)
-            })
             .collect();
         'pending: for pending in self.journal.state().pending_items() {
             let id = watch_path_key(&pending.path);
@@ -5238,7 +5348,6 @@ fn recover_source_cleanup<'a>(
     if ids.is_empty() { return Ok(()); }
     let boundaries: HashSet<_> = roots.map(crate::pipeline::cleanup_boundary_key).collect();
     for id in ids {
-        if journal.source_cleanup_retired(&id) { continue; }
         let Some((batch, _)) = id[SOURCE_DELETE_PREFIX.len()..].split_once('|') else { continue; };
         let Some(value) = state.runtime_record(&id) else { continue; };
         let record = SourceCleanupPublication::deserialize(&*value).map_err(io::Error::other)?;
@@ -5314,7 +5423,7 @@ impl Scheduler {
     }
 
     fn next_admission(&self) -> Option<Instant> {
-        if self.admission_available() == 0 {
+        if self.due.is_empty() || self.admission_available() == 0 {
             // Completions wake the Hub. A full window must not turn an old
             // pending deadline into an idle spin while extraction is parked.
             return None;
@@ -5526,14 +5635,13 @@ impl Scheduler {
             }
             let password_scope = candidate_password_scope(self.journal.state(),
                 &pending.candidate.path, pending.recovery.as_deref());
-            let source = (pending.candidate, pending.quiet);
             // Local recovery has its own discovery and durable owner. Catalog
             // discovery keeps each relation family's errors inside the batch.
-            let recovery_owner = pending.recovery.as_ref().map(|_| source.0.path.clone());
+            let recovery_owner = pending.recovery.as_ref().map(|_| pending.candidate.path.clone());
             let (_, candidates) = groups
                 .entry((pending.root, password_scope, recovery_owner))
                 .or_insert_with(|| (pending.recovery, Vec::new()));
-            candidates.push(source);
+            candidates.push((id, AdmittedInput { candidate: pending.candidate, quiet: pending.quiet }));
         }
         let mut retried = HashSet::new();
         for (root, stem) in changed_buckets {
@@ -5626,18 +5734,13 @@ impl Scheduler {
     fn start_batch(
         &mut self,
         id: String,
-        candidates: Vec<(WatchCandidateRow, quiet::Activity)>,
+        candidates: Vec<(String, AdmittedInput)>,
         recovery: Option<Arc<Recovery>>,
         password_scope: PathBuf,
     ) -> io::Result<()> {
         let Some((root, scope)) = self.roots.get(&id) else {
             return Ok(());
         };
-        let mut quiet = HashMap::with_capacity(candidates.len());
-        let candidates: Vec<_> = candidates.into_iter().map(|(candidate, tracker)| {
-            quiet.insert(watch_path_key(&candidate.path), tracker);
-            candidate
-        }).collect();
         let mut token = windows::random_bytes::<16>()?;
         // The other half of the token space is reserved for Toast groups.
         token[0] &= 0x7f;
@@ -5647,7 +5750,7 @@ impl Scheduler {
             .collect::<String>();
         let cancel = Cancellation::new();
         let mut request = Request::with_config(
-            candidates.iter().map(|input| PathBuf::from(&input.path)).collect(),
+            candidates.iter().map(|(_, input)| PathBuf::from(&input.candidate.path)).collect(),
             Mode::Extract,
             Arc::clone(&self.settings),
         );
@@ -5657,8 +5760,8 @@ impl Scheduler {
         // Catalog-backed recovery can join ordinary and generated peers.
         // The local scope remains the fallback when no catalog row is visible.
         let catalog_recovery = recovery.is_some()
-            && candidates.iter().all(|candidate| self.catalog.dependency_contains(&scope, &candidate.path)
-                && !self.catalog.is_owned(&candidate.path));
+            && candidates.iter().all(|(_, input)| self.catalog.dependency_contains(scope, &input.candidate.path)
+                && !self.catalog.is_owned(&input.candidate.path));
         let local_recovery = recovery.as_ref().filter(|_| !catalog_recovery);
         let nested_recovery = recovery.as_ref().is_some_and(|recovery| {
             watch_path_key(&recovery.scope.root) != watch_path_key(&scope.root)
@@ -5680,12 +5783,12 @@ impl Scheduler {
             request.watch_catalog = Some(Arc::clone(&self.catalog));
         }
         let mut outputs = BTreeMap::new();
-        for candidate in &candidates {
+        for (_, input) in &candidates {
             request.checkpoints.extend(restore_checkpoints(
-                self.journal.state(), &candidate.path, &mut outputs, &mut request.generated_sources,
+                self.journal.state(), &input.candidate.path, &mut outputs, &mut request.generated_sources,
             )?);
         }
-        let layout_checked_at = self.journal.state().take_prepared_volumes(candidates.iter().map(|input| input.path.as_str()),
+        let layout_checked_at = self.journal.state().take_prepared_volumes(candidates.iter().map(|(_, input)| input.candidate.path.as_str()),
             &mut request.prepared_volumes);
         let engine = Arc::clone(&self.engine);
         let journal = Arc::clone(&self.journal);
@@ -5695,7 +5798,7 @@ impl Scheduler {
         let worker_batch = Arc::clone(&batch_id);
         let owners = candidates
             .iter()
-            .map(|input| (watch_path_key(&input.path), input.path.clone()))
+            .map(|(key, input)| (key.clone(), input.candidate.path.clone()))
             .collect();
 
         let toast = self
@@ -5706,7 +5809,7 @@ impl Scheduler {
         let report_path = toast
             .as_ref()
             .and_then(|_| candidates.first())
-            .map(|candidate| PathBuf::from(&candidate.path));
+            .map(|(_, input)| PathBuf::from(&input.candidate.path));
         let groups = Arc::new(Mutex::new(SourceGroups::default()));
         let worker_groups = Arc::clone(&groups);
         let claimed = Arc::new(Mutex::new(ClaimedSources { layout_checked_at, ..ClaimedSources::default() }));
@@ -5714,7 +5817,7 @@ impl Scheduler {
         let worker_cancel = cancel.clone();
         self.journal
             .log(json!({"event":"pipeline_request_started","owner":batch,
-            "path":candidates.first().map(|entry| &entry.path),"count":candidates.len()}));
+            "path":candidates.first().map(|(_, input)| &input.candidate.path),"count":candidates.len()}));
         let observer = Arc::new(WatchObserver {
             deep: root.deep,
             dedup: Arc::clone(&self.dedup),
@@ -5745,7 +5848,7 @@ impl Scheduler {
                 if result.is_err() {
                     let mut reported = HashSet::new();
                     let sources = observer.owners.iter().filter_map(|(source_key, source)| {
-                        if claimed.finished.contains(source_key) { return None; }
+                        if claimed.finished.contains_key(source_key) { return None; }
                         let source = groups.get(source_key).map_or(Path::new(source), |group| group.path.as_path());
                         reported.insert(key(source)).then_some(source)
                     });
@@ -5772,11 +5875,8 @@ impl Scheduler {
         // while another child still needs its durable completion reply.
         let completion = BatchCompletion { hub, batch: Some(send_batch) };
         request_handle.on_ready(move || drop(completion));
-        for candidate in &candidates {
-            self.active_paths.insert(
-                watch_path_key(&candidate.path),
-                Arc::clone(&batch_id),
-            );
+        for (key, _) in &candidates {
+            self.active_paths.insert(key.clone(), Arc::clone(&batch_id));
         }
         self.active.insert(
             batch,
@@ -5787,8 +5887,7 @@ impl Scheduler {
                 recovery,
                 password_scope,
                 passwords,
-                inputs: candidates.into_iter().map(|candidate| (watch_path_key(&candidate.path), candidate)).collect(),
-                quiet,
+                inputs: candidates.into_iter().collect(),
                 dirty: HashSet::new(),
                 cancel,
                 groups,
@@ -5849,9 +5948,9 @@ impl Scheduler {
             .filter(|(path, _)| !active.inputs.contains_key(*path))
             .filter_map(|(_, candidate)| candidate.as_ref());
         let mut interrupted = crate::watch_store::NativeWatchOperations::empty();
-        for input in active.inputs.values().chain(siblings) {
+        for input in active.inputs.values().map(|input| &input.candidate).chain(siblings) {
             let id = watch_path_key(&input.path);
-            if claimed.finished.contains(&id)
+            if claimed.finished.contains_key(&id)
                 || self.hub.claims.lock().unwrap().get(&id).is_some_and(|owner| owner.as_ref() != batch)
                 || self.pending.get(&id).is_some_and(|pending| quiet::changed(input, &pending.candidate))
                 || recorded_file_is_absent(&input.path)
@@ -5938,11 +6037,12 @@ impl Scheduler {
         let mut quiet = HashMap::new();
         for member in &members {
             if let Some(path) = active.dirty.take(member) { dirty.insert(path); }
-            if let Some(input) = active.inputs.remove(member) { inputs.push(input); }
-            if let Some((path, tracker)) = active.quiet.remove_entry(member) { quiet.insert(path, tracker); }
+            if let Some((path, input)) = active.inputs.remove_entry(member) {
+                inputs.push(input.candidate);
+                quiet.insert(path, input.quiet);
+            }
         }
         crate::collections::trim_map(&mut active.inputs);
-        crate::collections::trim_map(&mut active.quiet);
         let group = root.groups.values().next().cloned();
         let context = CompletionContext {
             max_depth: active.max_depth,
@@ -5965,8 +6065,12 @@ impl Scheduler {
         for member in &retired {
             claimed.candidates.remove(member);
             claimed.deduplicated.remove(member);
+            if claimed.finished.get(member) == Some(&false) {
+                claimed.finished.remove(member);
+            }
         }
         crate::collections::trim_map(&mut claimed.candidates);
+        crate::collections::trim_map(&mut claimed.finished);
         if claimed.deduplicated.capacity() > 256.max(claimed.deduplicated.len().saturating_mul(4)) {
             let remaining = claimed.deduplicated.len();
             claimed.deduplicated.shrink_to(remaining.saturating_mul(2));
@@ -6011,11 +6115,13 @@ impl Scheduler {
             .and_then(|mut completed| {
                 completed.cancelled |= active.cancel.cancelled();
                 let groups = std::mem::take(&mut *active.groups.lock().unwrap()).into_aliases();
+                let (inputs, quiet) = active.inputs.into_iter()
+                    .map(|(path, input)| (input.candidate, (path, input.quiet))).unzip();
                 self.apply_completion(batch, CompletionContext {
                     max_depth: active.max_depth,
                     deep: active.deep,
                     root: active.root, recovery: active.recovery, password_scope: active.password_scope, passwords: active.passwords,
-                    inputs: active.inputs.into_values().collect(), quiet: active.quiet, dirty: active.dirty, claimed: active.claimed, groups, toast: active.toast, task: None,
+                    inputs, quiet, dirty: active.dirty, claimed: active.claimed, groups, toast: active.toast, task: None,
                 }, completed).map(|(_, finish)| finish)
             });
         self.release_request_display_claims(batch);
@@ -6240,15 +6346,14 @@ impl Scheduler {
             if retry_execution && completed.cancelled { continue; }
             let id = key(&archive.path);
             if !published.insert(id.clone()) { continue; }
-            let Some(candidate) = watch_candidate_for_path(&archive.path, None)? else {
+            let Some((candidate, generation)) = crate::postprocess::watch_candidate_with_generation(&archive.path, None)? else {
                 continue;
             };
             // The completion must not grant recovery to a replacement made
             // after this nested input was examined by the pipeline.
             let sources = generated.get_or_init(|| outcome.generated_sources.iter()
                 .map(|source| (key(source.path()), source)).collect::<HashMap<_, _>>());
-            if !sources.get(&id).is_some_and(|source| crate::io::reader::capture_file_generation(&archive.path)
-                .is_ok_and(|current| source.matches(&current))) { continue; }
+            if !sources.get(&id).is_some_and(|source| source.matches(&generation)) { continue; }
             if self.active_paths.contains_key(&id) {
                 continue;
             }
@@ -7240,32 +7345,28 @@ impl From<BTreeMap<String, String>> for ObservedOutputs {
 
 impl ObservedOutputs {
     fn insert(&mut self, path: String, owner: String) {
-        if let Some(previous) = self.paths.insert(path.clone(), owner.clone()) {
-            self.remove_owner_path(&path, &previous);
+        let owner_key = watch_path_key(&owner);
+        if let Some(previous) = self.paths.insert(path.clone(), owner) {
+            let previous_key = watch_path_key(&previous);
+            if previous_key == owner_key { return; }
+            Self::remove_owner_path(&mut self.owners, &path, &previous_key);
         }
-        self.owners.entry(watch_path_key(&owner)).or_default().insert(path);
+        self.owners.entry(owner_key).or_default().insert(path);
     }
 
-    fn remove(&mut self, path: &str) {
-        if let Some(owner) = self.paths.remove(path) {
-            self.remove_owner_path(path, &owner);
-        }
-    }
-
-    fn remove_owner_path(&mut self, path: &str, owner: &str) {
-        let owner = watch_path_key(owner);
-        if let Some(paths) = self.owners.get_mut(&owner) {
+    fn remove_owner_path(owners: &mut HashMap<String, HashSet<String>>, path: &str, owner: &str) {
+        if let Some(paths) = owners.get_mut(owner) {
             paths.remove(path);
-            if paths.is_empty() { self.owners.remove(&owner); }
+            if paths.is_empty() { owners.remove(owner); }
         }
     }
 
     fn replace_tree(&mut self, root: &str, output: String, owner: String) {
-        let prefix = format!("{}\\", root.trim_end_matches('\\'));
-        let children: Vec<_> = self.paths.range(prefix.clone()..)
-            .take_while(|(path, _)| path.starts_with(&prefix)).map(|(path, _)| path.clone()).collect();
-        self.remove(root);
-        for path in children { self.remove(&path); }
+        let removed_root = self.paths.remove_entry(root);
+        let descendants = self.paths.extract_if(crate::path_keys::descendant_key_range(root), |_, _| true);
+        for (path, owner) in removed_root.into_iter().chain(descendants) {
+            Self::remove_owner_path(&mut self.owners, &path, &watch_path_key(&owner));
+        }
         self.insert(output, owner);
     }
 
@@ -7398,7 +7499,10 @@ impl Observer for WatchObserver {
         drop(groups);
         let members = aliases.keys().map(String::as_str)
             .chain((!aliases.contains_key(&root)).then_some(root.as_str()));
-        claimed.finished.extend(members.clone().map(str::to_owned));
+        claimed.finished.extend(members.clone().map(|member| {
+            let retain_for_report = self.toast.is_some() && self.owners.contains_key(member);
+            (member.to_owned(), retain_for_report)
+        }));
         drop(claimed);
         let mut shared_outputs = self.outputs.lock().unwrap();
         let outputs = shared_outputs.take_owners(members);
@@ -7435,12 +7539,12 @@ impl Observer for WatchObserver {
 
     fn generated_source(&self, path: &str) -> Option<GeneratedSource> {
         let before = self.catalog.generated_observation(path)?;
-        // Capture before probing the accepted baseline. A later replacement
-        // cannot inherit this receipt; pipeline admission validates its generation.
-        let receipt = GeneratedSource::capture(Path::new(path)).ok()?;
-        let current = watch_candidate_for_path(Path::new(path), Some(before.change_usn)).ok()??;
+        // Observe and capture the receipt from the same handle. Pipeline
+        // admission validates this generation before using it.
+        let path = Path::new(path);
+        let (current, generation) = crate::postprocess::watch_candidate_with_generation(path, Some(before.change_usn)).ok()??;
         (!crate::postprocess::watch_source_changed(before.size, before.mtime, &before.file_id(), before.change_usn, &current))
-            .then_some(receipt)
+            .then(|| GeneratedSource::from_generation(path, &generation))
     }
 
     fn completed_sources(&self, generations: &SourceGenerations, layout: u128) -> io::Result<Option<PathBuf>> {
@@ -7778,12 +7882,13 @@ fn rebase_cleanup_sources(
     // Descendant deletions have joined before the parent moves; only a
     // pending retry whose delivered output moves with the leaf needs rebasing.
     let prefix = format!("{SOURCE_DELETE_PREFIX}{batch}|");
-    for id in state.runtime_keys(&prefix) {
-        let Some(value) = state.runtime_record(&id) else { continue; };
-        let moved = |path: &Path| path.strip_prefix(leaf).ok().map(|suffix| destination.join(suffix));
-        if ![&value["output"][0], &value["alternate"][0]].iter().any(|path| {
+    let records = state.project_runtime(&prefix, |id, value| {
+        [&value["output"][0], &value["alternate"][0]].iter().any(|path| {
             path.as_str().is_some_and(|path| Path::new(path).starts_with(leaf))
-        }) { continue; }
+        }).then(|| (id.to_owned(), Arc::clone(value)))
+    });
+    let moved = |path: &Path| path.strip_prefix(leaf).ok().map(|suffix| destination.join(suffix));
+    for (id, value) in records {
         let mut record = SourceCleanupPublication::deserialize(&*value).map_err(io::Error::other)?;
         for (path, _) in std::iter::once(&mut record.output).chain(record.alternate.as_mut()) {
             if let Some(next) = moved(Path::new(path)) { *path = next.to_string_lossy().into_owned(); }

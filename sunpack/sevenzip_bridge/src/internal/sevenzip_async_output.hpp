@@ -152,11 +152,11 @@ namespace sunpack::sevenzip
             std::size_t inflight_bytes = 0;
             // A file stays pending until its writes drain and its handle closes.
             std::size_t pending_files = 0;
+            std::size_t unsealed_files = 0;
             std::size_t active_index = kUnregistered;
             const std::size_t max_inflight_bytes;
             std::shared_ptr<std::atomic<bool>> cancel_token;
             const bool capture_inventory;
-            bool sync_storage_at_publication = false;
 #ifdef SUP7Z_DEBUG
             PipelineTiming *pipeline_timing = nullptr;
 #endif
@@ -442,6 +442,7 @@ namespace sunpack::sevenzip
             file->active_index = active_files_.size();
             active_files_.push_back(file);
             ++file->job->pending_files;
+            ++file->job->unsealed_files;
             return file;
         }
 
@@ -475,7 +476,7 @@ namespace sunpack::sevenzip
 
         void trim_completed_batch(std::chrono::steady_clock::time_point now,
                                   std::chrono::milliseconds idle_timeout) noexcept {
-            std::lock_guard<std::mutex> lock(mutex_);
+            std::unique_lock<std::mutex> lock(mutex_);
             // A lease can be acquired again before the registry calls us.
             if (!active_jobs_.empty() || !active_files_.empty() || free_buffers_.size() != buffers_.size()) return;
             // Keep one file's write window hot. Deeper windows serve
@@ -486,6 +487,22 @@ namespace sunpack::sevenzip
             }
             trim_free_payloads_locked(kDefaultFileInFlightBytes,
                 now < large_window_deadline_ ? kBufferSize : kSmallBufferSize);
+            // Close requests can exceed the data queue limit. Retire that
+            // burst's file slots and empty queue blocks while keeping the
+            // writer warm. Releasing these blocks must not hold up a new lease.
+            if (active_files_.capacity() > queue_limit_ && work_queue_.empty() &&
+                pending_closes_.empty() && retry_queue_.empty()) {
+                try {
+                    decltype(work_queue_) work, retries;
+                    decltype(pending_closes_) closes;
+                    decltype(active_files_) files;
+                    work.swap(work_queue_);
+                    retries.swap(retry_queue_);
+                    closes.swap(pending_closes_);
+                    files.swap(active_files_);
+                    lock.unlock();
+                } catch (const std::bad_alloc &) { /* Keep the reusable empty queues. */ }
+            }
         }
 
         // Memory pressure can reclaim free buffers even during a batch.
@@ -684,6 +701,8 @@ namespace sunpack::sevenzip
                 }
                 synchronize_cancellation_locked(file->job);
                 file->close_requested = true;
+                assert(file->job->unsealed_files != 0);
+                --file->job->unsealed_files;
                 if (magic) file->magic = std::move(*magic);
                 if (terminal_result_locked(file->job) != S_OK)
                 {
@@ -714,25 +733,26 @@ namespace sunpack::sevenzip
             }
             std::unique_lock<std::mutex> lock(mutex_);
             synchronize_cancellation_locked(job);
-            // Seal all files even if an error arrives after this call starts,
-            // or the caller never reached the stream's Close().
             if (job->pending_files != 0)
             {
-                lock.unlock();
-                seal_job_files(job);
-                drain_cancelled_retries();
+                // Normal stream teardown has already sealed its files. Scan
+                // the shared registry only when a caller left a stream open.
+                if (job->unsealed_files != 0)
+                {
+                    lock.unlock();
+                    seal_job_files(job);
+                    lock.lock();
+                }
                 if (job->first_error.load(std::memory_order_acquire) != S_OK && state_->space_gate)
+                {
+                    lock.unlock();
                     state_->space_gate->wake_waiters();
-                lock.lock();
+                    lock.lock();
+                }
                 const auto drained = [&job] { return job->pending_files == 0; };
                 bool handed_off = false;
-                // An outstanding close is common even without I/O pressure. Give
-                // the existing completion wake a short head start; never delay it.
-                constexpr auto handoff_grace = std::chrono::milliseconds(8);
                 if (!drained() && cpu && cpu->may_handoff_output_drain() &&
-                    job->first_error.load(std::memory_order_acquire) == S_OK &&
-                    !producer_cv_.wait_for(lock, handoff_grace, drained) &&
-                    job->first_error.load(std::memory_order_acquire) == S_OK)
+                    terminal_result_locked(job) == S_OK)
                 {
                     // Neither the scheduler nor credit reacquisition owns the writer mutex.
                     lock.unlock();
@@ -775,7 +795,6 @@ namespace sunpack::sevenzip
             producer_cv_.notify_all();
             if (state_->space_gate) state_->space_gate->wake_waiters();
             seal_job_files(job);
-            drain_cancelled_retries();
         }
 #endif
 
@@ -796,7 +815,6 @@ namespace sunpack::sevenzip
                     }
                 }
             }
-            drain_cancelled_retries();
             // 取消必须能穿透"因满盘而暂停"：卷 gate 的等待者也要被唤醒。
             if (state_->space_gate)
             {
@@ -823,6 +841,12 @@ namespace sunpack::sevenzip
         }
 
 #ifdef SUP7Z_DEBUG
+        std::size_t active_file_slots_for_test() const noexcept
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            return active_files_.capacity();
+        }
+
         bool has_active_jobs() const noexcept
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -874,7 +898,6 @@ namespace sunpack::sevenzip
             producer_cv_.notify_all();
             if (state_->space_gate) state_->space_gate->wake_waiters();
             seal_job_files(nullptr);
-            drain_cancelled_retries();
             {
                 std::unique_lock<std::mutex> lock(mutex_);
                 producer_cv_.wait(lock, [this] { return work_queue_.empty() && active_files_.empty(); });
@@ -1411,10 +1434,15 @@ namespace sunpack::sevenzip
             const auto file = item.kind == WorkItem::Kind::Data ? item.buffer->file : item.file;
             if (retry_error)
                 report_retry_space_failure(state_->space_gate.get(), retry_error, file->path);
+            bool wake = false;
             try
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 retry_queue_.push_back(std::move(item));
+                synchronize_cancellation_locked(file->job);
+                // Start admission for the first item in a queue and always
+                // wake for terminal cleanup.
+                wake = retry_queue_.size() == 1 || terminal_result_locked(file->job) != S_OK;
             }
             catch (...)
             {
@@ -1422,8 +1450,11 @@ namespace sunpack::sevenzip
                 if (item.kind == WorkItem::Kind::Data)
                     finish_data_attempt(item.buffer, {AttemptResult::Kind::PermanentFailure, ERROR_OUTOFMEMORY});
                 else process_close(file);
+                return;
             }
-            space_wake_->wake();
+            // Later items need no extra packet while admission is pending.
+            // Every transition that grants admission also wakes the writer.
+            if (wake || state_->space_gate->can_admit_retry()) space_wake_->wake();
         }
 
         void dispatch_space_retries() noexcept
@@ -1435,13 +1466,22 @@ namespace sunpack::sevenzip
                 bool found = false;
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
+                    bool admission_pending = false;
                     for (auto it = retry_queue_.begin(); it != retry_queue_.end(); ++it)
                     {
-                        const auto file = it->kind == WorkItem::Kind::Data ? it->buffer->file : it->file;
+                        const auto &file = it->kind == WorkItem::Kind::Data ? it->buffer->file : it->file;
                         synchronize_cancellation_locked(file->job);
-                        auto decision = state_->space_gate->try_wait(writer_terminal_predicate(file->job));
-                        if (decision.kind == VolumeSpaceGate::WaitResult::Kind::Pending) continue;
-                        lease = std::move(decision.lease);
+                        if (!admission_pending)
+                        {
+                            auto decision = state_->space_gate->try_wait(writer_terminal_predicate(file->job));
+                            if (decision.kind == VolumeSpaceGate::WaitResult::Kind::Pending)
+                            {
+                                admission_pending = true;
+                                continue;
+                            }
+                            lease = std::move(decision.lease);
+                        }
+                        else if (terminal_result_locked(file->job) == S_OK) continue;
                         item = std::move(*it);
                         retry_queue_.erase(it);
                         found = true;
@@ -1458,27 +1498,12 @@ namespace sunpack::sevenzip
             }
         }
 
-        void drain_cancelled_retries() noexcept
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (!retry_queue_.empty()) space_wake_->wake();
-        }
-
         // Publish the handle under mutex_, but keep filesystem calls outside
         // that per-volume lock. Outstanding data prevents close during opening.
         // Space failures remain retryable through the existing IOCP queue.
         AttemptResult try_open_file(const FileStatePtr &file, bool has_data = true) noexcept
         {
             if (!file) return {AttemptResult::Kind::PermanentFailure, ERROR_INVALID_STATE};
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                if (file->hresult != S_OK)
-                    return {AttemptResult::Kind::PermanentFailure, ERROR_INVALID_STATE};
-                if (file->handle != INVALID_HANDLE_VALUE)
-                    return {AttemptResult::Kind::Succeeded, 0};
-                if (file->open_attempted)
-                    return {AttemptResult::Kind::PermanentFailure, ERROR_OPEN_FAILED};
-            }
             std::lock_guard<std::mutex> open_lock(file->open_mutex);
             {
                 std::lock_guard<std::mutex> lock(mutex_);
@@ -1503,8 +1528,22 @@ namespace sunpack::sevenzip
             }
 #endif
 
+            // Extraction already constructs an extended path under its
+            // output root. Avoid copying it on the writer thread.
+            std::wstring normalized_path;
+            const wchar_t *path = file->path.c_str();
+            if (file->path.rfind(LR"(\\?\)", 0) != 0)
+            {
+                try { normalized_path = win32_extended_path(file->path); }
+                catch (const std::bad_alloc &)
+                {
+                    record_failure(file, E_OUTOFMEMORY);
+                    return {AttemptResult::Kind::PermanentFailure, ERROR_OUTOFMEMORY};
+                }
+                path = normalized_path.c_str();
+            }
             const HANDLE handle = CreateFileW(
-                win32_extended_path(file->path).c_str(),
+                path,
                 GENERIC_WRITE,
                 0,
                 nullptr,
@@ -1691,21 +1730,24 @@ namespace sunpack::sevenzip
             return {AttemptResult::Kind::PermanentFailure, static_cast<unsigned long>(error)};
         }
 
-        bool flush_file(HANDLE handle, bool sync_storage_at_publication, DWORD &error) noexcept
+        bool flush_file(HANDLE handle, DWORD &error) noexcept
         {
 #ifdef SUP7Z_DEBUG
             if (flush_fault_.consume(error)) return false;
 #endif
-            if (sync_storage_at_publication && !write_through_)
+            if (!write_through_)
             {
                 // Write back this file while its handle is available. The
                 // extraction callback fences the output volume after all
                 // these writes and namespace updates have completed.
                 using Flush = LONG (NTAPI *)(HANDLE, ULONG, PVOID, ULONG, PIO_STATUS_BLOCK);
                 using ToWin32 = ULONG (NTAPI *)(LONG);
-                const auto ntdll = GetModuleHandleW(L"ntdll.dll");
-                static const auto flush = reinterpret_cast<Flush>(GetProcAddress(ntdll, "NtFlushBuffersFileEx"));
-                static const auto to_win32 = reinterpret_cast<ToWin32>(GetProcAddress(ntdll, "RtlNtStatusToDosError"));
+                static const auto functions = [] {
+                    const auto ntdll = GetModuleHandleW(L"ntdll.dll");
+                    return std::pair{reinterpret_cast<Flush>(GetProcAddress(ntdll, "NtFlushBuffersFileEx")),
+                                     reinterpret_cast<ToWin32>(GetProcAddress(ntdll, "RtlNtStatusToDosError"))};
+                }();
+                const auto [flush, to_win32] = functions;
                 if (flush && to_win32)
                 {
                     constexpr ULONG no_storage_sync = 2; // FLUSH_FLAGS_NO_SYNC
@@ -1740,34 +1782,43 @@ namespace sunpack::sevenzip
                 return;
             }
             const auto job = file->job;
-            const HRESULT global_error = current_error(job);
+            HRESULT global_error;
+            HANDLE handle;
+            bool ready_to_flush;
+            bool should_open;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                synchronize_cancellation_locked(job);
+                global_error = terminal_result_locked(job);
+                handle = file->handle;
+                ready_to_flush = global_error == S_OK && file->hresult == S_OK;
+                should_open = ready_to_flush && handle == INVALID_HANDLE_VALUE &&
+                    !file->open_attempted && !(file->replay && file->replay->complete && !file->new_writes);
+            }
             if (global_error != S_OK)
             {
                 record_failure(file, global_error);
             }
 
-            bool should_open = false;
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                should_open = file->hresult == S_OK && file->handle == INVALID_HANDLE_VALUE &&
-                              !file->open_attempted && !(file->replay && file->replay->complete && !file->new_writes);
-            }
             AttemptResult result;
             // This is a close-only open. The file has no outstanding data
             // and no future write can require a completion packet.
-            if (should_open) result = try_open_file(file, false);
-            HANDLE handle;
-            bool ready_to_flush;
+            if (should_open)
             {
-                std::lock_guard<std::mutex> lock(mutex_);
-                handle = file->handle;
-                ready_to_flush = file->hresult == S_OK;
+                result = try_open_file(file, false);
+                if (result.kind == AttemptResult::Kind::Succeeded)
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    synchronize_cancellation_locked(job);
+                    handle = file->handle;
+                    ready_to_flush = file->hresult == S_OK && terminal_result_locked(job) == S_OK;
+                }
             }
 #ifdef SUP7Z_DEBUG
             ArchiveMetadataErrors metadata_errors;
 #endif
             if (ready_to_flush && result.kind == AttemptResult::Kind::Succeeded &&
-                handle != INVALID_HANDLE_VALUE && current_error(job) == S_OK)
+                handle != INVALID_HANDLE_VALUE)
             {
                 // Persist the final file using the writer's existing handle. A
                 // complete replay receipt can only be issued after this flush.
@@ -1777,7 +1828,7 @@ namespace sunpack::sevenzip
 #endif
                 );
                 DWORD error = ERROR_SUCCESS;
-                if (!flush_file(handle, job->sync_storage_at_publication, error))
+                if (!flush_file(handle, error))
                 {
                     result = {is_space_exhaustion_error(error) ? AttemptResult::Kind::SpaceFailure
                                : AttemptResult::Kind::PermanentFailure, error};

@@ -310,6 +310,11 @@ namespace sunpack::sevenzip
         // Publish external terminal state before calling wake_waiters().
         WaitResult wait(const TerminalPredicate &terminal) noexcept;
         WaitResult try_wait(const TerminalPredicate &terminal) noexcept;
+        bool can_admit_retry() const noexcept
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            return phase_ == VolumeSpacePhase::Ready || probe_available_locked();
+        }
         void subscribe(const std::shared_ptr<SpaceWakeTarget> &target)
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -393,6 +398,11 @@ namespace sunpack::sevenzip
         {
             return phase_ == VolumeSpacePhase::Probing && token != 0 &&
                    probe_owner_token_ == token;
+        }
+
+        bool probe_available_locked() const noexcept
+        {
+            return phase_ == VolumeSpacePhase::Probing && probe_owner_token_ == 0;
         }
 
         bool record_query_failure_locked(unsigned long win32_error) noexcept
@@ -607,7 +617,7 @@ namespace sunpack::sevenzip
             return {WaitResult::Kind::Terminal, {}};
         if (phase_ == VolumeSpacePhase::Ready)
             return {WaitResult::Kind::Ready, {}};
-        if (phase_ == VolumeSpacePhase::Probing && probe_owner_token_ == 0)
+        if (probe_available_locked())
         {
             const auto token = next_token_++;
             probe_owner_token_ = token;

@@ -573,6 +573,9 @@ void check_prefetch_lifetime_and_seek()
     UInt64 position = 0;
     check(stream->Seek(0, FILE_CURRENT, &position) == S_OK && position == 192,
           "relative Seek uses logical cursor after cached reads");
+    check(stream->Seek((std::numeric_limits<Int64>::max)(), FILE_CURRENT, nullptr) ==
+              HRESULT_FROM_WIN32(ERROR_NEGATIVE_SEEK),
+          "relative Seek after prefetch rejects a logical offset that overflows");
     check(stream->Seek(-129, FILE_CURRENT, &position) == S_OK && position == 63,
           "backward relative Seek recalibrates the decoder handle");
     unsigned char expected[65]{};

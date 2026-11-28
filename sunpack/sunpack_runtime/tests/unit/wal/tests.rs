@@ -14,24 +14,24 @@ fn frames_reject_corruption_and_recover_only_incomplete_tails() {
     })
     .unwrap();
     let mut reader = Reader::new(Cursor::new(&bytes), Kind::TaskWal).unwrap();
-    assert_eq!(reader.next().unwrap(), Some(7));
+    assert_eq!(reader.next(None).unwrap(), Some(7));
     assert_eq!(
         decode::<Vec<String>>(&reader.payload).unwrap(),
         ["雪", "payload"]
     );
-    assert!(reader.next().unwrap().is_none());
+    assert!(reader.next(None).unwrap().is_none());
     assert!(!reader.torn);
     for offset in [0, 4, 6, 8, 20, 28, bytes.len() - 1] {
         let mut damaged = bytes.clone();
         damaged[offset] ^= 1;
         let result =
-            Reader::new(Cursor::new(damaged), Kind::TaskWal).and_then(|mut r| r.next());
+            Reader::new(Cursor::new(damaged), Kind::TaskWal).and_then(|mut r| r.next(None));
         assert!(result.is_err(), "undetected corruption at {offset}");
     }
     assert!(Reader::new(Cursor::new(&bytes), Kind::CatalogWal).is_err());
     for end in 0..bytes.len() {
         let mut reader = Reader::new(Cursor::new(&bytes[..end]), Kind::TaskWal).unwrap();
-        assert!(reader.next().unwrap().is_none());
+        assert!(reader.next(None).unwrap().is_none());
         assert!(reader.torn || end == 16);
         assert_eq!(reader.valid_end, if end < 16 { 0 } else { 16 });
     }
@@ -39,7 +39,7 @@ fn frames_reject_corruption_and_recover_only_incomplete_tails() {
     oversized[16..20].copy_from_slice(&((MAX_FRAME_BYTES as u32) + 1).to_le_bytes());
     assert!(Reader::new(Cursor::new(oversized), Kind::TaskWal)
         .unwrap()
-        .next()
+        .next(None)
         .is_err());
 }
 
@@ -58,28 +58,32 @@ fn fragmented_replay_releases_consumed_payload_and_commits_only_complete_transac
     append_frame(&mut bytes, &mut buffer, 3, |out| out.write_all(b"last")).unwrap();
 
     let mut reader = Reader::new(Cursor::new(&bytes), Kind::TaskWal).unwrap();
-    assert_eq!(reader.next().unwrap(), Some(1));
+    assert_eq!(reader.next(None).unwrap(), Some(1));
     assert_eq!(&*reader.payload, b"first");
-    assert_eq!(reader.next().unwrap(), Some(2));
+    assert_eq!(reader.next(None).unwrap(), Some(2));
     assert_eq!(&*reader.payload, large.as_slice());
-    assert_eq!(reader.next().unwrap(), Some(3));
+    assert_eq!(reader.next(None).unwrap(), Some(3));
     assert_eq!(&*reader.payload, b"last");
-    assert_eq!(reader.next().unwrap(), None);
+    assert_eq!(reader.next(None).unwrap(), None);
     assert!(reader.payload.is_empty());
     assert!(!reader.torn);
     assert_eq!(reader.valid_end, bytes.len() as u64);
 
+    let mut checkpointed = Reader::new(Cursor::new(&bytes), Kind::TaskWal).unwrap();
+    assert_eq!(checkpointed.next(Some(2)).unwrap(), Some(3));
+    assert_eq!(&*checkpointed.payload, b"last");
+
     let mut torn = Reader::new(Cursor::new(&bytes[..large_end - 1]), Kind::TaskWal).unwrap();
-    assert_eq!(torn.next().unwrap(), Some(1));
-    assert_eq!(torn.next().unwrap(), None);
+    assert_eq!(torn.next(None).unwrap(), Some(1));
+    assert_eq!(torn.next(None).unwrap(), None);
     assert!(torn.torn);
     assert!(torn.payload.is_empty());
     assert_eq!(torn.valid_end, first_end as u64);
 
     bytes[large_end - 1] ^= 1;
     let mut corrupt = Reader::new(Cursor::new(&bytes), Kind::TaskWal).unwrap();
-    assert_eq!(corrupt.next().unwrap(), Some(1));
-    assert!(corrupt.next().is_err());
+    assert_eq!(corrupt.next(None).unwrap(), Some(1));
+    assert!(corrupt.next(Some(2)).is_err());
     assert!(corrupt.payload.is_empty());
     assert_eq!(corrupt.valid_end, first_end as u64);
 }

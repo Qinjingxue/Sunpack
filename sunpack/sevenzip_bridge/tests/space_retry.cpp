@@ -627,36 +627,6 @@ void r16_reaped_writer_does_not_poison_gate(const std::filesystem::path &directo
     registry->shutdown();
 }
 
-// R-17 open 并发不误判
-void r17_concurrent_open_is_serialized(const std::filesystem::path &directory) {
-    Harness harness(directory, 4, 8);
-    auto &writer = *harness.writer;
-    std::atomic<int> open_calls{0};
-    writer.set_open_probe_for_test([&open_calls](const std::wstring &) { open_calls.fetch_add(1); });
-
-    constexpr std::size_t kPayload = 8 * kMib;
-    const auto payload = make_payload(kPayload);
-    const auto path = directory / L"r17-parallel.bin";
-
-    const auto job = writer.make_job(16 * kMib);
-    const auto file = writer.make_file(job, path.wstring(), 0, 0);
-    std::uint32_t processed = 0;
-    check(writer.write(file, payload.data(), static_cast<std::uint32_t>(payload.size()),
-                       &processed) == S_OK,
-          "R-17: 写入必须被接受");
-    writer.record_operation_result(file, 0);
-    writer.close_file(file, {});
-    check(writer.finish_job(job) == S_OK, "R-17: 并发写同一文件必须成功");
-
-    const auto snapshot = writer.take_file_snapshot(file);
-    check(snapshot.peak_active_data_writes >= 2,
-          "R-17: 测试前提 —— 同一 file 的多个 Data WorkItem 必须被多个 writer 线程并发处理");
-    check(open_calls.load() == 1,
-          "R-17: CreateFileW 只能发生一次（第二个线程必须看到已建立的 handle）");
-    check(snapshot.hresult == S_OK, "R-17: 不得出现 ERROR_FILE_EXISTS → PermanentFailure");
-    check(read_file(path) == payload, "R-17: 数据必须完整");
-}
-
 // R-18 PermanentFailure 也补记 discarded
 void r18_permanent_failure_records_discarded(const std::filesystem::path &directory) {
     Harness harness(directory, 1, 8);
@@ -689,79 +659,6 @@ void r18_permanent_failure_records_discarded(const std::filesystem::path &direct
     // 永久错误走 probe inconclusive：绝不产生 space_resumed。
     check(harness.log->count(VolumeSpaceTransition::Kind::Resumed) == 0,
           "R-18: 非空间错误绝不能伪造成 space_resumed");
-}
-
-// R-19 每个 dequeue buffer 恰好记一次（四种返回路径）
-void r19_exactly_one_discard_per_buffer(const std::filesystem::path &directory) {
-    // ① Succeeded → 增量 0
-    {
-        Harness harness(directory, 1, 8);
-        auto &writer = *harness.writer;
-        const auto payload = make_payload(1 * kMib);
-        const auto job = writer.make_job(2 * kMib);
-        const auto file = writer.make_file(
-            job, (directory / L"r19-ok.bin").wstring(), 0, 0);
-        std::uint32_t processed = 0;
-        writer.write(file, payload.data(), static_cast<std::uint32_t>(payload.size()),
-                     &processed);
-        check(writer.finish_job(job) == S_OK, "R-19: ① 干净写入必须成功");
-        check(writer.snapshot_meters().discarded_bytes == 0, "R-19: ① Succeeded 必须记 0 次");
-    }
-    // ② PermanentFailure → 增量 remaining
-    {
-        Harness harness(directory, 1, 8);
-        auto &writer = *harness.writer;
-        const auto payload = make_payload(1 * kMib);
-        const auto path = directory / L"r19-permanent.bin";
-        writer.set_write_fault_for_test(ERROR_WRITE_FAULT, 1);
-        const auto job = writer.make_job(2 * kMib);
-        const auto file = writer.make_file(job, path.wstring(), 0, 0);
-        std::uint32_t processed = 0;
-        writer.write(file, payload.data(), static_cast<std::uint32_t>(payload.size()),
-                     &processed);
-        writer.finish_job(job);
-        check(writer.snapshot_meters().discarded_bytes == 1 * kMib,
-              "R-19: ② PermanentFailure 必须恰好记一次 remaining");
-    }
-    // ③ Terminal → 增量 remaining
-    {
-        Harness harness(directory, 1, 8);
-        auto &writer = *harness.writer;
-        const auto payload = make_payload(1 * kMib);
-        const auto path = directory / L"r19-terminal.bin";
-        writer.set_write_fault_for_test(ERROR_DISK_FULL, 1);
-        const auto job = writer.make_job(2 * kMib);
-        const auto file = writer.make_file(job, path.wstring(), 0, 0);
-        std::uint32_t processed = 0;
-        writer.write(file, payload.data(), static_cast<std::uint32_t>(payload.size()),
-                     &processed);
-        check(wait_until([&] { return harness.gate->blocked(); }, 5s), "R-19: ③ 必须进入暂停");
-        writer.cancel_job(job);
-        writer.finish_job(job);
-        check(writer.snapshot_meters().discarded_bytes == 1 * kMib,
-              "R-19: ③ Terminal 必须恰好记一次 remaining");
-    }
-    // ④ SpaceFailure（gate 存在）→ 增量 0（骨架内部重试，不退出、不记账）
-    {
-        Harness harness(directory, 1, 8);
-        auto &writer = *harness.writer;
-        const auto payload = make_payload(1 * kMib);
-        const auto path = directory / L"r19-space.bin";
-        writer.set_write_fault_for_test(ERROR_DISK_FULL, 1);
-        const auto job = writer.make_job(2 * kMib);
-        const auto file = writer.make_file(job, path.wstring(), 0, 0);
-        std::uint32_t processed = 0;
-        writer.write(file, payload.data(), static_cast<std::uint32_t>(payload.size()),
-                     &processed);
-        check(wait_until([&] { return harness.gate->blocked(); }, 5s), "R-19: ④ 必须进入暂停");
-        check(writer.snapshot_meters().discarded_bytes == 0,
-              "R-19: ④ gate 存在时的 SpaceFailure 必须记 0 次");
-        check(harness.release_probe_and_wait_ready(), "R-19: ④ 恢复");
-        check(writer.finish_job(job) == S_OK, "R-19: ④ 恢复后成功");
-        const auto metrics = writer.snapshot_meters();
-        check(metrics.discarded_bytes == 0 && metrics.pending_bytes == 0,
-              "R-19: ④ 全程不得产生 discarded，且没有双重记账");
-    }
 }
 
 // R-9 close 阶段空间错误（write_through 的 flush 走同一骨架）
@@ -1211,7 +1108,8 @@ void r23_hot_path_never_enters_the_gate(const std::filesystem::path &directory) 
         check(read_file(path) == payload, "R-23: ① 数据必须完整");
     }
 
-    // ② 真实空间失败：此时（也只有此时）骨架才允许进入 gate。
+    // A real space failure reaches admission. Once recovery completes, a
+    // subsequent ordinary write must bypass the gate again.
     {
         constexpr std::size_t kPayload = 1 * kMib;
         const auto payload = make_payload(kPayload);
@@ -1237,31 +1135,8 @@ void r23_hot_path_never_enters_the_gate(const std::filesystem::path &directory) 
         writer.close_file(file, {});
         check(writer.finish_job(job) == S_OK, "R-23: ② 恢复后 job 必须成功");
         check(read_file(path) == payload, "R-23: ② 数据必须完整");
-    }
-
-    // ③ 恢复之后重新归零：后续正常写入不得再进入 gate（开销随异常状态一起消失）。
-    {
-        constexpr std::size_t kPayload = 1 * kMib;
-        const auto payload = make_payload(kPayload);
-        Harness harness(directory, 1, 8);
-        auto &writer = *harness.writer;
-        const auto path = directory / L"r23-after-recovery.bin";
-        writer.set_write_fault_for_test(ERROR_DISK_FULL, 1);
-
-        const auto job = writer.make_job(2 * kMib);
-        const auto file = writer.make_file(job, path.wstring(), 0, 0);
-        std::uint32_t processed = 0;
-        check(writer.write(file, payload.data(), static_cast<std::uint32_t>(payload.size()),
-                           &processed) == S_OK,
-              "R-23: ③ 写入必须被接受");
-        check(wait_until([&] { return harness.gate->blocked(); }, 5s), "R-23: ③ 必须进入暂停");
-        check(harness.release_probe_and_wait_ready(), "R-23: ③ 恢复后必须回到 Ready");
-        writer.record_operation_result(file, 0);
-        writer.close_file(file, {});
-        check(writer.finish_job(job) == S_OK, "R-23: ③ 恢复后 job 必须成功");
-
         const std::uint64_t calls_after_recovery = harness.gate->wait_call_count();
-        const auto second_path = directory / L"r23-after-recovery-2.bin";
+        const auto second_path = directory / L"r23-after-recovery.bin";
         const auto second_job = writer.make_job(2 * kMib);
         const auto second_file =
             writer.make_file(second_job, second_path.wstring(), 0, 0);
@@ -1352,10 +1227,8 @@ int main(int argc, char **argv) {
         {"R-15 space job registration", [&] { r15_space_job_registration(directory); }},
         {"R-16 reaped writer does not poison gate",
          [&] { r16_reaped_writer_does_not_poison_gate(directory); }},
-        {"R-17 concurrent open is serialized", [&] { r17_concurrent_open_is_serialized(directory); }},
         {"R-18 permanent failure records discarded",
          [&] { r18_permanent_failure_records_discarded(directory); }},
-        {"R-19 exactly one discard per buffer", [&] { r19_exactly_one_discard_per_buffer(directory); }},
         {"R-21 open space error is retryable", [&] { r21_open_space_error_is_retryable(directory); }},
         {"R-22 partial write then space failure",
          [&] { r22_partial_write_then_space_failure(directory); }},

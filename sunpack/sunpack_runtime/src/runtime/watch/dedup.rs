@@ -6,7 +6,7 @@ use crate::io::view::{ConfiguredViews, ReadView, Span};
 use crate::io::reader::{physical_file_generation_from_metadata, PhysicalFileGeneration};
 use crate::collections::{trim_map, SmallOrderedSet};
 use crate::path_keys::{path_ancestors, path_key};
-use crate::postprocess::{mtime_seconds, watch_usn_content_changed};
+use crate::postprocess::watch_usn_content_changed;
 use crate::scan::scope::NativeDiscoveryScope;
 use crate::wal::{self, Kind};
 use serde::{Deserialize, Serialize};
@@ -24,7 +24,7 @@ struct Identity {
     reversed: bool,
 }
 #[derive(Clone, Serialize, Deserialize)]
-struct Source { path: Arc<str>, generation: PhysicalFileGeneration, mtime: f64, usn: i64 }
+struct Source { path: Arc<str>, generation: PhysicalFileGeneration, usn: i64 }
 type SourceSnapshot = crate::filesystem::WatchFileSnapshot<PhysicalFileGeneration>;
 
 impl Source {
@@ -33,13 +33,14 @@ impl Source {
             Path::new(self.path.as_ref()), Some(self.usn), physical_file_generation_from_metadata,
         )
             .ok().flatten().filter(|snapshot| {
+                let change_usn = snapshot.change_usn();
                 snapshot.captured.object_id() == self.generation.object_id()
                     && snapshot.captured.len == self.generation.len
-                    && snapshot.change_usn() >= self.usn
-                    && !watch_usn_content_changed(
-                        self.mtime, self.usn, mtime_seconds(&snapshot.metadata),
-                        snapshot.change_usn(), snapshot.change_reasons,
-                    )
+                    && change_usn >= self.usn
+                    && (change_usn == self.usn || !watch_usn_content_changed(
+                        self.generation.modified_seconds(), self.usn, snapshot.captured.modified_seconds(),
+                        change_usn, snapshot.change_reasons,
+                    ))
             })
     }
 
@@ -50,7 +51,6 @@ impl Source {
     }
 
     fn update_snapshot(&mut self, snapshot: SourceSnapshot) {
-        self.mtime = mtime_seconds(&snapshot.metadata);
         self.usn = snapshot.change_usn();
         self.generation = snapshot.captured;
     }
@@ -316,7 +316,7 @@ pub(super) struct Index {
     next_domain: u64,
     journals: HashMap<String, (String, u64)>,
     records: HashMap<u64, Record>,
-    // Commit removes a superseded record before writing a replacement owner.
+    // A Put replaces the previous layout of this owner during admission and replay.
     owners: HashMap<Arc<str>, u64>,
     paths: BTreeMap<Arc<str>, RecordIds>, sizes: HashMap<Signature, SizeBucket>,
     hashes: HashMap<(Signature, [u8; 16]), RecordIds>,
@@ -333,7 +333,7 @@ impl Index {
         let loaded = (|| -> io::Result<()> {
             let mut reader = wal::Reader::new(File::open(&index.path)?, Kind::DedupWal)?;
             let mut begun = false;
-            while let Some(seq) = reader.next()? {
+            while let Some(seq) = reader.next(None)? {
                 if seq != index.seq + 1 { return Err(wal::invalid("deduplication WAL gap")); }
                 let delta: Delta = wal::decode(&reader.payload)?;
                 match delta {
@@ -561,15 +561,11 @@ impl Index {
             if !checked && !record.current() {
                 return Ok(Admission::Finished(false));
             }
-            return self.commit(prepared.record, replaced, duplicate);
+            return self.commit(prepared.record, duplicate);
         }
     }
-    fn commit(&mut self, mut record: Record, replaced: Option<u64>, duplicate: bool) -> io::Result<Admission> {
+    fn commit(&mut self, mut record: Record, duplicate: bool) -> io::Result<Admission> {
         record.admitted = !duplicate;
-        // Superseded owner layouts must not retain an obsolete signature indefinitely.
-        if let Some(id) = replaced.filter(|id| self.records.contains_key(id)) {
-            self.remove_ids(vec![id])?;
-        }
         self.append(&Delta::Put(Cow::Borrowed(&record)))?; self.insert(record);
         self.compact()?;
         Ok(Admission::Finished(duplicate))
@@ -688,6 +684,9 @@ impl Index {
     fn insert(&mut self, mut r: Record) {
         r.scope = self.domain(&r.scope);
         let signature = self.signature(&r);
+        if let Some(previous) = self.owners.get(&r.owner).copied().filter(|previous| *previous != r.id) {
+            self.remove(previous);
+        }
         self.remove(r.id); self.next_id = self.next_id.max(r.id + 1);
         self.owners.insert(Arc::clone(&r.owner), r.id);
         for s in r.sources.iter() {
@@ -815,7 +814,6 @@ fn describe_with_snapshots(
                 }
                 sources.push(Source {
                     path,
-                    mtime: mtime_seconds(&snapshot.metadata),
                     usn: snapshot.change_usn(),
                     generation: snapshot.captured,
                 });

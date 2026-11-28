@@ -121,7 +121,7 @@ fn recovery_volume_descriptor_preserves_style_roles_and_plan_order() {
     }));
     let mut decoded: ArchiveInput =
         serde_json::from_slice(&serde_json::to_vec(&input).unwrap()).unwrap();
-    assert_eq!(serde_json::to_value(decoded.worker_input()).unwrap()["named_volumes"], true);
+    assert_eq!(serde_json::to_value(decoded.worker_input()).unwrap()["open_mode"], "named_volumes");
     assert_eq!(serde_json::to_value(input.report()).unwrap(), serde_json::to_value(decoded.report()).unwrap());
     decoded
         .select_volumes(&VolumeSelection {

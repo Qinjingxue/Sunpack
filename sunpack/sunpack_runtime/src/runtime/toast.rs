@@ -8,7 +8,7 @@ use crate::pipeline::{
     Outcome, ResourceWait, TaskId,
 };
 use serde::{ser::SerializeSeq, Serialize, Serializer};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -243,7 +243,7 @@ impl Snapshot {
                 body.push_str(interrupted);
             }
         }
-        let action = summary.output.as_ref().map(|path| {
+        let action = summary.output.as_ref().filter(|path| path.is_dir()).map(|path| {
             (
                 1,
                 language.text("toast.action.open_output").to_owned(),
@@ -332,8 +332,7 @@ fn push_text(output: &mut Vec<u8>, value: &str) {
 #[derive(Default)]
 struct State {
     group: Option<Group>,
-    completed: VecDeque<Completed>,
-    published: VecDeque<(Completed, Option<PathBuf>)>,
+    completion: Option<Completion>,
     dirty: bool,
     stopping: bool,
     clear: bool,
@@ -383,6 +382,19 @@ impl Completed {
     fn needs_report(&self) -> bool {
         !self.summary.report_failed && (self.summary.failed != 0
             || (self.summary.rollback_failed && self.summary.succeeded != 0))
+    }
+}
+
+enum Completion {
+    Prepare(Completed),
+    Present(Completed, Option<PathBuf>),
+}
+
+impl Completion {
+    fn discard(self) {
+        if let Self::Present(_, Some(path)) = self {
+            let _ = fs::remove_file(path);
+        }
     }
 }
 
@@ -707,7 +719,7 @@ impl State {
                 }
                 group.finalizing = true;
                 group.finalize_at = None;
-                self.completed.push_back(Completed {
+                let completed = Completed {
                     generation: group.generation,
                     id: Arc::clone(&group.id),
                     language: group.language,
@@ -715,6 +727,13 @@ impl State {
                     summary: group.summary.clone(),
                     report: Arc::clone(&group.report),
                     cancellation: group.cancellation.clone(),
+                };
+                // The current group stays finalizing until this snapshot is
+                // consumed or the group is reset. Only one can be pending.
+                self.completion = Some(if completed.needs_report() {
+                    Completion::Prepare(completed)
+                } else {
+                    Completion::Present(completed, None)
                 });
                 changed = true;
                 break;
@@ -807,8 +826,13 @@ impl Summary {
         self.report_failed |= other.report_failed;
         self.cleanup_failed += other.cleanup_failed;
         if let Some(output) = other.output {
-            self.output = existing_output_target(self.output.as_deref().into_iter()
-                .chain(std::iter::once(output.as_path())));
+            // Outcome projection already checked these directories. Merge
+            // their paths without filesystem I/O under the presentation lock.
+            self.output = match self.output.take() {
+                Some(previous) => crate::pipeline::common_ancestor([previous.as_path(), output.as_path()])
+                    .or(Some(previous)),
+                None => Some(output),
+            };
         }
     }
 }
@@ -872,17 +896,16 @@ struct Shared {
 
 impl Shared {
     fn discard_batches(&self) {
-        let (groups, completed, published) = {
+        let (group, completion) = {
             let mut state = self.state.lock().unwrap();
-            (std::mem::take(&mut state.group), std::mem::take(&mut state.completed),
-                std::mem::take(&mut state.published))
+            (state.group.take(), state.completion.take())
         };
         // Unpresented reports are invalid, like main's detached finalize result.
         // File removal and draft destruction must never hold the state gate.
-        for (_, report) in published {
-            if let Some(path) = report { let _ = fs::remove_file(path); }
+        if let Some(completion) = completion {
+            completion.discard();
         }
-        drop((groups, completed));
+        drop(group);
     }
 
     fn present(&self, batch: &str, show: impl FnOnce()) -> bool {
@@ -945,10 +968,8 @@ impl Finish {
     pub(super) fn publish(self) {
         let mut state = self.activity.publisher.shared.state.lock().unwrap();
         if state.stopping { return; }
-        let Some(group) = state.group.iter_mut()
-            .find(|group| group.requests.contains_key(&self.activity.request))
-        else { return; };
-        group.finish(&self.activity.request, self.summary);
+        let Some(group) = state.group.as_mut() else { return; };
+        if !group.finish(&self.activity.request, self.summary) { return; }
         state.settle(Instant::now());
         state.dirty = true;
         self.activity.publisher.shared.changed.notify_one();
@@ -967,7 +988,7 @@ impl Publisher {
                 }
                 let mut state = self.shared.state.lock().unwrap();
                 if !state.stopping && state.group.iter().any(|group| group.id == completed.id) {
-                    state.published.push_back((completed, None));
+                    state.completion = Some(Completion::Present(completed, None));
                     self.shared.changed.notify_one();
                 }
                 return crate::pipeline::scheduling::Join::ready(());
@@ -995,7 +1016,7 @@ impl Publisher {
                 drop(state);
                 if let Some(path) = report { let _ = fs::remove_file(path); }
             } else {
-                state.published.push_back((completed, report));
+                state.completion = Some(Completion::Present(completed, report));
                 shared.changed.notify_one();
             }
         }))
@@ -1022,16 +1043,17 @@ impl Publisher {
     }
 
     fn reset_batches(&self) {
-        let retired = {
+        let (retired, completion) = {
             let mut state = self.shared.state.lock().unwrap();
             if let Some(group) = &state.group { group.cancellation.cancel(); }
-            let retired = (std::mem::take(&mut state.group), std::mem::take(&mut state.completed));
+            let retired = (state.group.take(), state.completion.take());
             state.clear = true;
             self.mark_dirty(&mut state);
             retired
         };
-        // Old activities can no longer publish; active report copies observe
-        // the batch cancellation and completed copies fail the presentation gate.
+        if let Some(completion) = completion {
+            completion.discard();
+        }
         drop(retired);
     }
 
@@ -1075,11 +1097,7 @@ impl Activity {
         if state.settle(Instant::now()) {
             self.publisher.shared.changed.notify_one();
         }
-        if let Some(group) = state
-            .group
-            .iter_mut()
-            .find(|group| group.requests.contains_key(&self.request))
-        {
+        if let Some(group) = state.group.as_mut() {
             if group.event(&self.request, event) && group.visible {
                 self.publisher.mark_dirty(&mut state);
             }
@@ -1098,9 +1116,9 @@ impl Activity {
         let (group_id, language, report) = {
             let state = self.publisher.shared.state.lock().unwrap();
             if state.stopping { return; }
-            let Some(group) = state.group.iter().find(|group| group.requests.contains_key(&self.request))
-                else { return; };
-            if !group.requests[&self.request].roots.get(&id).is_some_and(|root| root.visible) { return; }
+            let Some(group) = state.group.as_ref() else { return; };
+            if !group.requests.get(&self.request).and_then(|request| request.roots.get(&id))
+                .is_some_and(|root| root.visible) { return; }
             (Arc::clone(&group.id), group.language, Arc::clone(&group.report))
         };
         let key = crate::path_keys::path_key(&path.to_string_lossy());
@@ -1130,9 +1148,8 @@ impl Activity {
         let summary = Summary::for_outcome(outcome, false, visible, &|_| Some(key.clone()), None);
         let mut state = self.publisher.shared.state.lock().unwrap();
         if state.stopping { return; }
-        let Some(group) = state.group.iter_mut()
-            .find(|group| group.requests.contains_key(&self.request)) else { return; };
-        let request = group.requests.get_mut(&self.request).unwrap();
+        let Some(group) = state.group.as_mut() else { return; };
+        let Some(request) = group.requests.get_mut(&self.request) else { return; };
         let Some(root) = request.roots.get_mut(&id) else { return; };
         if !request.settled.insert(key) { return; }
         root.done_bytes = 0;
@@ -1152,31 +1169,29 @@ impl Activity {
     pub(super) fn report_finished(&self, id: TaskId, failed: bool) {
         let mut state = self.publisher.shared.state.lock().unwrap();
         if state.stopping { return; }
-        if let Some(group) = state.group.iter_mut()
-            .find(|group| group.requests.contains_key(&self.request))
-        {
-            let request = group.requests.get_mut(&self.request).unwrap();
-            if request.roots.get(&id).is_some_and(|root| root.settlement != RootSettlement::Unsettled) {
-                let root = request.roots.remove(&id).unwrap();
-                if root.settlement == RootSettlement::PendingReport {
-                    group.pending_completions -= 1;
-                    group.summary.report_failed |= failed;
-                }
-                if let Some(path) = root.path {
-                    request.settled.remove(&crate::path_keys::path_key(&path.to_string_lossy()));
-                }
-                for task in root.descendants {
-                    request.task_roots.remove(&task);
-                }
-                if request.roots.capacity() > 256 {
-                    crate::collections::trim_map(&mut request.roots);
-                }
-                if request.task_roots.capacity() > 256 {
-                    crate::collections::trim_map(&mut request.task_roots);
-                }
-                if request.name.as_ref().is_some_and(|(root, _)| *root == id) { request.name = None; }
-            }
+        let Some(group) = state.group.as_mut() else { return; };
+        let Some(request) = group.requests.get_mut(&self.request) else { return; };
+        let std::collections::hash_map::Entry::Occupied(entry) = request.roots.entry(id)
+            else { return; };
+        if entry.get().settlement == RootSettlement::Unsettled { return; }
+        let root = entry.remove();
+        if root.settlement == RootSettlement::PendingReport {
+            group.pending_completions -= 1;
+            group.summary.report_failed |= failed;
         }
+        if let Some(path) = root.path {
+            request.settled.remove(&crate::path_keys::path_key(&path.to_string_lossy()));
+        }
+        for task in root.descendants {
+            request.task_roots.remove(&task);
+        }
+        if request.roots.capacity() > 256 {
+            crate::collections::trim_map(&mut request.roots);
+        }
+        if request.task_roots.capacity() > 256 {
+            crate::collections::trim_map(&mut request.task_roots);
+        }
+        if request.name.as_ref().is_some_and(|(root, _)| *root == id) { request.name = None; }
         state.settle(Instant::now());
         state.dirty = true;
         self.publisher.shared.changed.notify_one();
@@ -1194,12 +1209,10 @@ impl Activity {
             if state.stopping {
                 return None;
             }
-            let Some(group) = state.group.iter()
-                .find(|group| group.requests.contains_key(&self.request))
+            let Some(request) = state.group.as_ref().and_then(|group| group.requests.get(&self.request))
             else {
                 return None;
             };
-            let request = &group.requests[&self.request];
             (request.visible, if cancelled { request.roots.values().filter_map(|root| root.path.clone()).collect::<HashSet<_>>() }
                 else { request.roots.values().filter_map(|root| root.started.as_ref())
                     .flat_map(SmallOrderedSet::iter).cloned().collect() }, request.settled.clone())
@@ -1231,12 +1244,8 @@ impl Activity {
             if state.stopping || ignore_request_error {
                 return;
             }
-            let Some(group) = state.group.iter()
-                .find(|group| group.requests.contains_key(&self.request))
-            else {
-                return;
-            };
-            let request = &group.requests[&self.request];
+            let Some(group) = state.group.as_ref() else { return; };
+            let Some(request) = group.requests.get(&self.request) else { return; };
             if !request.visible {
                 return;
             }
@@ -1534,9 +1543,7 @@ impl Reports {
                     .and_then(|name| name.strip_suffix(".tmp"))
                 {
                     let state = shared.state.lock().unwrap();
-                    if state.group.iter().any(|group| group.id.as_ref() == id)
-                        || state.completed.iter().any(|group| group.id.as_ref() == id)
-                    {
+                    if state.group.iter().any(|group| group.id.as_ref() == id) {
                         continue;
                     }
                 }
@@ -1616,15 +1623,8 @@ impl Toast {
                         if std::mem::take(&mut state.clear) {
                             break Display::Clear;
                         }
-                        if let Some((completed, report)) = state.published.pop_front() {
-                            break Display::Published(completed, report);
-                        }
-                        if let Some(completed) = state.completed.pop_front() {
-                            if state.completed.capacity() > 256 {
-                                crate::collections::trim_deque(&mut state.completed);
-                            }
-                            break if completed.needs_report() { Display::Completed(completed) }
-                                else { Display::Published(completed, None) };
+                        if let Some(completion) = state.completion.take() {
+                            break Display::Completion(completion);
                         }
                         if state.dirty {
                             let group = state.group.as_ref().filter(|group| group.visible);
@@ -1665,15 +1665,15 @@ impl Toast {
                         if let Some(error) = error { report_error("toast_error", &error); }
                         continue;
                     }
-                    if let Display::Completed(completed) = display {
-                        Publisher { shared: Arc::clone(&presenter_shared), reports: Arc::clone(&presenter_reports) }
-                            .publish(&engine, completed);
-                        continue;
-                    }
                     let (snapshot, completion, published_report) = match display {
-                        Display::Clear | Display::Completed(_) => unreachable!(),
+                        Display::Clear => unreachable!(),
                         Display::Progress(snapshot) => (snapshot, None, None),
-                        Display::Published(completed, report) => {
+                        Display::Completion(Completion::Prepare(completed)) => {
+                            Publisher { shared: Arc::clone(&presenter_shared), reports: Arc::clone(&presenter_reports) }
+                                .publish(&engine, completed);
+                            continue;
+                        }
+                        Display::Completion(Completion::Present(completed, report)) => {
                             (Snapshot::completed(&completed, report.clone()), Some(completed), report)
                         }
                     };
@@ -1764,8 +1764,7 @@ impl Toast {
 enum Display {
     Clear,
     Progress(Snapshot),
-    Completed(Completed),
-    Published(Completed, Option<PathBuf>),
+    Completion(Completion),
 }
 
 impl Drop for Toast {

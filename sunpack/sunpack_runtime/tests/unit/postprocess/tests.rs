@@ -29,9 +29,9 @@ fn watch_observation_keeps_its_path_and_file_identity_during_rename() {
         fs::rename(path, new_name)?;
         fs::rename(left.join("replacement.zip"), path)
     }));
-    let sampled = watch_candidate_for_path(&path, None);
+    let sampled = watch_candidate_with_generation(&path, None);
     *WATCH_OBSERVATION_HOOK.lock().unwrap() = None;
-    let sampled = sampled.unwrap().unwrap();
+    let (sampled, generation) = sampled.unwrap().unwrap();
     let moved = watch_candidate_for_path(&destination, None).unwrap().unwrap();
     let reused = watch_candidate_for_path(&path, None).unwrap().unwrap();
 
@@ -39,6 +39,7 @@ fn watch_observation_keeps_its_path_and_file_identity_during_rename() {
     assert_eq!(sampled.size, original.size);
     assert_eq!(sampled.observation.file_id, moved.observation.file_id);
     assert_ne!(sampled.observation.file_id, reused.observation.file_id);
+    assert_eq!(generation, crate::io::reader::capture_file_generation(&destination).unwrap());
 }
 
 use std::time::{SystemTime, UNIX_EPOCH};

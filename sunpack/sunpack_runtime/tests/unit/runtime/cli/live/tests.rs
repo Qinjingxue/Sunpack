@@ -284,6 +284,9 @@ fn finished_rows_project_results_while_other_work_is_running() {
         for (id, path) in [(1, "carrier"), (2, "slow.zip"), (3, "cancelled.zip")] {
             panel.update(&terminal, Language::En, queued(id, None, path, None), false);
         }
+        assert_eq!(panel.tasks[&3].verbose_path.is_some(), verbose);
+        panel.update(&terminal, Language::En, Event::Extracting { id: 3 }, false);
+        assert_eq!(panel.tasks[&3].detail.is_some(), verbose);
         for (id, status) in [(4, TaskStatus::Partial), (5, TaskStatus::Complete)] {
             panel.update(&terminal, Language::En, queued(id, Some(1), "carrier", Some(Segment {
                 format: "zip".into(), index: (id - 3) as usize,
@@ -305,6 +308,7 @@ fn finished_rows_project_results_while_other_work_is_running() {
             result: TaskCompletion { status: TaskStatus::Failed,
                 failure: Some(Failure::new(FailureKind::Cancelled, "raw")), output: None },
         }, false);
+        assert!(panel.tasks[&3].verbose_path.is_none() && panel.tasks[&3].detail.is_none());
         let rows = panel.rows(terminal.size, true, Language::En);
         let text = rows.iter().map(|row| row.text.as_str()).collect::<Vec<_>>().join("\n");
         assert!(text.contains(Language::En.text("report.status.partial")));

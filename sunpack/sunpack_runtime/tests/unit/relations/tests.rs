@@ -208,6 +208,23 @@ fn validation_with_owned_paths(status: ProposalStatus, paths: &[&str]) -> Propos
     }
 }
 
+#[test]
+fn a_later_shared_volume_connects_entire_selected_component() {
+    let first = [r"C:\selected.rar", r"C:\one.part2.rar"];
+    let second = [r"C:\two.part1.rar", r"C:\two.part2.rar"];
+    let unrelated = [r"C:\other.part1.rar"];
+    let bridge = [r"C:\bridge.rar", "c:/ONE.part2.rar", r"C:\two.part2.rar"];
+    let mut groups: Vec<_> = [&first[..], &second, &unrelated, &bridge]
+        .into_iter()
+        .map(|paths| NativeRelationGroup::Proposal(Box::new(validation_with_owned_paths(ProposalStatus::Valid, paths))))
+        .collect();
+
+    let owned: HashSet<_> = retain_connected_groups(&mut groups, &HashSet::from([path_key(first[0])])).collect();
+    assert_eq!(groups.iter().map(NativeRelationGroup::entry_path).collect::<Vec<_>>(),
+        [first[0], second[0], bridge[0]]);
+    assert_eq!(owned, first.into_iter().chain(second).chain(bridge).map(path_key).collect());
+}
+
 // A real parsed ENDARC before carrier EOF reaches NativeVolumes with a
 // finite head extent. That physical bound must not invent a scan range.
 #[test]

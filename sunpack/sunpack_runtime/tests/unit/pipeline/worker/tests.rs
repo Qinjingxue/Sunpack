@@ -27,7 +27,7 @@ fn native_worker_accepts_chunked_request_then_an_ordinary_request() {
                 output_dir: String::new(),
                 output_volume_key: String::new(),
                 archive_input: Arc::clone(&archive),
-                password_candidates: Arc::new(vec![Arc::clone(&candidate); count]),
+                password_candidates: Some(Arc::new(vec![Arc::clone(&candidate); count])),
                 layout_passwords: Default::default(),
                 password: None,
                 password_verified: false,
@@ -73,7 +73,7 @@ fn native_extraction_requests_inventory_rows_only_for_recursion() {
                 output_dir: output_dir.clone(),
                 output_volume_key: String::new(),
                 archive_input: Arc::clone(&archive),
-                password_candidates: Arc::default(),
+                password_candidates: None,
                 layout_passwords: Default::default(),
                 password: None,
                 password_verified: false,
@@ -453,16 +453,6 @@ fn stdin_first_worker_death_keeps_worker_lost() {
 }
 
 #[test]
-fn communication_failures_keep_the_report_kind() {
-    for kind in ["worker_lost", "process_io"] {
-        let error = WorkerExit { message: "worker failed".into(), kind: io::ErrorKind::BrokenPipe, failure_kind: kind }.error();
-        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
-        assert_eq!(error.to_string(), "worker failed");
-        assert_eq!(error.get_ref().unwrap().downcast_ref::<CommunicationError>().unwrap().kind, kind);
-    }
-}
-
-#[test]
 fn job_protocol_errors_cancel_once_and_wait_for_native_completion() {
     for malformed in [
         // A frame boundary and job route survive a malformed event body.
@@ -639,7 +629,11 @@ fn partial_write_failure_reaps_before_waking_senders_and_exit_stops_idle_writer(
     assert!(mailbox.updates.lock().unwrap().result.is_none());
     reap.send(()).unwrap();
     writer.join().unwrap();
-    for write in [first, queued, shared.send(Arc::new(vec![3]))] {
+    let error = first.wait_blocking().unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    assert_eq!(error.to_string(), "injected partial write");
+    assert_eq!(error.get_ref().unwrap().downcast_ref::<CommunicationError>().unwrap().kind, "process_io");
+    for write in [queued, shared.send(Arc::new(vec![3]))] {
         assert_eq!(
             write.wait_blocking().unwrap_err().kind(),
             io::ErrorKind::BrokenPipe,
@@ -701,11 +695,7 @@ fn worker_transport_diagnostic_survives_unrelated_results() {
 
 fn dispatch(shared: &Shared, summary: Value) {
     let bytes = encode_worker_frame(&summary).unwrap();
-    let mut decoder = NativeWorkerFrameDecoder::default();
-    for frame in decoder.feed(&bytes).unwrap() {
-        shared.event(frame);
-    }
-    decoder.finish().unwrap();
+    dispatch_stdout(bytes.as_slice(), shared).unwrap();
 }
 
 fn register(shared: &Shared, id: &str) -> Arc<Mailbox> {

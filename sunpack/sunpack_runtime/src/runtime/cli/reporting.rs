@@ -130,7 +130,7 @@ impl Reports {
         &self,
         notify: impl Fn() + Sync,
     ) {
-        let _close = Close(self);
+        let _close = CloseOnDrop(self);
         loop {
             let (closed, pending) = poll_fn(|cx| {
                 let mut state = self.state.lock().unwrap();
@@ -143,7 +143,7 @@ impl Reports {
                 }
             }).await;
             if !pending { return; }
-            crate::pipeline::stage("report", &crate::pipeline::Cancellation::new()).await
+            crate::pipeline::stage("report", &crate::pipeline::Cancellation::default()).await
                 .expect("completion reporting is not cancellable");
             notify();
             if closed { return; }
@@ -178,8 +178,8 @@ impl Reports {
     }
 }
 
-struct Close<'a>(&'a Reports);
-impl Drop for Close<'_> {
+pub(super) struct CloseOnDrop<'a>(pub(super) &'a Reports);
+impl Drop for CloseOnDrop<'_> {
     fn drop(&mut self) { self.0.close(); }
 }
 

@@ -153,6 +153,11 @@ fn rust_writer_cpp_query_lifecycle() {
     for index in 0..250 {
         let source = root.0.join(if index < 100 { "one" } else { "two" })
             .join(format!("载体-{index}.fake"));
+        let source = if index == 0 {
+            source.to_string_lossy().replace('\\', "/")
+        } else {
+            source.to_string_lossy().into_owned()
+        };
         let member = root.0.join(format!("密钥_{index}%.002"));
         let ts = base + f64::from(index / 100) * 86400.0 + f64::from(index) / 1000.0;
         log.write(json!({"event":"pipeline_sources_claimed", "owner":index.to_string(),
@@ -167,6 +172,7 @@ fn rust_writer_cpp_query_lifecycle() {
         assert_eq!(selected.len(), if query == "100%" { 1 } else { 250 });
     }
     assert!(rows(&binary, &path, "密匙", "", "").is_empty());
+    assert_eq!(rows(&binary, &path, "/one/载体-0", "", "").len(), 1);
     let stamp = history.values().next().unwrap()["time"].as_str().unwrap();
     for query in [stamp, &stamp[..10], &stamp[11..16]] {
         let expected: BTreeMap<_, _> = history.iter().filter(|(_, row)|

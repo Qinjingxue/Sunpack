@@ -55,11 +55,7 @@ impl Bucket {
                 hash.update(value.as_bytes());
             }
         }
-        let digest = hash
-            .hexdigest()
-            .into_bytes()
-            .try_into()
-            .expect("XXH128 is 32 hex digits");
+        let digest = hash.hex_digest();
         Self {
             values: Arc::from(values),
             disabled: (!disabled.is_empty()).then(|| Arc::from(disabled)),

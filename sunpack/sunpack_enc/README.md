@@ -17,7 +17,7 @@ Scratch and active-batch reservations are released at batch exit. The worker
 borrows up to three extra credits for the selected-password KDF, returning them
 before recovery framing or extraction I/O. One-credit KDF runs lanes serially.
 
-`Decoder::decrypt_with_budget` is the sole authenticated decrypt entry point.
+The worker calls `sup_enc_decrypt`, which uses the shared `Decoder::decrypt` implementation.
 It streams through a 256 KiB buffer, sharing expanded keys and zeroizing key,
 plaintext and counter scratch on drop. CTR acquires available extra credits each
 batch, with at least 4 KiB per slice, then releases them before writes and on every

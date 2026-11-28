@@ -85,6 +85,39 @@ static void test_codec(const Bytes &packed, const Bytes &expected) {
     check(invoke(output_size, true, S_OK, E_ACCESSDENIED, false).first == E_ACCESSDENIED, "codec write failure propagated");
     check(invoke(output_size, true, S_OK, S_OK, true).first == E_ABORT, "codec progress cancellation propagated");
     check(invoke(0, false, S_OK, S_OK, false).first == S_OK, "codec empty partial output");
+    CMyComPtr<ICompressSetInStream> set_input;
+    CMyComPtr<ICompressSetOutStreamSize> set_size;
+    CMyComPtr<ISequentialInStream> pull;
+    check(coder->QueryInterface(IID_ICompressSetInStream, (void **)&set_input) == S_OK &&
+          coder->QueryInterface(IID_ICompressSetOutStreamSize, (void **)&set_size) == S_OK &&
+          coder->QueryInterface(IID_ISequentialInStream, (void **)&pull) == S_OK, "codec pull interfaces");
+    const auto pull_exact = [&](const Bytes &source, UInt64 size, bool full) {
+        CMyComPtr<ISequentialInStream> input = new CodecStreams(source);
+        check(finish->SetFinishMode(full) == S_OK && set_input->SetInStream(input) == S_OK &&
+            set_size->SetOutStreamSize(&size) == S_OK, "initialize codec pull");
+        Bytes out(static_cast<size_t>(size));
+        HRESULT status = S_OK;
+        size_t pos = 0;
+        while (pos < out.size() && status == S_OK) {
+            UInt32 n = 0;
+            status = pull->Read(out.data() + pos, static_cast<UInt32>((std::min)(size_t(4093), out.size() - pos)), &n);
+            pos += n;
+            if (!n) break;
+        }
+        out.resize(pos);
+        check(set_input->ReleaseInStream() == S_OK, "release codec pull");
+        return std::make_pair(status, std::move(out));
+    };
+    const auto pulled = pull_exact(packed, output_size, true);
+    check(pulled.first == S_OK && pulled.second == expected, "codec pull fragmented decode");
+    processed->GetInStreamProcessedSize(&consumed);
+    check(consumed == input_size, "codec pull consumed full range");
+    const auto prefix = pull_exact(packed, 17, false);
+    check(prefix.first == S_OK && prefix.second == Bytes(expected.begin(), expected.begin()+17), "codec pull prefix");
+    Bytes damaged = packed;
+    damaged.back() ^= 1;
+    check(pull_exact(damaged, output_size, true).first == S_FALSE, "codec pull rejects corrupt footer on last read");
+
 }
 static void word(Bytes &out, unsigned int n) { for (int i=0;i<4;++i) out.push_back(static_cast<unsigned char>(n>>(8*i))); }
 static void save(const std::filesystem::path &path, const Bytes &data) {
@@ -245,11 +278,11 @@ int wmain(int argc,wchar_t **argv) {
         Bytes double_input=input;double_input.insert(double_input.end(),input.begin(),input.end());
         std::filesystem::create_directories(root/L"expected_concat");
         save(root/L"expected_concat"/L"payload",double_input);
-        auto result=decode(concatenated,double_input,7);check(result.frames==2&&result.skippable_frames==3&&result.content_checked_frames==2,"concatenation receipt");
+        check(decode(concatenated,double_input,7).frames==2,"concatenated data frames");
         save(root/L"concat.bin",concatenated);
         const auto unchecked=frame(input,4,false,false,true,false);
         Bytes partial=standard;partial.insert(partial.end(),unchecked.begin(),unchecked.end());
-        check(decode(partial,double_input,31).content_checked_frames==1,"partial content checksum coverage");
+        decode(partial,double_input,31);
         save(root/L"concat_partial.bin",partial);
         Bytes prefix=standard;prefix.resize(prefix.size()+29,0x88);save(root/L"prefix_carrier.dat",prefix);
         auto empty=frame({},4,false,true,true,true);decode(empty,{});save(root/L"empty.lz4",empty);

@@ -1,4 +1,41 @@
 #[test]
+fn dedup_baseline_cutover_excludes_a_late_hard_link() {
+    use super::*;
+    use crate::scan::scope::NativeDiscoveryScope;
+
+    let root = crate::test_support::temp_file("dedup_baseline_cutover", b"");
+    fs::remove_file(&root).unwrap();
+    fs::create_dir(&root).unwrap();
+    let original = root.join("original.zip");
+    let arrival = root.join("arrival.zip");
+    let fresh = root.join("fresh.zip");
+    let fresh_alias = root.join("fresh-alias.zip");
+    fs::write(&original, b"stable archive bytes").unwrap();
+    let scope = NativeDiscoveryScope::new(root.to_str().unwrap().to_owned(), None, Vec::new());
+    let state = crate::watch_store::NativeWatchState::new();
+    let catalog = NativeWatchCatalog::new(&state, None);
+    let options = NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap();
+    assert!(options.catalog_refresh(&catalog, &scope, None).unwrap().0.is_empty());
+    let frozen = catalog.dedup_baseline_paths(std::iter::once(&scope));
+
+    fs::hard_link(&original, &arrival).unwrap();
+    fs::write(&fresh, b"new archive bytes").unwrap();
+    fs::hard_link(&fresh, &fresh_alias).unwrap();
+    assert!(options.catalog_refresh(&catalog, &scope, None).unwrap().0.is_empty());
+    let existing = crate::path_keys::path_key(original.to_str().unwrap());
+    let refreshed = catalog.dedup_baseline_paths(std::iter::once(&scope));
+    assert!(frozen.contains(existing.as_str()));
+    for path in [arrival, fresh, fresh_alias] {
+        let late = crate::path_keys::path_key(path.to_str().unwrap());
+        assert!(refreshed.contains(late.as_str()));
+        assert!(!frozen.contains(late.as_str()));
+        fs::remove_file(path).unwrap();
+    }
+    fs::remove_file(original).unwrap();
+    fs::remove_dir(root).unwrap();
+}
+
+#[test]
 fn queued_relation_probe_does_not_block_same_root_promotion() {
     use super::*;
     use crate::io::resource_lifecycle::Promotion;

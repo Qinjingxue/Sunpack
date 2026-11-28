@@ -414,14 +414,10 @@ fn walk_inner(
 }
 #[repr(C)]
 #[derive(Default)]
-pub(crate) struct DecodeResult {
-    pub(crate) input_bytes: u64,
-    pub(crate) output_bytes: u64,
-    pub(crate) frames: u64,
-    pub(crate) skippable_frames: u64,
-    pub(crate) content_checked_frames: u64,
-    pub(crate) block_checked_frames: u64,
-    pub(crate) error: i32,
+struct DecodeResult {
+    input_bytes: u64,
+    output_bytes: u64,
+    frames: u64,
 }
 pub(crate) fn decode_into<R: Read, W: std::io::Write>(reader: R, writer: W) -> std::io::Result<()> {
     struct State<R, W> {

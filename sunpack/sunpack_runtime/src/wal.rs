@@ -29,8 +29,8 @@ pub(crate) fn file_header(kind: Kind) -> [u8; 16] {
     let version: u16 = match kind {
         // Task persistence includes the flatten intent and relocation payload.
         Kind::TaskWal | Kind::TaskSnapshot => 2,
-        // Dedup keeps exact source paths and the ordered logical archive boundaries.
-        Kind::DedupWal => 4,
+        // Dedup derives last-write time from the saved physical generation.
+        Kind::DedupWal => 5,
         _ => 1,
     };
     header[4..6].copy_from_slice(&version.to_le_bytes());
@@ -131,17 +131,17 @@ impl<R: Read + Seek> Reader<R> {
             payload: Vec::new().into(),
         })
     }
-    pub fn next(&mut self) -> io::Result<Option<u64>> {
+    pub fn next(&mut self, checkpoint: Option<u64>) -> io::Result<Option<u64>> {
         // The caller consumed the previous transaction. Release its allocation
         // or mapping before building another, including on EOF and failure.
         self.payload = Vec::new().into();
-        if self.torn || self.valid_end == self.end {
+        if self.torn {
             return Ok(None);
         }
         let mut cursor = self.valid_end;
         let mut payload = Spool::default();
         let mut sequence = None;
-        loop {
+        while cursor < self.end {
             if self.end - cursor < FRAME_HEADER_BYTES as u64 {
                 self.torn = true;
                 return Ok(None);
@@ -160,6 +160,9 @@ impl<R: Read + Seek> Reader<R> {
                 self.torn = true;
                 return Ok(None);
             }
+            // The snapshot already represents this transaction. Still check
+            // its framing and checksum without assembling or spilling it.
+            let retain = checkpoint.is_none_or(|checkpoint| seq > checkpoint);
             let mut hash = Hasher::new();
             hash.update(&header[..12]);
             let mut remaining = len;
@@ -173,7 +176,9 @@ impl<R: Read + Seek> Reader<R> {
                 }
                 let take = remaining.min(buffer.len());
                 hash.update(&buffer[..take]);
-                payload.write_all(&buffer[..take])?;
+                if retain {
+                    payload.write_all(&buffer[..take])?;
+                }
                 self.input.consume(take);
                 remaining -= take;
             }
@@ -182,11 +187,18 @@ impl<R: Read + Seek> Reader<R> {
             }
             cursor += (FRAME_HEADER_BYTES + len) as u64;
             if framed_len & MORE == 0 {
-                self.payload = payload.finish()?;
+                if retain {
+                    self.payload = payload.finish()?;
+                    self.valid_end = cursor;
+                    return Ok(Some(seq));
+                }
                 self.valid_end = cursor;
-                return Ok(sequence);
+                sequence = None;
             }
         }
+        // EOF inside a multi-fragment transaction is still a torn tail.
+        self.torn = sequence.is_some();
+        Ok(None)
     }
 }
 

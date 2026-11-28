@@ -11,9 +11,7 @@ enum sup_lz4_error {
     SUP_LZ4_CHECKSUM, SUP_LZ4_UNSUPPORTED, SUP_LZ4_MEMORY, SUP_LZ4_CANCELLED
 };
 typedef struct {
-    uint64_t input_bytes, output_bytes, frames, skippable_frames;
-    uint64_t content_checked_frames, block_checked_frames;
-    int error;
+    uint64_t input_bytes, output_bytes, frames;
 } sup_lz4_result;
 
 /* All callbacks belong to one invocation; no process-global decoder state.
@@ -25,6 +23,12 @@ typedef int (*sup_lz4_write)(void *, const void *, size_t);
 typedef int (*sup_lz4_progress)(void *, uint64_t, uint64_t);
 typedef void *(*sup_lz4_allocate)(void *, size_t);
 typedef void (*sup_lz4_free)(void *, void *);
+typedef struct sup_lz4_reader sup_lz4_reader;
+sup_lz4_reader *sup_lz4_reader_open(void *opaque, sup_lz4_read read, sup_lz4_result *result,
+    sup_lz4_allocate allocate, sup_lz4_free release);
+/* Read decoded bytes. A successful nonzero-size read returns zero bytes only at EOF. */
+int sup_lz4_reader_read(sup_lz4_reader *reader, void *out, size_t capacity, size_t *written);
+void sup_lz4_reader_close(sup_lz4_reader *reader);
 int sup_lz4_decode(void *opaque, sup_lz4_read read, sup_lz4_skip skip,
     sup_lz4_write write, sup_lz4_progress progress, sup_lz4_result *result);
 int sup_lz4_decode_with_memory(void *opaque, sup_lz4_read read, sup_lz4_skip skip,

@@ -2,6 +2,19 @@ use super::*;
 use std::sync::mpsc;
 use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
+fn read_u32(input: &mut impl Read) -> io::Result<u32> {
+    let mut word = [0; 4];
+    input.read_exact(&mut word)?;
+    Ok(u32::from_be_bytes(word))
+}
+
+fn read_field(input: &mut impl Read, len: usize) -> io::Result<Vec<u8>> {
+    assert!(len <= MAX_FIELD);
+    let mut output = vec![0; len];
+    input.read_exact(&mut output)?;
+    Ok(output)
+}
+
 #[test]
 fn persistent_idle_can_be_disabled_and_reenabled_by_configuration() {
     let host = Host::new();
@@ -377,9 +390,7 @@ fn status_stream_is_passive_and_disconnect_releases_subscription() {
     let length = read_u32(&mut client).unwrap() as usize;
     let bytes = read_field(&mut client, length).unwrap();
     let status: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert!(status["running"].is_boolean());
-    assert!(status["enabled"].is_boolean());
-    assert!(status["phase"].is_string());
+    assert_eq!(status, serde_json::json!({"running":false,"enabled":false,"phase":"stopped"}));
     {
         let activity = server.activity.lock().unwrap();
         assert_eq!(activity.active, 1);

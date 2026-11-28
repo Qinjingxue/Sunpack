@@ -22,7 +22,9 @@ public:
         std::size_t minimum_grant = 1) noexcept;
     void release(std::size_t count) noexcept;
 
+#ifdef SUP7Z_DEBUG
     std::size_t reserved_credits() const noexcept;
+#endif
     bool can_acquire_base() const noexcept;
 
 private:

@@ -38,13 +38,13 @@ impl NativeJournalTicket {
         }
     }
 
-    fn wait_for(&self, goal: TicketGoal) -> Result<(), String> {
+    fn wait_for(&self, goal: TicketGoal) -> Result<u64, String> {
         self.shared.wait_for(&self.stream, self.seq, goal)
     }
 }
 
 impl Shared {
-    fn wait_for(&self, id: &Arc<StreamId>, seq: u64, goal: TicketGoal) -> Result<(), String> {
+    fn wait_for(&self, id: &Arc<StreamId>, seq: u64, goal: TicketGoal) -> Result<u64, String> {
         let mut state = lock_state(self);
         loop {
             let live = state.streams.get(id.key.as_ref()).filter(|stream| Arc::ptr_eq(&stream.id, id));
@@ -59,7 +59,7 @@ impl Shared {
                 TicketGoal::Sealed => frontier.sealed_seq,
             };
             if reached >= seq {
-                return Ok(());
+                return Ok(frontier.written_bytes);
             }
             if live.is_none() {
                 return Err("Watch journal stream closed before the requested frontier".to_string());
@@ -75,6 +75,7 @@ impl Shared {
 #[derive(Default)]
 struct StreamFrontier {
     written_seq: u64,
+    written_bytes: u64,
     durable_seq: u64,
     sealed_seq: u64,
     error: Option<String>,
@@ -101,6 +102,10 @@ impl NativeJournalStream {
 
     fn id(&self) -> &Arc<StreamId> {
         self.stream.as_ref().expect("open Watch journal stream")
+    }
+
+    pub(crate) fn owns(&self, ticket: &NativeJournalTicket) -> bool {
+        Arc::ptr_eq(self.id(), &ticket.stream)
     }
 
     pub(crate) fn submit_task_append(
@@ -180,28 +185,18 @@ impl Drop for NativeJournalStream {
 
 impl NativeJournalTicket {
     pub(crate) fn wait(&self) -> std::io::Result<()> {
-        (self.wait_for(self.goal)).map_err(std::io::Error::other)
+        self.wait_for(self.goal).map(|_| ()).map_err(io::Error::other)
     }
 
-    pub(crate) fn wait_appends(tickets: &[Self]) -> io::Result<u64> {
-        let Some((last, previous)) = tickets.split_last() else {
-            return Ok(0);
-        };
-        // A task's deferred appends share one stream and are sequenced at
-        // submission. Only the latest written and durable targets matter.
-        if matches!(last.goal, TicketGoal::Written) {
-            if let Some(durable) = previous
-                .iter()
-                .rfind(|ticket| matches!(ticket.goal, TicketGoal::Durable))
-            {
-                durable.wait()?;
-            }
+    pub(crate) fn requires_durability(&self) -> bool {
+        matches!(self.goal, TicketGoal::Durable)
+    }
+
+    pub(crate) fn wait_append(&self, durable: Option<&Self>) -> io::Result<u64> {
+        if !self.requires_durability() {
+            if let Some(durable) = durable { durable.wait()?; }
         }
-        last.wait()?;
-        Ok(tickets
-            .iter()
-            .map(Self::bytes_written)
-            .fold(0u64, u64::saturating_add))
+        self.wait_for(self.goal).map_err(io::Error::other)
     }
 
     fn bytes_written(&self) -> u64 {
@@ -224,7 +219,6 @@ struct StreamState {
     frontier: StreamFrontier,
     requested_seq: u64,
     segments: BTreeMap<u64, SegmentState>,
-    has_written: bool,
     #[cfg(test)]
     write_calls: u64,
     #[cfg(test)]
@@ -242,7 +236,6 @@ impl StreamState {
             frontier: StreamFrontier::default(),
             requested_seq: 0,
             segments: BTreeMap::new(),
-            has_written: false,
             #[cfg(test)]
             write_calls: 0,
             #[cfg(test)]
@@ -286,10 +279,6 @@ enum WriterCommand {
         old_start: u64,
         boundary: u64,
     },
-    #[cfg(test)]
-    Barrier {
-        done: mpsc::Sender<()>,
-    },
 }
 
 struct JournalRuntime {
@@ -331,7 +320,7 @@ impl JournalRuntime {
             .map_err(|_| "native Watch journal release barrier failed".to_string())?;
         // The flusher retires the last owner's stream under the same state
         // lock that publishes durability, so this also waits for retirement.
-        self.shared.wait_for(&stream, target, TicketGoal::Durable)
+        self.shared.wait_for(&stream, target, TicketGoal::Durable).map(|_| ())
     }
 
     fn start() -> Arc<Self> {
@@ -371,8 +360,9 @@ impl JournalRuntime {
             TicketGoal::Written
         };
         let mut ticket = NativeJournalTicket::new(self.shared.clone(), stream.clone(), seq, goal);
-        let bytes_written = Arc::new(AtomicU64::new(0));
-        ticket.bytes_written = Some(Arc::clone(&bytes_written));
+        let bytes_written = matches!(&operations, JournalPayload::Catalog(_))
+            .then(|| Arc::new(AtomicU64::new(0)));
+        ticket.bytes_written = bytes_written.clone();
         self.writer_tx
             .send(WriterCommand::Append(AppendWorkItem {
                 stream: stream.clone(),
@@ -441,7 +431,7 @@ impl JournalRuntime {
             .get_mut(stream)
             .filter(|stream| stream.owners != 0)
             .ok_or("Watch journal stream is unavailable")?;
-        if !stream_state.has_written && stream_state.segments.is_empty() {
+        if stream_state.frontier.written_bytes == 0 && stream_state.segments.is_empty() {
             stream_state.frontier.written_seq = stream_state.frontier.written_seq.max(seq);
             stream_state.frontier.durable_seq = stream_state.frontier.durable_seq.max(seq);
             stream_state.requested_seq = stream_state.requested_seq.max(stream_state.frontier.durable_seq);
@@ -455,38 +445,6 @@ impl JournalRuntime {
         Ok(())
     }
 
-    #[cfg(test)]
-    fn barrier(&self) -> Result<(), String> {
-        let (tx, rx) = mpsc::channel();
-        self.writer_tx
-            .send(WriterCommand::Barrier { done: tx })
-            .map_err(|_| "native Watch journal writer is unavailable".to_string())?;
-        rx.recv()
-            .map_err(|_| "native Watch journal writer barrier failed".to_string())
-    }
-
-    #[cfg(test)]
-    fn flush_all(&self) -> Result<(), String> {
-        self.barrier()?;
-        let targets = {
-            let mut state = lock_state(&self.shared);
-            let mut targets = Vec::with_capacity(state.streams.len());
-            for stream in state.streams.values_mut() {
-                let target = stream.frontier.written_seq;
-                stream.requested_seq = stream.requested_seq.max(target);
-                targets.push((stream.id.clone(), target));
-            }
-            self.shared.cv.notify_all();
-            targets
-        };
-
-        // Keep each captured incarnation, including its retired outcome. A
-        // concurrent close/reopen must not erase errors or replace our target.
-        for (stream, target) in targets {
-            self.shared.wait_for(&stream, target, TicketGoal::Durable)?;
-        }
-        Ok(())
-    }
 }
 
 static JOURNAL_RUNTIME: OnceLock<Arc<JournalRuntime>> = OnceLock::new();
@@ -627,7 +585,7 @@ struct AppendWorkItem {
     seq: u64,
     operations: JournalPayload,
     durable: bool,
-    bytes_written: Arc<AtomicU64>,
+    bytes_written: Option<Arc<AtomicU64>>,
 }
 
 fn write_append_batch(shared: &Shared, batch: &[AppendWorkItem]) -> io::Result<()> {
@@ -661,13 +619,15 @@ fn write_append_batch(shared: &Shared, batch: &[AppendWorkItem]) -> io::Result<(
         if item.operations.kind() != first.operations.kind() {
             return Err(wal::invalid("mixed WAL types"));
         }
-        let start = payload.len()?;
+        let start = item.bytes_written.as_ref().map(|_| payload.len()).transpose()?;
         wal::append_frame(&mut payload, &mut frame_buffer, item.seq, |out| {
             item.operations.encode(out)
         })?;
-        // Only a ticket that reached its written/durable frontier reads this count.
-        item.bytes_written
-            .store(payload.len()? - start, Ordering::Release);
+        if let Some((bytes, start)) = item.bytes_written.as_ref().zip(start) {
+            // The catalog needs its individual frame size. Task consumers
+            // share the stream's cumulative counter instead.
+            bytes.store(payload.len()? - start, Ordering::Release);
+        }
         if item.durable {
             requested = item.seq;
         }
@@ -681,6 +641,7 @@ fn write_append_batch(shared: &Shared, batch: &[AppendWorkItem]) -> io::Result<(
         &first.path,
         first.operations.kind(),
     )?;
+    let written_bytes = payload.len()?;
     file.write_shared(&payload.finish()?)?;
 
     let mut state = lock_state(shared);
@@ -699,7 +660,7 @@ fn write_append_batch(shared: &Shared, batch: &[AppendWorkItem]) -> io::Result<(
         segment.last_seq = last_seq;
     }
     stream_state.frontier.written_seq = last_seq;
-    stream_state.has_written = true;
+    stream_state.frontier.written_bytes = stream_state.frontier.written_bytes.saturating_add(written_bytes);
     #[cfg(test)]
     {
         stream_state.write_calls += 1;
@@ -828,10 +789,6 @@ fn writer_loop(shared: Arc<Shared>, rx: mpsc::Receiver<WriterCommand>) {
                     continue;
                 }
                 shared.cv.notify_all();
-            }
-            #[cfg(test)]
-            WriterCommand::Barrier { done } => {
-                let _ = done.send(());
             }
         }
     }

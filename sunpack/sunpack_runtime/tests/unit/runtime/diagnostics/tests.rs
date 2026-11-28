@@ -29,7 +29,7 @@ fn runtime_events_are_published_and_drained_without_watch_tasks() {
     // Owner calls, not CLI dispatch: these transitions also cover non-CLI
     // callers and must each produce their own ignored lifecycle event.
     assert_eq!(watch.stop().unwrap()["stopped"], false);
-    assert_eq!(watch.reload().unwrap()["running"], false);
+    assert_eq!(crate::pipeline::block_on(watch.reload_async()).unwrap()["running"], false);
     log.finish("idle");
     let manifest: crate::io::display_store::Manifest = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     assert_eq!(manifest.runs.iter().map(|run| run.count).sum::<u64>(), 6);

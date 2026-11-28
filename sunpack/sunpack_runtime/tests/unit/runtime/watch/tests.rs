@@ -26,7 +26,7 @@ fn cancelling_watch_status_removes_only_the_cancelled_waiter() {
     assert!(second.as_mut().poll(&mut cx).is_pending());
     cancelled.cancel();
     assert_eq!(wake_count.0.load(Ordering::Relaxed), 1);
-    assert_eq!(watch.status.waiters.lock().unwrap().len(), 1);
+    assert_eq!(watch.status.waiters.wakers.lock().unwrap().len(), 1);
     assert!(matches!(first.as_mut().poll(&mut cx), Poll::Ready(Err(_))));
     watch.status.notify();
     assert_eq!(wake_count.0.load(Ordering::Relaxed), 2);
@@ -804,6 +804,9 @@ fn content_batches_do_not_invalidate_topology_but_overflow_does() {
     signals.changes.root_changed("root-a", [(PathBuf::from("root-a/archive.zip"), PathChange::default())]);
     assert_eq!(signals.changes.topology_roots, HashSet::from(["root-a".to_owned()]));
     assert_eq!(signals.changes.changed_roots["root-a"].len(), 1);
+    let path = PathBuf::from("root-a/archive.zip");
+    signals.changes.root_changed("root-b", [(path.clone(), PathChange { modified_only: true, ..PathChange::default() })]);
+    assert!(!signals.changes.paths[&path].modified_only);
 }
 
 #[test]
@@ -1391,28 +1394,39 @@ fn concurrent_stop_keeps_the_draining_generation_visible_to_start() {
     use std::task::Context;
     let watch = Watch::new(Arc::new(|| {}));
     let hub = Arc::new(Hub::new());
-    let completion = Arc::new(RunCompletion::default());
-    let finished = FinishRun(Arc::clone(&completion));
+    let finished = FinishRun(Arc::clone(&hub));
     let worker_hub = Arc::clone(&hub);
     let (release, released) = mpsc::channel();
+    let (completion_sent, completion_seen) = mpsc::channel();
+    let (finish_epilogue, epilogue_finished) = mpsc::channel();
     let worker = thread::spawn(move || {
         worker_hub.wait(None);
         released.recv().unwrap();
-        finished.0.complete(&Ok(()));
+        finished.complete(&Ok(()));
+        completion_sent.send(()).unwrap();
+        epilogue_finished.recv().unwrap();
         Ok(())
     });
     watch.generation.store(4, Ordering::Relaxed);
-    *watch.running.lock().unwrap() = Some(Running { hub, thread: worker, completion });
+    *watch.running.lock().unwrap() = Some(Running { hub: Arc::clone(&hub), thread: worker });
     let mut first = Box::pin(watch.stop_async());
     let mut second = Box::pin(watch.stop_async());
     let mut cx = Context::from_waker(Waker::noop());
     assert!(first.as_mut().poll(&mut cx).is_pending());
     assert!(second.as_mut().poll(&mut cx).is_pending());
+    let mut cancelled = Box::pin(watch.stop_async());
+    assert!(cancelled.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(hub.completion.waiters.wakers.lock().unwrap().len(), 3);
+    drop(cancelled);
+    assert_eq!(hub.completion.waiters.wakers.lock().unwrap().len(), 2);
     // A missing worker path also proves start never tries to spawn/handshake.
     let start = block_on(watch.start_async(Path::new("."),
         Arc::new(Engine::new(PathBuf::from("unused-worker"))), false)).unwrap();
     assert_eq!(start, json!({"running":true,"started":false,"generation":4}));
     release.send(()).unwrap();
+    completion_seen.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(!watch.is_running());
+    finish_epilogue.send(()).unwrap();
     for response in [block_on(first).unwrap(), block_on(second).unwrap()] {
         assert_eq!(response, json!({"running":false,"stopped":true,"generation":4}));
     }
@@ -1420,11 +1434,36 @@ fn concurrent_stop_keeps_the_draining_generation_visible_to_start() {
 }
 
 #[test]
+fn watch_thread_panic_releases_pending_replies_and_wakes_host() {
+    let (wake, woke) = mpsc::channel();
+    let watch = Watch::new(Arc::new(move || wake.send(()).unwrap()));
+    let mut hub = Hub::new();
+    hub.status = Arc::clone(&watch.status);
+    hub.wake_host = Some(Arc::clone(&watch.wake_host));
+    let hub = Arc::new(hub);
+    let (reply, result) = command_reply();
+    hub.queue_reload(Some(reply));
+    let revision = watch.status_revision();
+    let finished = FinishRun(Arc::clone(&hub));
+    let worker = thread::spawn(move || {
+        let _finished = finished;
+        panic!("Watch service failed before handling its queued command")
+    });
+    *watch.running.lock().unwrap() = Some(Running { hub, thread: worker });
+
+    woke.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_ne!(watch.status_revision(), revision);
+    assert!(!watch.is_running());
+    assert_eq!(block_on(result.wait()).unwrap_err().kind(), io::ErrorKind::Interrupted);
+    assert_eq!(watch.stop().unwrap()["stopped"], false);
+    assert!(watch.running.lock().unwrap().is_none());
+}
+
+#[test]
 fn asynchronous_reload_and_stop_release_the_shared_control_driver() {
     let watch = Arc::new(Watch::new(Arc::new(|| {})));
     let hub = Arc::new(Hub::new());
-    let completion = Arc::new(RunCompletion::default());
-    let finished = FinishRun(Arc::clone(&completion));
+    let finished = FinishRun(Arc::clone(&hub));
     let worker_hub = Arc::clone(&hub);
     let (entered, entering) = mpsc::channel();
     let (release, released) = mpsc::channel();
@@ -1435,10 +1474,10 @@ fn asynchronous_reload_and_stop_release_the_shared_control_driver() {
         // A disappearing service must wake an async reply even without send.
         drop(pending);
         worker_hub.wait(None);
-        finished.0.complete(&Ok(()));
+        finished.complete(&Ok(()));
         Ok(())
     });
-    *watch.running.lock().unwrap() = Some(Running { hub, thread: worker, completion });
+    *watch.running.lock().unwrap() = Some(Running { hub, thread: worker });
     let engine = Engine::new(PathBuf::from("unused-worker"));
     let caller = Arc::clone(&watch);
     let reload = engine.spawn_control(Origin::Foreground, &Cancellation::new(), async move { caller.reload_async().await }).unwrap();
@@ -1460,8 +1499,7 @@ fn root_apply_ack_accepts_observer_first_noop_but_not_apply_failure() {
     let watch = Watch::new(Arc::new(|| {}));
     let hub = Arc::new(Hub::new());
     let worker_hub = Arc::clone(&hub);
-    let completion = Arc::new(RunCompletion::default());
-    let finished = FinishRun(Arc::clone(&completion));
+    let finished = FinishRun(Arc::clone(&hub));
     let worker = thread::spawn(move || {
         let finished = finished;
         for result in [Ok(false), Ok(false), Err(io::Error::other("apply failed")), Err(io::Error::other("apply failed"))] {
@@ -1470,16 +1508,16 @@ fn root_apply_ack_accepts_observer_first_noop_but_not_apply_failure() {
             signals.reload_waiters.into_iter().next().unwrap().send(result);
         }
         worker_hub.wait(None);
-        finished.0.complete(&Ok(()));
+        finished.complete(&Ok(()));
         Ok(())
     });
-    *watch.running.lock().unwrap() = Some(Running { hub, thread: worker, completion });
+    *watch.running.lock().unwrap() = Some(Running { hub, thread: worker });
     // FileObserver already applied the write: explicit reload is a
     // successful no-op, but the changed root command was still applied.
     assert_eq!(block_on(watch.root_change_status(true, true)).unwrap(), Some((true, 0)));
-    assert_eq!(watch.reload().unwrap()["reloaded"], false);
+    assert_eq!(block_on(watch.reload_async()).unwrap()["reloaded"], false);
     assert_eq!(block_on(watch.root_change_status(true, true)).unwrap_err().to_string(), "apply failed");
-    assert_eq!(watch.reload().unwrap()["reloaded"], false);
+    assert_eq!(block_on(watch.reload_async()).unwrap()["reloaded"], false);
     assert_eq!(block_on(watch.root_change_status(true, false)).unwrap(), Some((false, 0)));
     watch.stop().unwrap();
 }
@@ -1490,16 +1528,15 @@ fn stopping_watch_allows_worker_foreground_callbacks() {
     let hub = Arc::new(Hub::new());
     let worker_hub = Arc::clone(&hub);
     let worker_watch = Arc::clone(&watch);
-    let completion = Arc::new(RunCompletion::default());
-    let finished = FinishRun(Arc::clone(&completion));
+    let finished = FinishRun(Arc::clone(&hub));
     let worker = thread::spawn(move || {
         let finished = finished;
         worker_hub.wait(None);
         worker_watch.foreground_finished(|| {});
-        finished.0.complete(&Ok(()));
+        finished.complete(&Ok(()));
         Ok(())
     });
-    *watch.running.lock().unwrap() = Some(Running { hub, thread: worker, completion });
+    *watch.running.lock().unwrap() = Some(Running { hub, thread: worker });
     let (send, receive) = mpsc::channel();
     let stop = thread::spawn(move || {
         let _ = send.send(watch.stop());
@@ -1618,13 +1655,16 @@ fn admission_counts_unfinished_candidates_not_batches_or_claimed_members() {
             max_depth: usize::MAX,
             deep: false, root: String::new(), recovery: None, password_scope: base.clone(),
             passwords: Arc::default(),
-            inputs: names.into_iter().map(|path| (watch_path_key(&path), WatchCandidateRow {
-                path, size: 1, mtime: 1.0,
-                observation: crate::filesystem::WatchFileObservation {
-                    file_id: String::new(), change_usn: 0, change_reasons: None,
+            inputs: names.into_iter().map(|path| (watch_path_key(&path), AdmittedInput {
+                candidate: WatchCandidateRow {
+                    path, size: 1, mtime: 1.0,
+                    observation: crate::filesystem::WatchFileObservation {
+                        file_id: String::new(), change_usn: 0, change_reasons: None,
+                    },
                 },
+                quiet: quiet::Activity::default(),
             })).collect(),
-            quiet: HashMap::new(), dirty: HashSet::new(), cancel,
+            dirty: HashSet::new(), cancel,
             groups: Arc::default(), claimed: Arc::default(), toast: None, request,
         }
     };
@@ -1654,6 +1694,7 @@ fn admission_counts_unfinished_candidates_not_batches_or_claimed_members() {
         let mut claimed = scheduler.active["first"].claimed.lock().unwrap();
         claimed.capture(&group.members).unwrap();
         claimed.capture(&names[2..3]).unwrap();
+        claimed.finished.extend(group.members.iter().map(|member| (watch_path_key(member), false)));
     }
     let root = || RootCompleted {
         request: 1,
@@ -1669,6 +1710,7 @@ fn admission_counts_unfinished_candidates_not_batches_or_claimed_members() {
         let claimed = scheduler.active["first"].claimed.lock().unwrap();
         assert_eq!(claimed.candidates.len(), 1);
         assert!(claimed.candidates.contains_key(&watch_path_key(&names[2])));
+        assert!(claimed.finished.is_empty());
     }
     drop(block_on(scheduler.engine.reserve_foreground_async(&reserved[..2], &cancel))
         .expect("the completed root and its final alias must be immediately available to the foreground"));
@@ -1848,7 +1890,7 @@ fn root_handoff_preserves_alias_aggregates_and_live_shared_tail_owners() {
     let root = hub.wait(None).roots.into_iter().next().unwrap();
     assert_eq!(root.groups[&key(alias)].path, head);
     assert_eq!(root.completed.outputs.len(), 1);
-    assert!(observer.claimed.lock().unwrap().finished.contains(&key(alias)));
+    assert!(observer.claimed.lock().unwrap().finished.contains_key(&key(alias)));
     let outcome = root.completed.result.unwrap();
     root.reply.complete(Ok(Outcome::default()));
     assert!(matches!(early.as_mut().poll(&mut Context::from_waker(&waker)), Poll::Ready(Ok(_))));
@@ -1878,8 +1920,8 @@ fn root_handoff_preserves_alias_aggregates_and_live_shared_tail_owners() {
     assert_eq!(root.completed.outputs.len(), 1);
     assert_eq!(observer.groups.lock().unwrap().roots[&key(other)].path, other);
     assert_eq!(observer.outputs.lock().unwrap().paths.len(), 1);
-    assert!(!observer.claimed.lock().unwrap().finished.contains(&key(alias)));
-    assert!(observer.claimed.lock().unwrap().finished.contains(&key(head)));
+    assert!(!observer.claimed.lock().unwrap().finished.contains_key(&key(alias)));
+    assert!(observer.claimed.lock().unwrap().finished.contains_key(&key(head)));
     root.reply.complete(root.completed.result);
     let Poll::Ready(result) = future.as_mut().poll(&mut Context::from_waker(&waker)) else {
         panic!("disabled notifications must not enqueue a report wait");

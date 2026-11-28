@@ -49,11 +49,16 @@ impl Drop for ActivityInner {
 
 impl Activities {
     pub(super) fn bind(self: &Arc<Self>, key: &str, make: impl FnOnce() -> Activity) -> Activity {
+        if let Some(inner) = self.0.lock().unwrap().get(key).and_then(std::sync::Weak::upgrade) {
+            return Activity(inner);
+        }
+        // Initializing from the catalog can wait for inventory publication.
+        // Only the same path's winning registration needs to share its sample.
+        let activity = make();
         let mut entries = self.0.lock().unwrap();
         if let Some(inner) = entries.get(key).and_then(std::sync::Weak::upgrade) {
             return Activity(inner);
         }
-        let activity = make();
         let key = Arc::<str>::from(key);
         activity.0.registration.get_or_init(|| (Arc::clone(&key), Arc::downgrade(self)));
         entries.insert(key, std::sync::Arc::downgrade(&activity.0));

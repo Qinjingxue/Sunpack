@@ -28,52 +28,24 @@ const CACHE_ORDER_COMPACT_STALE_MIN: usize = 64;
 static NEXT_SOURCE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
-enum CachedBacking {
-    Shared(Arc<[u8]>),
-    Owned(Arc<Vec<u8>>),
-}
-
-impl Deref for CachedBacking {
-    type Target = [u8];
-
-    fn deref(&self) -> &Self::Target {
-        match self {
-            Self::Shared(data) => data,
-            Self::Owned(data) => data,
-        }
-    }
-}
-
-#[derive(Clone)]
 pub(crate) struct CachedSlice {
-    data: CachedBacking,
+    data: Arc<Vec<u8>>,
     start: usize,
     end: usize,
 }
 
 impl CachedSlice {
-    fn from_shared(data: Arc<[u8]>, start: usize, end: usize) -> Self {
-        Self {
-            data: CachedBacking::Shared(data),
-            start,
-            end,
-        }
+    fn from_shared(data: Arc<Vec<u8>>, start: usize, end: usize) -> Self {
+        Self { data, start, end }
     }
 
     fn from_vec(data: Vec<u8>) -> Self {
         let end = data.len();
-        Self {
-            data: CachedBacking::Owned(Arc::new(data)),
-            start: 0,
-            end,
-        }
+        Self::from_shared(Arc::new(data), 0, end)
     }
 
     fn retained_bytes(&self) -> usize {
-        match &self.data {
-            CachedBacking::Shared(data) => data.len(),
-            CachedBacking::Owned(data) => data.capacity(),
-        }
+        self.data.capacity()
     }
 
     fn slice(&self, start: usize, len: usize) -> Self {
@@ -86,11 +58,7 @@ impl CachedSlice {
 
     #[cfg(test)]
     fn shares_backing(&self, other: &Self) -> bool {
-        match (&self.data, &other.data) {
-            (CachedBacking::Shared(left), CachedBacking::Shared(right)) => Arc::ptr_eq(left, right),
-            (CachedBacking::Owned(left), CachedBacking::Owned(right)) => Arc::ptr_eq(left, right),
-            _ => false,
-        }
+        Arc::ptr_eq(&self.data, &other.data)
     }
 }
 
@@ -849,6 +817,15 @@ pub(crate) struct PhysicalFileGeneration {
 
 impl PhysicalFileGeneration {
     #[cfg(windows)]
+    pub(crate) fn modified_seconds(&self) -> f64 {
+        const UNIX_EPOCH_TICKS: i64 = 116_444_736_000_000_000;
+        const TICKS_PER_SECOND: u64 = 10_000_000;
+        let ticks = self.windows.write_time.saturating_sub(UNIX_EPOCH_TICKS).max(0) as u64;
+        std::time::Duration::new(ticks / TICKS_PER_SECOND, ((ticks % TICKS_PER_SECOND) * 100) as u32)
+            .as_secs_f64()
+    }
+
+    #[cfg(windows)]
     pub(crate) fn worker_stamp(&self) -> [u64; 4] {
         let id = self.windows.file_id;
         [self.windows.volume, u64::from_le_bytes(id[..8].try_into().unwrap()),
@@ -1010,7 +987,7 @@ impl BlockLoad {
 }
 
 enum BlockLoadClaim {
-    Cached(Arc<[u8]>),
+    Cached(Arc<Vec<u8>>),
     Owned(Arc<BlockLoad>),
     Waiting(Arc<BlockLoad>),
 }
@@ -1020,7 +997,7 @@ impl FileSource {
         &self,
         offset: u64,
         len: usize,
-        mut consume: impl FnMut(Arc<[u8]>, std::ops::Range<usize>),
+        mut consume: impl FnMut(Arc<Vec<u8>>, std::ops::Range<usize>),
     ) -> io::Result<()> {
         let request_end = offset + len as u64;
         let first = offset / BLOCK_SIZE as u64;
@@ -1207,7 +1184,7 @@ enum CacheTier {
 }
 
 struct CacheEntry {
-    data: Arc<[u8]>,
+    data: Arc<Vec<u8>>,
     tier: CacheTier,
     generation: u64,
 }
@@ -1215,6 +1192,8 @@ struct CacheEntry {
 // Small or empty blocks also own metadata. Charge the cleanup index per
 // block even when several blocks share its canonical path and set.
 const CACHE_BLOCK_METADATA_BYTES: usize = size_of::<CacheEntry>()
+    + size_of::<Vec<u8>>()
+    + 2 * size_of::<usize>() // Arc reference counts
     + size_of::<BlockKey>()
     + size_of::<(BlockKey, u64)>()
     + size_of::<(u64, CachedSource)>()
@@ -1285,9 +1264,9 @@ impl CacheShard {
         &mut self,
         key: BlockKey,
         path: &Arc<Path>,
-        data: Arc<[u8]>,
+        data: Arc<Vec<u8>>,
         tier: CacheTier,
-    ) -> Arc<[u8]> {
+    ) -> Arc<Vec<u8>> {
         if let Some(existing) = self.entries.get(&key) {
             return Arc::clone(&existing.data);
         }
@@ -1310,7 +1289,7 @@ impl CacheShard {
             },
         );
         let queue = self.queue(tier);
-        queue.bytes += data.len();
+        queue.bytes += data.capacity();
         queue.order.push_back((key, generation));
 
         while self.queue(tier).over_budget() {
@@ -1327,7 +1306,7 @@ impl CacheShard {
     fn remove_entry(&mut self, key: &BlockKey, source_removed: bool) {
         let entry = self.entries.remove(key).expect("tracked cache entry");
         let queue = self.queue(entry.tier);
-        queue.bytes -= entry.data.len();
+        queue.bytes -= entry.data.capacity();
         queue.stale += usize::from(source_removed);
 
         if !source_removed {
@@ -1514,7 +1493,7 @@ impl ReaderManager {
         Ok(())
     }
 
-    fn read_block(&self, source: &FileSource, index: u64) -> io::Result<Arc<[u8]>> {
+    fn read_block(&self, source: &FileSource, index: u64) -> io::Result<Arc<Vec<u8>>> {
         let key = BlockKey::new(source, index);
         let tier = cache_tier(source, index);
 
@@ -1534,7 +1513,7 @@ impl ReaderManager {
                     let len = BLOCK_SIZE.min(source.len().saturating_sub(offset) as usize);
                     let result = source.with_file(|file| {
                         let data = read_file_at(file, offset, len)?;
-                        self.insert_block(source, key, Arc::from(data), tier)
+                        self.insert_block(source, key, Arc::new(data), tier)
                     });
                     let finish_result = self.finish_block_load(source, index, &load);
                     return match result {
@@ -1552,7 +1531,7 @@ impl ReaderManager {
         }
     }
 
-    fn cached_block(&self, key: &BlockKey) -> io::Result<Option<Arc<[u8]>>> {
+    fn cached_block(&self, key: &BlockKey) -> io::Result<Option<Arc<Vec<u8>>>> {
         let shard_index = cache_shard_index(key);
         let shard = self.cache_shards[shard_index]
             .lock()
@@ -1565,9 +1544,9 @@ impl ReaderManager {
         &self,
         source: &FileSource,
         key: BlockKey,
-        data: Arc<[u8]>,
+        data: Arc<Vec<u8>>,
         tier: CacheTier,
-    ) -> io::Result<Arc<[u8]>> {
+    ) -> io::Result<Arc<Vec<u8>>> {
         let shard_index = cache_shard_index(&key);
         let mut shard = self.cache_shards[shard_index]
             .lock()
@@ -1801,6 +1780,9 @@ fn read_file_at(file: &File, offset: u64, len: usize) -> io::Result<Vec<u8>> {
         THREAD_PHYSICAL_READS.with(|reads| reads.set(reads.get() + 1));
         let count = positional_read(file, &mut data[read..], offset + read as u64)?;
         if count == 0 {
+            if read == 0 {
+                return Ok(Vec::new());
+            }
             data.truncate(read);
             break;
         }

@@ -59,8 +59,19 @@ impl Hash128 {
         }
     }
 
+    pub(crate) fn hex_digest(&self) -> [u8; 32] {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut output = [0; 32];
+        let bytes = self.0.iter().flat_map(|state| state.digest().to_be_bytes());
+        for (pair, byte) in output.chunks_exact_mut(2).zip(bytes) {
+            pair[0] = HEX[(byte >> 4) as usize];
+            pair[1] = HEX[(byte & 15) as usize];
+        }
+        output
+    }
+
     pub(crate) fn hexdigest(&self) -> String {
-        format!("{:016x}{:016x}", self.0[0].digest(), self.0[1].digest())
+        String::from_utf8(self.hex_digest().to_vec()).expect("hex digits are valid UTF-8")
     }
 }
 

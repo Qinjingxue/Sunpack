@@ -142,17 +142,17 @@ enum WatchSnapshotMode {
 }
 
 /// Observe a file before admission, while its writer may still be open.
-pub(crate) fn watch_observed_file_snapshot(
+pub(crate) fn watch_observed_file_snapshot<T>(
     path: &Path,
     since_usn: Option<i64>,
     report_absent: bool,
-    before_identity: impl FnOnce() -> io::Result<()>,
-) -> io::Result<Option<WatchFileSnapshot<()>>> {
+    capture: impl FnOnce(&File, &std::fs::Metadata) -> io::Result<T>,
+) -> io::Result<Option<WatchFileSnapshot<T>>> {
     watch_file_snapshot(
         path,
         since_usn,
         WatchSnapshotMode::Observe { report_absent },
-        |_, _| before_identity(),
+        capture,
     ).map(WatchSnapshotResult::into_option)
 }
 

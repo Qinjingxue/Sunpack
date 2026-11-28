@@ -463,21 +463,18 @@ namespace sunpack::sevenzip
             // handle owned while prefetch setup can still allocate.
             std::unique_ptr<void, decltype(&CloseHandle)> handle_owner(
                 handle_ == INVALID_HANDLE_VALUE ? nullptr : handle_, &CloseHandle);
-            LARGE_INTEGER size{};
-            if (handle_ != INVALID_HANDLE_VALUE && GetFileSizeEx(handle_, &size))
-            {
-                size_ = static_cast<UInt64>(size.QuadPart);
-            }
-
             if (handle_ == INVALID_HANDLE_VALUE)
                 record_input_error(trace_, path_, open_hresult_);
 
-            if (size_ && prefetch_config.enabled)
+            LARGE_INTEGER size{};
+            if (prefetch_config.enabled && prefetch_config.window_bytes && handle_ != INVALID_HANDLE_VALUE &&
+                GetFileSizeEx(handle_, &size) && size.QuadPart > 0)
             {
-                prefetch_ = std::make_unique<OverlappedPrefetcher>(prefetch_config, size_,
-                    [this](UInt64 offset, PrefetchSource &source)
+                const auto bytes = static_cast<UInt64>(size.QuadPart);
+                prefetch_ = std::make_unique<OverlappedPrefetcher>(prefetch_config, bytes,
+                    [this, bytes](UInt64 offset, PrefetchSource &source)
                     {
-                        source = PrefetchSource{&path_, offset, size_ - offset};
+                        source = PrefetchSource{&path_, offset, bytes - offset};
                         return true;
                     }, trace_);
             }
@@ -583,25 +580,29 @@ namespace sunpack::sevenzip
 
         HRESULT STDMETHODCALLTYPE Seek(Int64 offset, UInt32 seekOrigin, UInt64 *newPosition) SUP7Z_NOEXCEPT override
         {
-
-            LARGE_INTEGER distance{};
-
-            distance.QuadPart = offset;
-
-            LARGE_INTEGER new_pos{};
-            // FILE_CURRENT is relative to the decoder's logical position, not
-            // the possibly stale file pointer after prefetched reads.
-            BOOL positioned = TRUE;
-            if (file_pointer_dirty_ && seekOrigin == FILE_CURRENT)
+            if (seekOrigin == FILE_CURRENT && handle_ != INVALID_HANDLE_VALUE)
             {
-                LARGE_INTEGER logical_position{};
-                logical_position.QuadPart = static_cast<LONGLONG>(position_);
-                positioned = SetFilePointerEx(handle_, logical_position, nullptr, FILE_BEGIN);
+                if (offset == 0)
+                {
+                    if (newPosition) *newPosition = position_;
+                    return S_OK;
+                }
+                // After prefetch the kernel cursor may lag behind the
+                // decoder. Seek straight to the logical destination.
+                if (file_pointer_dirty_)
+                {
+                    const auto base = static_cast<Int64>(position_);
+                    if (offset < -base || offset > (std::numeric_limits<Int64>::max)() - base)
+                        return publish_named_volume_error(volume_error_, HRESULT_FROM_WIN32(ERROR_NEGATIVE_SEEK));
+                    offset += base;
+                    seekOrigin = FILE_BEGIN;
+                }
             }
-            if (positioned)
-                positioned = SetFilePointerEx(handle_, distance, &new_pos, seekOrigin);
 
-            if (!positioned) return publish_named_volume_error(volume_error_, HRESULT_FROM_WIN32(GetLastError()));
+            LARGE_INTEGER distance{}, new_pos{};
+            distance.QuadPart = offset;
+            if (!SetFilePointerEx(handle_, distance, &new_pos, seekOrigin))
+                return publish_named_volume_error(volume_error_, HRESULT_FROM_WIN32(GetLastError()));
 
             const UInt64 prior_position = position_;
             position_ = static_cast<UInt64>(new_pos.QuadPart);
@@ -631,8 +632,6 @@ namespace sunpack::sevenzip
         HRESULT open_hresult_ = S_OK;
 
         UInt64 position_ = 0;
-
-        UInt64 size_ = 0;
 
         bool file_pointer_dirty_ = false;
         std::unique_ptr<OverlappedPrefetcher> prefetch_;
@@ -1152,12 +1151,12 @@ namespace sunpack::sevenzip
         std::wstring callback_path;
         bool opened;
 
-        std::wstring handler_callback_path(bool zip, ArchiveOpenMode mode) const
+        std::wstring take_handler_callback_path(bool zip, ArchiveOpenMode mode)
         {
             // ZIP uses the callback name to infer disk roles before reading
             // the directory. Only a resolved named-volume plan supplies them.
             if (zip && !uses_named_volume_streams(mode)) return {};
-            return callback_path;
+            return std::move(callback_path);
         }
     };
 

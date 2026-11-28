@@ -4,8 +4,14 @@ use super::*;
 fn shared_samples_survive_coalescing_and_retire_with_the_last_owner() {
     use std::sync::Arc;
     let registry = Arc::new(Activities::default());
-    let owner = registry.bind("path", Activity::default);
-    let signal = registry.bind("path", Activity::default);
+    let mut owner = None;
+    let signal = registry.bind("path", || {
+        assert!(registry.0.try_lock().is_ok());
+        owner = Some(registry.bind("path", Activity::default));
+        Activity::default()
+    });
+    let owner = owner.unwrap();
+    assert!(Arc::ptr_eq(&owner.0, &signal.0));
     let now = Instant::now();
     let mut candidate = WatchCandidateRow {
         path: "path".into(), size: 100, mtime: 0.0,

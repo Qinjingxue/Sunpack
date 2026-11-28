@@ -11,6 +11,7 @@ use serde::ser::SerializeSeq;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ops::Bound::{Included, Unbounded};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -38,7 +39,7 @@ impl Serialize for PathSet {
 impl<'de> Deserialize<'de> for PathSet {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let paths = Vec::<String>::deserialize(deserializer)?;
-        Ok(Self(paths.into_iter().map(|p| (path_key(&p), p)).collect()))
+        Ok(Self(paths.into_iter().map(|p| (watch_path_key(&p), p)).collect()))
     }
 }
 impl PathSet {
@@ -46,42 +47,32 @@ impl PathSet {
         self.0.values()
     }
     pub(crate) fn contains(&self, path: &str) -> bool {
-        self.0.contains_key(&path_key(path))
+        self.0.contains_key(&watch_path_key(path))
     }
     fn covers(&self, path: &str) -> bool {
-        let key = path_key(path);
-        let mut ancestor = key.as_str();
-        loop {
-            if self.0.contains_key(ancestor) {
-                return true;
-            }
-            let Some((parent, _)) = ancestor.rsplit_once('\\') else {
-                return false;
-            };
-            ancestor = parent;
-        }
+        let key = watch_path_key(path);
+        self.covers_key(&key)
     }
-    fn remove_under(&mut self, path: &str) -> Vec<String> {
-        let key = path_key(path);
-        let mut removed: Vec<_> = self
-            .0
-            .extract_if(descendant_key_range(&key), |_, _| true)
+    fn covers_key(&self, key: &str) -> bool {
+        std::iter::successors(Some(key), |ancestor| ancestor.rsplit_once('\\').map(|(parent, _)| parent))
+            .any(|ancestor| self.0.contains_key(ancestor))
+    }
+    fn drain_under(&mut self, key: &str) -> impl Iterator<Item = String> + '_ {
+        let root = self.0.remove(key);
+        self.0.extract_if(descendant_key_range(key), |_, _| true)
             .map(|(_, path)| path)
-            .collect();
-        if let Some(path) = self.0.remove(&key) {
-            removed.push(path);
-        }
-        removed
+            .chain(root)
     }
     fn insert(&mut self, path: String) {
-        self.0.insert(path_key(&path), path);
+        self.0.insert(watch_path_key(&path), path);
     }
     fn retain_root(&mut self, path: &str) -> Vec<String> {
-        if self.covers(path) {
+        let key = watch_path_key(path);
+        if self.covers_key(&key) {
             return Vec::new();
         }
-        let removed = self.remove_under(path);
-        self.insert(path.to_owned());
+        let removed = self.drain_under(&key).collect();
+        self.0.insert(key, path.to_owned());
         removed
     }
 }
@@ -180,41 +171,37 @@ impl PendingRecord {
                 identity,
             } => {
                 self.active_outputs.remove(task, output);
+                let output_key = watch_path_key(output);
                 let removed = if *keep {
                     let remaining = self.active_outputs.0.get(task);
-                    if path_key(task) != path_key(&self.path)
+                    if watch_path_key(task) != watch_path_key(&self.path)
                         && remaining.is_none()
                     {
                         self.completed_sources.insert(task.clone());
                     }
-                    let output_key = path_key(output);
                     let mut removed = self.committed_roots.retain_root(output);
                     // Once a segment commits, its enclosing active carrier is
                     // no longer disposable. Unfinished siblings remain active
                     // and can still be removed individually on recovery.
                     for parent in remaining.into_iter().flatten() {
-                        if is_path_under(&output_key, &path_key(parent)) {
+                        if is_path_under(&output_key, &watch_path_key(parent)) {
                             removed.extend(self.committed_roots.retain_root(parent));
                         }
                     }
                     removed
                 } else {
-                    self.completed_sources.remove_under(output);
-                    self.committed_roots.remove_under(output)
+                    self.completed_sources.drain_under(&output_key).for_each(drop);
+                    self.committed_roots.drain_under(&output_key).collect()
                 };
-                if let Some(identity) = identity {
-                    self.output_identities
-                        .insert(output.clone(), identity.clone());
+                let retained = |path: &str| self.committed_roots.contains(path)
+                    || self.active_outputs.values().any(|value| value == path);
+                for path in removed.iter().filter(|path| path.as_str() != output && !retained(path)) {
+                    self.output_identities.remove(path);
                 }
-                for path in removed
-                    .iter()
-                    .chain(std::iter::once(output))
-                {
-                    if !self.committed_roots.contains(path)
-                        && !self.active_outputs.values().any(|p| p == path)
-                    {
-                        self.output_identities.remove(path);
-                    }
+                if !retained(output) {
+                    self.output_identities.remove(output);
+                } else if let Some(identity) = identity {
+                    self.output_identities.insert(output.clone(), identity.clone());
                 }
             }
             OutputChange::Relocate {
@@ -230,9 +217,9 @@ impl PendingRecord {
                 sources,
             } => {
                 self.durable_owner = true;
-                let source_keys: Vec<_> = sources.iter().map(|p| path_key(p)).collect();
+                let source_keys: Vec<_> = sources.iter().map(|p| watch_path_key(p)).collect();
                 for output in self.active_outputs.values() {
-                    let root = path_key(output);
+                    let root = watch_path_key(output);
                     if source_keys
                         .iter()
                         .any(|key| *key == root || is_path_under(key, &root))
@@ -249,11 +236,11 @@ impl PendingRecord {
     }
 
     fn apply_output_relocation(&mut self, source: &str, leaf: &str, destination: &str, identity: &str) {
-        let source_key = path_key(source);
-        let leaf_key = path_key(leaf);
+        let source_key = watch_path_key(source);
+        let leaf_key = watch_path_key(leaf);
         let leaf_depth = Path::new(leaf).components().count();
         let relocate = |path: &str| {
-            let key = path_key(path);
+            let key = watch_path_key(path);
             if key == leaf_key {
                 destination.to_owned()
             } else if is_path_under(&key, &leaf_key) {
@@ -270,10 +257,12 @@ impl PendingRecord {
             }
         };
         self.active_outputs.relocate(&relocate);
-        for path in self.committed_roots.remove_under(source) {
+        let committed: Vec<_> = self.committed_roots.drain_under(&source_key).collect();
+        for path in committed {
             self.committed_roots.retain_root(&relocate(&path));
         }
-        for path in self.completed_sources.remove_under(source) {
+        let completed: Vec<_> = self.completed_sources.drain_under(&source_key).collect();
+        for path in completed {
             self.completed_sources.insert(relocate(&path));
         }
         // Remove the source receipts before inserting any rebased path, since
@@ -380,9 +369,48 @@ pub(crate) struct Cursor {
     pub(crate) next_usn: i128,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PendingObservation(pub String, pub i64, pub f64, pub String, pub i64);
 
 pub(crate) type PendingUpdate = (PendingObservation, String, Option<Arc<Map<String, Value>>>);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingRefresh {
+    update: PendingUpdate,
+    password_scope_dir: String,
+    force: bool,
+    internal_recovery: bool,
+}
+
+impl PendingRefresh {
+    fn apply(&self, record: &mut PendingRecord) {
+        let (PendingObservation(path, size, mtime, file_id, change_usn), root, scope) = &self.update;
+        if !self.password_scope_dir.is_empty() {
+            record.password_scope_dir.clone_from(&self.password_scope_dir);
+        } else if record.password_scope_dir.is_empty() {
+            record.password_scope_dir = Path::new(path)
+                .parent()
+                .and_then(Path::to_str)
+                .unwrap_or_default()
+                .to_owned();
+        }
+        if !root.is_empty() {
+            record.source_input_root.clone_from(root);
+        }
+        if let Some(scope) = scope.as_ref().filter(|scope| !scope.is_empty()) {
+            record.discovery_scope = Arc::clone(scope);
+        }
+        record.path.clone_from(path);
+        record.size = *size;
+        record.mtime = *mtime;
+        record.file_id.clone_from(file_id);
+        record.change_usn = *change_usn;
+        record.force = self.force;
+        record.internal_recovery |= self.internal_recovery;
+        record.durable_owner = true;
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Collection {
@@ -399,6 +427,7 @@ pub(crate) const SOURCE_DELETE_PREFIX: &str = "delete-source|";
 enum Operation {
     Output(String, OutputChange),
     PutPending(String, Arc<PendingRecord>),
+    ObservePending(String, Box<PendingRefresh>),
     PutEntry(String, Arc<EntryRecord>),
     Delete(Collection, String),
     SetMetadata(i64, String),
@@ -412,6 +441,7 @@ impl Serialize for Operation {
         match self {
             Self::Output(key, change) => (7u8, key, change).serialize(serializer),
             Self::PutPending(_, record) => (0u8, record).serialize(serializer),
+            Self::ObservePending(_, refresh) => (9u8, refresh).serialize(serializer),
             Self::PutEntry(_, record) => (1u8, record).serialize(serializer),
             Self::Delete(Collection::Pending, key) => (2u8, key).serialize(serializer),
             Self::Delete(Collection::Entries, key) => (3u8, key).serialize(serializer),
@@ -447,11 +477,11 @@ impl<'de> Deserialize<'de> for Operation {
                 let op = match tag {
                     0 => {
                         let record: Arc<PendingRecord> = field(&mut seq)?;
-                        Operation::PutPending(path_key(&record.path), record)
+                        Operation::PutPending(watch_path_key(&record.path), record)
                     }
                     1 => {
                         let record: Arc<EntryRecord> = field(&mut seq)?;
-                        Operation::PutEntry(path_key(&record.path), record)
+                        Operation::PutEntry(watch_path_key(&record.path), record)
                     }
                     2 | 3 | 8 => {
                         let key: String = field(&mut seq)?;
@@ -486,6 +516,11 @@ impl<'de> Deserialize<'de> for Operation {
                         Operation::Runtime(key, field(&mut seq)?)
                     }
                     7 => Operation::Output(field(&mut seq)?, field(&mut seq)?),
+                    9 => {
+                        let refresh: Box<PendingRefresh> = field(&mut seq)?;
+                        let (PendingObservation(path, ..), _, _) = &refresh.update;
+                        Operation::ObservePending(crate::path_keys::path_key(path), refresh)
+                    }
                     _ => return Err(A::Error::custom("unknown operation opcode")),
                 };
                 if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
@@ -518,6 +553,11 @@ pub(crate) struct StateData {
 }
 
 impl StateData {
+    fn runtime_prefix<'a>(&'a self, prefix: &'a str) -> impl Iterator<Item = (&'a String, &'a Arc<Value>)> {
+        self.runtime.range::<str, _>((Included(prefix), Unbounded))
+            .take_while(move |(key, _)| key.starts_with(prefix))
+    }
+
     fn owns_volume_check(&self, key: &str, entry: &EntryRecord) -> bool {
         entry.waits_for_volume()
             && self.entries.get(key).is_some_and(|current| std::ptr::eq(current.as_ref(), entry))
@@ -547,7 +587,7 @@ impl StateData {
                     ..
                 } = change
                 {
-                    let output_key = path_key(output);
+                    let output_key = watch_path_key(output);
                     let retired: Vec<_> = self
                         .runtime
                         .range("flatten|".to_owned()..)
@@ -555,11 +595,11 @@ impl StateData {
                         .filter(|(_, record)| {
                             record["owner"]
                                 .as_str()
-                                .is_some_and(|p| path_key(p) == *key)
+                                .is_some_and(|p| watch_path_key(p) == *key)
                                 && ["root", "work"].iter().any(|field| {
                                     record[*field]
                                         .as_str()
-                                        .is_some_and(|p| path_key(p) == output_key)
+                                        .is_some_and(|p| watch_path_key(p) == output_key)
                                 })
                         })
                         .map(|(runtime_key, _)| runtime_key.clone())
@@ -580,6 +620,16 @@ impl StateData {
             }
             Operation::PutPending(key, record) => {
                 self.pending.insert(key.clone(), Arc::clone(record));
+            }
+            Operation::ObservePending(key, refresh) => {
+                // Preserve output changes already applied at this WAL position.
+                if let Some(record) = self.pending.get_mut(key) {
+                    refresh.apply(Arc::make_mut(record));
+                } else {
+                    let mut record = PendingRecord::default();
+                    refresh.apply(&mut record);
+                    self.pending.insert(key.clone(), Arc::new(record));
+                }
             }
             Operation::PutEntry(key, record) => {
                 let previous = self.entries.insert(key.clone(), Arc::clone(record));
@@ -628,10 +678,10 @@ impl StateData {
 
     fn retire_continuation(&mut self, id: &str) {
         if self.runtime.remove(id).is_none() { return; }
-        let prefix = continuation_output_key(id, "");
-        let paths: Vec<_> = self.runtime.range(prefix.clone()..)
-            .take_while(|(key, _)| key.starts_with(&prefix)).map(|(key, _)| key.clone()).collect();
-        for key in paths { self.runtime.remove(&key); }
+        let start = continuation_output_key(id, "");
+        // The ASCII '}' immediately follows the output key's '|' separator.
+        let end = format!("{CONTINUATION_OUTPUT_PREFIX}{id}}}");
+        for _ in self.runtime.extract_if(start..end, |_, _| true) {}
     }
 }
 
@@ -650,7 +700,7 @@ impl NativeWatchOperations {
     }
 
     pub(crate) fn exclude_recovery_files(owner: &str, paths: Vec<String>) -> Self {
-        Self(vec![Operation::Output(path_key(owner), OutputChange::ExcludeRecovery { paths })])
+        Self(vec![Operation::Output(watch_path_key(owner), OutputChange::ExcludeRecovery { paths })])
     }
 
     pub(crate) fn finished_output_identity(&self) -> Option<&str> {
@@ -669,13 +719,13 @@ impl NativeWatchOperations {
         identity: String,
     ) {
         self.0.push(Operation::Output(
-            path_key(owner),
+            watch_path_key(owner),
             OutputChange::Relocate { source, leaf, destination, identity },
         ));
     }
 
     pub(crate) fn put_entry(&mut self, entry: Arc<EntryRecord>) {
-        self.0.push(Operation::PutEntry(path_key(&entry.path), entry));
+        self.0.push(Operation::PutEntry(watch_path_key(&entry.path), entry));
     }
 
     pub(crate) fn finish_pending(&mut self, path: &str, entry: Option<Arc<EntryRecord>>) {
@@ -687,7 +737,7 @@ impl NativeWatchOperations {
     }
 
     fn finish_pending_as(&mut self, path: &str, entry: Option<Arc<EntryRecord>>, collection: Collection) {
-        let key = path_key(path);
+        let key = watch_path_key(path);
         let retry = match entry {
             Some(entry) => Operation::PutEntry(key.clone(), entry),
             None => Operation::Delete(collection, key.clone()),
@@ -769,7 +819,7 @@ where
             let mut records = HashMap::with_capacity(seq.size_hint().unwrap_or(0).min(4096));
             while let Some(record) = seq.next_element::<T>()? {
                 if records
-                    .insert(path_key(record.path()), Arc::new(record))
+                    .insert(watch_path_key(record.path()), Arc::new(record))
                     .is_some()
                 {
                     return Err(serde::de::Error::custom("duplicate state record"));
@@ -840,7 +890,7 @@ pub(crate) struct NativeWatchReplay {
     pub(crate) applied_seq: u64,
     pub(crate) records: u64,
     pub(crate) bytes: u64,
-    pub(crate) valid_bytes: u64,
+    pub(crate) truncate_to: Option<u64>,
 }
 
 fn entry_event(record: &EntryRecord) -> Value {
@@ -899,13 +949,13 @@ impl NativeWatchState {
                     members.retain(|member| {
                         member.as_str().is_some_and(|member| {
                             !*member_presence
-                                .entry(path_key(member))
+                                .entry(watch_path_key(member))
                                 .or_insert_with(|| recorded_file_is_absent(member))
                         })
                     });
                     if members.len() != count {
                         crate::event_log::retain_waiting_members(&mut status, |member|
-                            !member_presence.get(&path_key(member)).copied().unwrap_or(false));
+                            !member_presence.get(&watch_path_key(member)).copied().unwrap_or(false));
                     }
                     if !members.is_empty() {
                         rows.push(serde_json::json!({"event":"pipeline_sources_claimed","groups":[group]}));
@@ -954,7 +1004,7 @@ impl NativeWatchState {
                         .flatten()
                         .filter_map(Value::as_str)
                         .chain(std::iter::once(record.path.as_str()))
-                        .filter_map(|member| data.entries.get(&path_key(member)))
+                        .filter_map(|member| data.entries.get(&watch_path_key(member)))
                         .max_by(|a, b| a.last_attempt_at.total_cmp(&b.last_attempt_at));
                     if let Some(record) = remaining {
                         notifications.push(Notification::Blocked(Arc::clone(record)));
@@ -1015,55 +1065,28 @@ impl NativeWatchState {
     ) -> NativeWatchOperations {
         let recovery_batch = cursors.is_some();
         let mut operations = Vec::with_capacity(1);
-        for (PendingObservation(path, size, mtime, file_id, change_usn), root, scope) in updates {
-            let key = crate::path_keys::path_key(&path);
-            let previous = {
-                let data = self.lock();
-                let previous = data.pending.get(&key);
-                // The cursor barrier also covers previously persisted observations.
-                if recovery_batch
-                    && previous.is_some_and(|record| {
-                        record.durable_owner
-                            && record.size == size
-                            && record.mtime == mtime
-                            && record.file_id == file_id
-                            && record.change_usn == change_usn
-                            && record.force == force
-                            && (root.is_empty() || record.source_input_root == root)
-                            && scope
-                                .as_ref()
-                                .is_none_or(|scope| record.discovery_scope == *scope)
-                    })
-                {
-                    continue;
-                }
-                previous.cloned()
-            };
-            let mut record = previous.as_deref().cloned().unwrap_or_default();
-            if !password_scope_dir.is_empty() {
-                record.password_scope_dir = password_scope_dir.to_owned();
-            } else if record.password_scope_dir.is_empty() {
-                record.password_scope_dir = Path::new(&path)
-                    .parent()
-                    .and_then(Path::to_str)
-                    .unwrap_or_default()
-                    .to_owned();
+        for update in updates {
+            let (PendingObservation(path, size, mtime, file_id, change_usn), root, scope) = &update;
+            let key = crate::path_keys::path_key(path);
+            // The cursor barrier also covers previously persisted observations.
+            if recovery_batch && self.lock().pending.get(&key).is_some_and(|record| {
+                record.durable_owner
+                    && record.size == *size
+                    && record.mtime == *mtime
+                    && record.file_id == *file_id
+                    && record.change_usn == *change_usn
+                    && record.force == force
+                    && (root.is_empty() || record.source_input_root == *root)
+                    && scope.as_ref().is_none_or(|scope| record.discovery_scope == *scope)
+            }) {
+                continue;
             }
-            if !root.is_empty() {
-                record.source_input_root = root;
-            }
-            if let Some(scope) = scope.filter(|scope| !scope.is_empty()) {
-                record.discovery_scope = scope;
-            }
-            record.path = path;
-            record.size = size;
-            record.mtime = mtime;
-            record.file_id = file_id;
-            record.change_usn = change_usn;
-            record.force = force;
-            record.internal_recovery |= internal_recovery;
-            record.durable_owner = true;
-            operations.push(Operation::PutPending(key, Arc::new(record)));
+            operations.push(Operation::ObservePending(key, Box::new(PendingRefresh {
+                update,
+                password_scope_dir: password_scope_dir.to_owned(),
+                force,
+                internal_recovery,
+            })));
         }
         if let Some(cursors) = cursors {
             let mut merged = self.lock().cursors.clone();
@@ -1078,7 +1101,7 @@ impl NativeWatchState {
         owner: &str,
         sources: Vec<String>,
     ) -> Option<NativeWatchOperations> {
-        let key = path_key(owner);
+        let key = watch_path_key(owner);
         self.lock()
             .pending
             .contains_key(&key)
@@ -1100,7 +1123,7 @@ impl NativeWatchState {
         if exclusive && keep.is_some() {
             return Err(invalid("output registration requires a start"));
         }
-        let key = path_key(owner);
+        let key = watch_path_key(owner);
         {
             let data = self.lock();
             let Some(record) = data.pending.get(&key) else {
@@ -1192,13 +1215,21 @@ impl NativeWatchState {
         self.lock().runtime.get(key).cloned()
     }
 
+    pub(crate) fn take_source_cleanup(&self, key: &str) -> Option<Arc<Value>> {
+        debug_assert!(key.starts_with(SOURCE_DELETE_PREFIX));
+        self.lock().runtime.remove(key)
+    }
+
     pub(crate) fn runtime_keys(&self, prefix: &str) -> Vec<String> {
-        self.lock()
-            .runtime
-            .range(prefix.to_owned()..)
-            .take_while(|(key, _)| key.starts_with(prefix))
-            .map(|(key, _)| key.clone())
-            .collect()
+        self.project_runtime(prefix, |key, _| Some(key.to_owned()))
+    }
+
+    pub(crate) fn project_runtime<T>(
+        &self,
+        prefix: &str,
+        mut project: impl FnMut(&str, &Arc<Value>) -> Option<T>,
+    ) -> Vec<T> {
+        self.lock().runtime_prefix(prefix).filter_map(|(key, value)| project(key, value)).collect()
     }
 
     pub(crate) fn owns_path(&self, path: &str) -> bool {
@@ -1230,11 +1261,11 @@ impl NativeWatchState {
     }
 
     pub(crate) fn pending(&self, path: &str) -> Option<Arc<PendingRecord>> {
-        self.lock().pending.get(&path_key(path)).cloned()
+        self.lock().pending.get(&watch_path_key(path)).cloned()
     }
 
     pub(crate) fn entry(&self, path: &str) -> Option<Arc<EntryRecord>> {
-        self.entry_by_key(&path_key(path))
+        self.entry_by_key(&watch_path_key(path))
     }
 
     pub(crate) fn entry_by_key(&self, key: &str) -> Option<Arc<EntryRecord>> {
@@ -1265,7 +1296,7 @@ impl NativeWatchState {
         let mut data = self.lock();
         if data.volume_checks.is_empty() { return revision; }
         for path in paths {
-            if let Some(check) = data.volume_checks.get_mut(&path_key(path)) {
+            if let Some(check) = data.volume_checks.get_mut(&watch_path_key(path)) {
                 if let Some(plan) = check.prepared.take() {
                     revision = revision.min(check.revision);
                     plans.push(plan);
@@ -1330,7 +1361,7 @@ impl NativeWatchState {
                         .keys()
                         .chain(record.active_outputs.values())
                         .chain(record.committed_roots.iter())
-                        .map(|path| path_key(path))
+                        .map(|path| watch_path_key(path))
                 })
                 .map(|mut key| {
                     key.truncate(key.trim_end_matches('\\').len());
@@ -1349,7 +1380,7 @@ impl NativeWatchState {
                             .get("source_input_root")
                             .and_then(Value::as_str)
                             .filter(|_| record.failure_payload.contains_key("discovery_scope"))
-                            .is_some_and(|root| scope_roots.contains_key(path_key(root).trim_end_matches('\\')))
+                            .is_some_and(|root| scope_roots.contains_key(watch_path_key(root).trim_end_matches('\\')))
                         && !data.pending.contains_key(*key)
                         && !crate::path_keys::path_ancestors(key)
                             .any(|ancestor| recovery_roots.contains(ancestor))
@@ -1435,36 +1466,30 @@ impl NativeWatchState {
     }
 
     /// Replace the maps with the snapshot at ``path``.
-    pub(crate) fn load_snapshot(&self, path: String) -> std::io::Result<u64> {
-        let (checkpoint_seq, data) = (load_snapshot_file(&path))?;
+    pub(crate) fn load_snapshot(&self, path: &Path) -> std::io::Result<u64> {
+        let (checkpoint_seq, data) = load_snapshot_file(path)?;
         *self.lock() = data;
         Ok(checkpoint_seq)
     }
 
     /// Replay already established this boundary while holding the path gate.
-    pub(crate) fn truncate_journal_tail(path: String, valid_bytes: u64) -> std::io::Result<()> {
-        (|| -> std::io::Result<()> {
-            let file = TrackedFile::open_with(&path, |options| {
-                options.read(true).write(true);
-            })?;
-            if file.metadata()?.len() != valid_bytes {
-                file.set_len(valid_bytes)?;
-                file.sync_all()?;
-            }
-            Ok(())
-        })()
+    pub(crate) fn truncate_journal_tail(path: &Path, valid_bytes: u64) -> std::io::Result<()> {
+        let file = TrackedFile::open_with(path, |options| {
+            options.read(true).write(true);
+        })?;
+        file.set_len(valid_bytes)?;
+        file.sync_all()
     }
 
     /// Apply one journal segment after ``checkpoint_seq``; errors carry the WAL diagnosis.
     pub(crate) fn replay_segment(
         &self,
-
-        path: String,
+        path: &Path,
         checkpoint_seq: u64,
         expected_seq: u64,
     ) -> std::io::Result<NativeWatchReplay> {
         let mut data = self.lock();
-        let result = replay_segment_file(&mut data, &path, checkpoint_seq, expected_seq);
+        let result = replay_segment_file(&mut data, path, checkpoint_seq, expected_seq);
         data.trim_retired_storage();
         result
     }
@@ -1472,10 +1497,6 @@ impl NativeWatchState {
 
 /// Absolute Windows filesystem key shared with discovery.
 pub(crate) fn watch_path_key(path: &str) -> String {
-    path_key(path)
-}
-
-fn path_key(path: &str) -> String {
     let absolute = if path.is_empty() {
         std::env::current_dir().unwrap_or_default()
     } else {
@@ -1493,14 +1514,14 @@ fn invalid(message: impl Into<String>) -> std::io::Error {
     std::io::Error::other(message.into())
 }
 
-fn load_snapshot_file(path: &str) -> std::io::Result<(u64, StateData)> {
+fn load_snapshot_file(path: &Path) -> std::io::Result<(u64, StateData)> {
     let file = TrackedFile::open(path)?;
     let (checkpoint_seq, snapshot): (_, SnapshotInput) =
         wal::read_snapshot(file, Kind::TaskSnapshot)
-            .map_err(|error| invalid(format!("corrupt watch state snapshot at {path}: {error}")))?;
+            .map_err(|error| invalid(format!("corrupt watch state snapshot at {}: {error}", path.display())))?;
     if snapshot.password_generation < 0 {
         return Err(invalid(format!(
-            "corrupt watch state snapshot at {path}: negative password_generation"
+            "corrupt watch state snapshot at {}: negative password_generation", path.display()
         )));
     }
     let password_generation = snapshot.password_generation;
@@ -1524,32 +1545,29 @@ fn load_snapshot_file(path: &str) -> std::io::Result<(u64, StateData)> {
 
 fn replay_segment_file(
     data: &mut StateData,
-    path: &str,
+    path: &Path,
     checkpoint_seq: u64,
     mut expected_seq: u64,
 ) -> std::io::Result<NativeWatchReplay> {
-    let diagnose = |error| invalid(format!("corrupt watch state journal at {path}: {error}"));
+    let diagnose = |error| invalid(format!("corrupt watch state journal at {}: {error}", path.display()));
     let file = TrackedFile::open(path)?;
     let mut reader = wal::Reader::new(file, Kind::TaskWal).map_err(diagnose)?;
     let mut replay = NativeWatchReplay {
         applied_seq: 0,
         records: 0,
         bytes: 0,
-        valid_bytes: 0,
+        truncate_to: None,
     };
-    while let Some(seq) = reader.next().map_err(diagnose)? {
+    while let Some(seq) = reader.next(Some(checkpoint_seq)).map_err(diagnose)? {
         let decoded: Vec<Operation> = wal::decode(&reader.payload).map_err(|error| {
-            invalid(format!("invalid watch state operation at {path}: {error}"))
+            invalid(format!("invalid watch state operation at {}: {error}", path.display()))
         })?;
         if decoded.is_empty() {
-            return Err(invalid(format!("invalid watch state operations at {path}")));
-        }
-        if seq <= checkpoint_seq {
-            continue;
+            return Err(invalid(format!("invalid watch state operations at {}", path.display())));
         }
         if seq != expected_seq {
             return Err(invalid(format!(
-                "non-contiguous watch state sequence at {path}: expected {expected_seq}, got {seq}"
+                "non-contiguous watch state sequence at {}: expected {expected_seq}, got {seq}", path.display()
             )));
         }
         for operation in &decoded {
@@ -1562,7 +1580,7 @@ fn replay_segment_file(
         replay.records += 1;
         replay.bytes += (wal::FRAME_HEADER_BYTES + reader.payload.len()) as u64;
     }
-    replay.valid_bytes = reader.valid_end;
+    replay.truncate_to = reader.torn.then_some(reader.valid_end);
     Ok(replay)
 }
 

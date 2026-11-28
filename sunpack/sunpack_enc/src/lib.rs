@@ -356,17 +356,6 @@ pub struct Decoder {
     encrypted_end: u64,
     framing_error: Option<Error>,
 }
-struct CpuLease<'a, F: FnMut(usize)> {
-    extra: usize,
-    release: &'a mut F,
-}
-impl<F: FnMut(usize)> Drop for CpuLease<'_, F> {
-    fn drop(&mut self) {
-        if self.extra != 0 {
-            (self.release)(self.extra);
-        }
-    }
-}
 impl Decoder {
     /// Final KDF joins all licensed helpers before reading recovery framing.
     fn open_with_budget<R: Read + Seek>(
@@ -400,36 +389,6 @@ impl Decoder {
             return 0;
         }
         self.encrypted_end - PREFIX - CHECK
-    }
-    /// Authenticate and decrypt through one budget-aware path. The caller owns
-    /// one base credit; grant zero extras for serial computation. A fixed budget
-    /// can grant `wanted.min(credits.saturating_sub(1))` with a no-op release.
-    pub fn decrypt_with_budget<R: Read + Seek, W: Write>(
-        &self,
-        input: &mut R,
-        output: &mut W,
-        mut acquire: impl FnMut(usize) -> usize,
-        mut release: impl FnMut(usize),
-        progress: impl FnMut(u64) -> Result<()>,
-    ) -> Result<()> {
-        self.decrypt(
-            input,
-            output,
-            |cipher, offset, bytes, wanted| {
-                let wanted = if wanted == 0 {
-                    0
-                } else {
-                    wanted.min(rayon::current_num_threads().saturating_sub(1))
-                };
-                let extra = if wanted == 0 { 0 } else { acquire(wanted) };
-                let _lease = CpuLease {
-                    extra,
-                    release: &mut release,
-                };
-                cipher.apply_with_threads(offset, bytes, 1 + extra.min(wanted), None);
-            },
-            progress,
-        )
     }
     fn decrypt<R: Read + Seek, W: Write>(
         &self,

@@ -31,72 +31,34 @@ fn journal_frontiers_do_not_revive_closed_streams() {
 }
 
 #[test]
-fn global_flush_keeps_the_original_stream_outcome_after_retirement() {
-    // Ticket tests do not cover the global flush snapshot. Coordinate the
-    // retirement after admission without sleeps or real storage failures.
-    let mut outcomes = Vec::new();
-    for reopen in [false, true] {
-        for failed in [false, true] {
-            let shared = Arc::new(Shared::new());
-            let (writer_tx, writer_rx) = mpsc::channel();
-            let runtime = JournalRuntime {
-                shared: shared.clone(),
-                writer_tx,
-            };
-            let key: Arc<str> = "stream".into();
-            lock_state(&shared).streams.insert(
-                key.clone(),
-                StreamState {
-                    owners: 1,
-                    frontier: StreamFrontier { written_seq: 1, ..Default::default() },
-                    ..StreamState::new(key.clone())
-                },
-            );
-            let flush = thread::spawn(move || runtime.flush_all());
-            let WriterCommand::Barrier { done } = writer_rx.recv().unwrap() else {
-                panic!("expected the flush barrier");
-            };
-            done.send(()).unwrap();
-
-            let mut state = lock_state(&shared);
-            while state.streams["stream"].requested_seq != 1 {
-                state = shared.cv.wait(state).unwrap();
-            }
-            let stream = state.streams.get_mut("stream").unwrap();
-            stream.owners = 0;
-            if failed {
-                stream.frontier.error = Some("old stream failed".to_string());
-            } else {
-                stream.frontier.durable_seq = 1;
-            }
-            retire_closed_stream(&mut state, "stream");
-            if reopen {
-                state.streams.insert(
-                    key.clone(),
-                    StreamState {
-                        owners: 1,
-                        frontier: StreamFrontier {
-                            written_seq: 1,
-                            durable_seq: 1,
-                            error: (!failed).then(|| "new stream failed".to_string()),
-                            ..Default::default()
-                        },
-                        ..StreamState::new(key)
-                    },
-                );
-            }
-            shared.cv.notify_all();
-            drop(state);
-            outcomes.push((reopen, failed, flush.join().unwrap()));
-        }
-    }
-    for (reopen, failed, result) in outcomes {
-        let expected = if failed {
-            Err("old stream failed".to_string())
-        } else {
-            Ok(())
+fn retired_flush_tickets_keep_the_original_outcome_after_reopen() {
+    for failed in [false, true] {
+        let shared = Arc::new(Shared::new());
+        let key: Arc<str> = "stream".into();
+        let mut old = StreamState::new(Arc::clone(&key));
+        let ticket = NativeJournalTicket::new(Arc::clone(&shared), Arc::clone(&old.id), 1, TicketGoal::Durable);
+        old.frontier = StreamFrontier {
+            written_seq: 1,
+            written_bytes: 37,
+            durable_seq: u64::from(!failed),
+            error: failed.then(|| "old stream failed".into()),
+            ..Default::default()
         };
-        assert_eq!(result, expected, "reopen={reopen}, failed={failed}");
+        let mut state = lock_state(&shared);
+        state.streams.insert(Arc::clone(&key), old);
+        retire_closed_stream(&mut state, &key);
+        let mut next = StreamState::new(Arc::clone(&key));
+        next.frontier = StreamFrontier {
+            written_seq: 1,
+            written_bytes: 51,
+            durable_seq: 1,
+            error: (!failed).then(|| "new stream failed".into()),
+            ..Default::default()
+        };
+        state.streams.insert(key, next);
+        drop(state);
+        assert_eq!(ticket.wait_for(TicketGoal::Durable),
+            if failed { Err("old stream failed".into()) } else { Ok(37) });
     }
 }
 
@@ -193,7 +155,7 @@ fn writer_batches_already_queued_appends_without_waiting() {
             seq,
             operations: empty_operations(),
             durable: false,
-            bytes_written: Arc::new(AtomicU64::new(0)),
+            bytes_written: None,
         }))
         .unwrap();
     }
@@ -203,6 +165,7 @@ fn writer_batches_already_queued_appends_without_waiting() {
     let state = lock_state(&shared);
     let stream_state = state.streams.get(stream.as_ref()).unwrap();
     assert_eq!(stream_state.frontier.written_seq, 32);
+    assert_eq!(stream_state.frontier.written_bytes, fs::metadata(&path).unwrap().len() - wal::FILE_HEADER_BYTES);
     assert_eq!(stream_state.write_calls, 1);
     drop(state);
     let _ = fs::remove_file(path);

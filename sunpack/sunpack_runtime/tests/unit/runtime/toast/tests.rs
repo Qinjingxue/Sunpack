@@ -147,7 +147,11 @@ fn terminal_progress_and_rollback_failure_keep_main_presentation() {
         result.archives.push(output);
     }
     let summary = Summary::for_outcome(&result, false, true, &one_root, None);
-    assert_eq!(summary.output, Some(live));
+    assert_eq!(summary.output.as_deref(), Some(live.as_path()));
+    completed.summary.merge(summary);
+    assert!(Snapshot::completed(&completed, None).action.is_some());
+    fs::remove_dir(&live).unwrap();
+    assert!(Snapshot::completed(&completed, None).action.is_none());
 
     let mut snapshot = Snapshot::stop_failed("batch", Language::En);
     assert_eq!(snapshot.kind, 3);
@@ -230,7 +234,7 @@ fn overlapping_requests_share_progress_stop_and_cleanup_result() {
     assert_eq!(stopped_again.len(), 3);
     a.finish(&Err(io::Error::other("output deletion failed")), true, true, one_root);
     b.finish(&Ok(Outcome::default()), true, false, one_root);
-    assert!(publisher.shared.state.lock().unwrap().completed.is_empty());
+    assert!(publisher.shared.state.lock().unwrap().completion.is_none());
 
     let mut outcome = Outcome::default();
     outcome.archives.push(archive("later.zip", None));
@@ -247,7 +251,7 @@ fn overlapping_requests_share_progress_stop_and_cleanup_result() {
     {
         let state = publisher.shared.state.lock().unwrap();
         assert!(state.group.as_ref().unwrap().finalize_at.is_none());
-        assert!(state.completed.is_empty());
+        assert!(state.completion.is_none());
     }
     finish.publish();
     finish_debounce(&publisher);
@@ -292,8 +296,15 @@ fn finish_debounce(publisher: &Publisher) {
     state.settle(deadline);
 }
 
+fn take_completion(publisher: &Publisher) -> Completed {
+    match publisher.shared.state.lock().unwrap().completion.take().unwrap() {
+        Completion::Prepare(completed) | Completion::Present(completed, None) => completed,
+        Completion::Present(_, Some(_)) => panic!("report was already prepared"),
+    }
+}
+
 fn take_completed(publisher: &Publisher) -> Completed {
-    let completed = publisher.shared.state.lock().unwrap().completed.pop_front().unwrap();
+    let completed = take_completion(publisher);
     assert!(publisher.shared.present_completed(&completed, || {}));
     completed
 }
@@ -512,7 +523,7 @@ fn request_projection_suppresses_invisible_retry_and_partial_diagnostics() {
     invisible.record([Path::new("invisible.zip")], &error, false, one_root);
     invisible.finish(&error, false, false, one_root);
     assert!(!directory.0.exists());
-    assert!(publisher.shared.state.lock().unwrap().completed.is_empty());
+    assert!(publisher.shared.state.lock().unwrap().completion.is_none());
 
     for (index, kind) in [FailureKind::WrongPassword,
         FailureKind::MissingVolume].into_iter().enumerate()
@@ -528,7 +539,7 @@ fn request_projection_suppresses_invisible_retry_and_partial_diagnostics() {
         activity.finish(&result, false, false, one_root);
         let mut state = publisher.shared.state.lock().unwrap();
         assert!(state.group.is_none());
-        assert!(state.completed.is_empty());
+        assert!(state.completion.is_none());
         assert!(std::mem::take(&mut state.clear));
         assert!(!directory.0.exists());
     }
@@ -550,7 +561,7 @@ fn request_projection_suppresses_invisible_retry_and_partial_diagnostics() {
         activity.record([Path::new("carrier.bin")], &result, false, one_root);
         activity.finish(&result, false, false, one_root);
         assert!(publisher.shared.state.lock().unwrap().group.is_none());
-        assert!(publisher.shared.state.lock().unwrap().completed.is_empty());
+        assert!(publisher.shared.state.lock().unwrap().completion.is_none());
         assert!(!directory.0.exists());
 
         let mut accepted = archive("carrier.bin", Some(kind));
@@ -618,7 +629,7 @@ fn debounce_coalesces_requests_without_waiting_for_invisible_scans() {
         let mut state = publisher.shared.state.lock().unwrap();
         assert_eq!(state.group.as_ref().unwrap().finalize_at, Some(first_deadline));
         state.settle(first_deadline - Duration::from_millis(1));
-        assert!(state.completed.is_empty());
+        assert!(state.completion.is_none());
     }
     progress(&b, 2, 1, 2);
     assert!(publisher.shared.state.lock().unwrap().group.as_ref().unwrap().finalize_at.is_none());
@@ -757,7 +768,7 @@ fn semantic_reload_retires_debouncing_and_in_flight_batches() {
         old.finish(&failure, false, false, one_root);
         let completed = if in_flight {
             finish_debounce(&publisher);
-            publisher.shared.state.lock().unwrap().completed.pop_front()
+            Some(take_completion(&publisher))
         } else { None };
         publisher.reset_batches();
         assert!(publisher.shared.state.lock().unwrap().clear);
@@ -770,7 +781,7 @@ fn semantic_reload_retires_debouncing_and_in_flight_batches() {
         }
         let state = publisher.shared.state.lock().unwrap();
         assert_eq!(state.group.iter().count(), 1);
-        assert!(state.completed.is_empty());
+        assert!(state.completion.is_none());
         let group = state.group.as_ref().unwrap();
         assert!(group.requests.contains_key("02"));
         assert_ne!(group.id.as_ref(), stale_progress.batch);
@@ -781,34 +792,39 @@ fn semantic_reload_retires_debouncing_and_in_flight_batches() {
 }
 
 #[test]
-fn presenter_shutdown_discards_queued_report_and_draft_with_live_activity() {
-    let directory = TestDirectory::new();
-    let publisher = publisher(directory.0.clone());
-    let activity = publisher.register(Arc::from("01"), Language::En);
-    activity.event(queued(1, "failed.zip", None, 0));
-    progress(&activity, 1, 1, 2);
-    let failure = Err(io::Error::other("failure"));
-    activity.record([Path::new("failed.zip")], &failure, false, one_root);
-    activity.finish(&failure, false, false, one_root);
-    finish_debounce(&publisher);
-    let completed = publisher.shared.state.lock().unwrap().completed.pop_front().unwrap();
-    let draft_path = completed.report.lock().unwrap().path.clone().unwrap();
-    let engine = crate::pipeline::Engine::new(PathBuf::new());
-    publisher.publish(&engine, completed).join().unwrap();
-    let report_path = publisher.shared.state.lock().unwrap().published.front()
-        .unwrap().1.clone().unwrap();
-    assert!(report_path.exists());
-    assert!(draft_path.exists());
-    // Both disable and unrecoverable presenter failure exit through this
-    // cleanup, while extraction observers may still retain the Activity.
-    publisher.shared.state.lock().unwrap().stopping = true;
-    publisher.shared.discard_batches();
-    assert!(!report_path.exists());
-    assert!(!draft_path.exists());
-    let state = activity.publisher.shared.state.lock().unwrap();
-    assert!(state.group.is_none());
-    assert!(state.completed.is_empty());
-    assert!(state.published.is_empty());
+fn reset_and_shutdown_discard_queued_report_and_draft_with_live_activity() {
+    for shutdown in [false, true] {
+        let directory = TestDirectory::new();
+        let publisher = publisher(directory.0.clone());
+        let activity = publisher.register(Arc::from("01"), Language::En);
+        activity.event(queued(1, "failed.zip", None, 0));
+        progress(&activity, 1, 1, 2);
+        let failure = Err(io::Error::other("failure"));
+        activity.record([Path::new("failed.zip")], &failure, false, one_root);
+        activity.finish(&failure, false, false, one_root);
+        finish_debounce(&publisher);
+        let completed = take_completion(&publisher);
+        let draft_path = completed.report.lock().unwrap().path.clone().unwrap();
+        let engine = crate::pipeline::Engine::new(PathBuf::new());
+        publisher.publish(&engine, completed).join().unwrap();
+        let report_path = match &publisher.shared.state.lock().unwrap().completion {
+            Some(Completion::Present(_, Some(path))) => path.clone(),
+            _ => panic!("expected a queued failure report"),
+        };
+        assert!(report_path.exists());
+        assert!(draft_path.exists());
+        if shutdown {
+            publisher.shared.state.lock().unwrap().stopping = true;
+            publisher.shared.discard_batches();
+        } else {
+            publisher.reset_batches();
+        }
+        assert!(!report_path.exists());
+        assert!(!draft_path.exists());
+        let state = activity.publisher.shared.state.lock().unwrap();
+        assert!(state.group.is_none());
+        assert!(state.completion.is_none());
+    }
 }
 
 #[test]
@@ -828,13 +844,15 @@ fn stopping_remaining_work_preserves_the_batch_failure_report() {
     assert_eq!(publisher.stop_group(&batch), vec![Arc::<str>::from("02")]);
     running.finish(&Ok(Outcome::default()), true, false, one_root);
     finish_debounce(&publisher);
-    let completed = publisher.shared.state.lock().unwrap().completed.pop_front().unwrap();
+    let completed = take_completion(&publisher);
     assert_eq!(completed.summary.failed, 1);
     assert_eq!(completed.summary.interrupted, 1);
     assert!(!completed.cancellation.cancelled());
     let engine = crate::pipeline::Engine::new(PathBuf::new());
     publisher.publish(&engine, completed).join().unwrap();
-    let (completed, report) = publisher.shared.state.lock().unwrap().published.pop_front().unwrap();
+    let Some(Completion::Present(completed, report)) = publisher.shared.state.lock().unwrap().completion.take() else {
+        panic!("expected a queued failure report");
+    };
     let report = report.expect("stopping must retain previous failures");
     assert!(fs::read_to_string(&report).unwrap().contains("archive failure before user stop"));
     assert!(Snapshot::completed(&completed, Some(report)).report_action.is_some());
@@ -860,7 +878,7 @@ fn report_publication_does_not_block_progress_and_reset_cancels_its_io() {
     first.record([Path::new("first.zip")], &failure, false, one_root);
     first.finish(&failure, false, false, one_root);
     finish_debounce(&publisher);
-    let completed = publisher.shared.state.lock().unwrap().completed.pop_front().unwrap();
+    let completed = take_completion(&publisher);
     let cancel = completed.cancellation.clone();
     let draft = Arc::clone(&completed.report);
     // Hold the actual report I/O gate, not a timed large-file simulation.
@@ -880,7 +898,7 @@ fn report_publication_does_not_block_progress_and_reset_cancels_its_io() {
     assert!(publisher.shared.state.lock().unwrap().clear);
     drop(held);
     publication.join().unwrap();
-    assert!(publisher.shared.state.lock().unwrap().published.is_empty());
+    assert!(publisher.shared.state.lock().unwrap().completion.is_none());
     assert!(fs::read_dir(&directory.0).unwrap().flatten().all(|entry| {
         !entry.file_name().to_string_lossy().starts_with("failed-")
     }));
@@ -899,7 +917,7 @@ fn native_presentation_releases_state_before_sending_progress_and_completion() {
     }));
     first.finish(&success(), false, false, one_root);
     finish_debounce(&publisher);
-    let completed = publisher.shared.state.lock().unwrap().completed.pop_front().unwrap();
+    let completed = take_completion(&publisher);
     assert!(publisher.shared.present_completed(&completed, || {
         assert!(publisher.shared.state.try_lock().is_ok());
         let next = publisher.register(Arc::from("02"), Language::En);
@@ -924,7 +942,7 @@ fn new_visible_work_invalidates_in_flight_completion_without_losing_report() {
     first.record([Path::new("first.zip")], &failure, false, one_root);
     first.finish(&failure, false, false, one_root);
     finish_debounce(&publisher);
-    let completed = publisher.shared.state.lock().unwrap().completed.pop_front().unwrap();
+    let completed = take_completion(&publisher);
     let batch = Arc::clone(&completed.id);
     let (entered, ready) = mpsc::channel();
     let (release, released) = mpsc::channel();
@@ -952,7 +970,7 @@ fn new_visible_work_invalidates_in_flight_completion_without_losing_report() {
     assert!(!stale_report.exists());
     assert_eq!(publisher.shared.state.lock().unwrap().group.as_ref().unwrap().summary.failed, 2);
     finish_debounce(&publisher);
-    let completed = publisher.shared.state.lock().unwrap().completed.pop_front().unwrap();
+    let completed = take_completion(&publisher);
     let report = publisher.reports.publish(&completed, &publisher.shared).unwrap().unwrap();
     assert!(publisher.shared.present_completed(&completed, || {}));
     assert!(publisher.shared.state.lock().unwrap().group.is_none());

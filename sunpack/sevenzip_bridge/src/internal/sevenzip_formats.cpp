@@ -84,7 +84,6 @@ namespace sunpack::sevenzip
     std::wstring canonical_archive_type_for_guid(const GUID &format)
     {
         const auto id = format.Data4[5];
-        if (id == 0x0F) return L"gzip"; // Legacy GZip handler identifier.
         for (const auto& handler : handlers)
             if (handler.ids[0] == id) return std::wstring(handler.name);
         return {};

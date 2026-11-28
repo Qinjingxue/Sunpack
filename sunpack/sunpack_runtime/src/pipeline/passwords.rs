@@ -62,9 +62,10 @@ struct CandidateSources {
     recent_priority: Mutex<Option<RecentPriority>>,
 }
 
+#[derive(Clone)]
 struct RecentPriority {
     recent: RecentOrder,
-    indices: Arc<[(usize, usize)]>,
+    indices: Arc<[Option<usize>]>,
 }
 
 struct ScopedCandidates<'a> {
@@ -106,20 +107,29 @@ impl CandidateSources {
         }
     }
 
-    fn recent_indices(&self, recent: &RecentOrder) -> Arc<[(usize, usize)]> {
-        if let Some(cached) = self.recent_priority.lock().unwrap().as_ref()
-            .filter(|cached| Arc::ptr_eq(&cached.recent, recent))
-        {
-            return Arc::clone(&cached.indices);
-        }
-        // One request can have many inputs sharing these immutable sources.
-        // Store only the recent matches, including an empty answer, and keep
-        // a dictionary-sized search outside the lock shared by these inputs.
+    fn recent_indices(&self, recent: &RecentOrder) -> Arc<[Option<usize>]> {
+        let previous = {
+            let cached = self.recent_priority.lock().unwrap();
+            if let Some(cached) = cached.as_ref().filter(|cached| Arc::ptr_eq(&cached.recent, recent)) {
+                return Arc::clone(&cached.indices);
+            }
+            cached.clone()
+        };
+        // A confirmation frequently just moves a known password to the front.
+        // Reuse both hits and misses when the rank changes. Only an unseen
+        // password can trigger another pass over the configured dictionary.
+        let cached = previous.iter().flat_map(|entry| {
+            entry.recent.iter().map(AsRef::as_ref).zip(entry.indices.iter().copied())
+        });
         let configured = self.explicit.iter().chain(self.snapshot.global()).enumerate();
-        let indices: Arc<[_]> = prioritize(recent, configured).into();
-        let cached = RecentPriority { recent: Arc::clone(recent), indices: Arc::clone(&indices) };
-        let displaced = self.recent_priority.lock().unwrap().replace(cached);
-        drop(displaced);
+        let indices: Arc<[_]> = prioritize(recent, cached, configured).into();
+        let current = self.recent.0.lock().unwrap();
+        if Arc::ptr_eq(&current, recent) {
+            let cached = RecentPriority { recent: Arc::clone(recent), indices: Arc::clone(&indices) };
+            let displaced = self.recent_priority.lock().unwrap().replace(cached);
+            drop(current);
+            drop(displaced);
+        }
         indices
     }
 }
@@ -215,28 +225,29 @@ impl CandidateSet {
         } else if explicit_len + self.sources.snapshot.global().len() >= BATCH_SIZE {
             let base = self.sources.recent_indices(recent);
             let mut ranked = if scoped.buckets.is_empty() {
-                Vec::new()
+                vec![None; recent.len()]
             } else {
-                prioritize(recent, scoped.enabled().map(|value| (value, value)))
+                prioritize(recent, std::iter::empty(), scoped.enabled().map(|value| (value, value)))
             };
             // An applicable scoped entry has precedence over the shared base.
-            // Only merge recent entries, regardless of dictionary size.
-            ranked.extend(base.iter().filter_map(|&(rank, index)| {
-                let value = self.sources.base_password(index);
-                (index < explicit_len || scoped.allows(value)).then_some((rank, value))
-            }));
-            if !scoped.buckets.is_empty() {
-                ranked.sort_by_key(|&(rank, _)| rank);
-                ranked.dedup_by_key(|entry| entry.0);
+            // Both lists are indexed by recent rank, so fill only empty slots.
+            for (slot, &index) in ranked.iter_mut().zip(base.iter()) {
+                if slot.is_some() { continue; }
+                if let Some(index) = index {
+                    let value = self.sources.base_password(index);
+                    if index < explicit_len || scoped.allows(value) {
+                        *slot = Some(value);
+                    }
+                }
             }
             ranked
         } else {
-            prioritize(recent, self.configured(scoped).map(|(value, _)| (value, value)))
+            prioritize(recent, std::iter::empty(), self.configured(scoped).map(|(value, _)| (value, value)))
         };
-        let mut seen: HashSet<&str> = priority.iter().map(|&(_, value)| value.as_ref()).collect();
+        let mut seen: HashSet<&str> = priority.iter().copied().flatten().map(AsRef::as_ref).collect();
         priority
             .into_iter()
-            .map(|(_, value)| value)
+            .flatten()
             .chain(self.configured(scoped).filter_map(move |(value, track)| {
                 // Global entries are already unique. Only earlier sources can
                 // duplicate them, so the set never grows with this dictionary.
@@ -321,7 +332,7 @@ impl CandidateSet {
             .verified_password
             .as_ref()
             .map(std::slice::from_ref)
-            .unwrap_or(&plan.candidates);
+            .unwrap_or_else(|| plan.candidates());
         let (out, matched) =
             crate::analysis_native::volume_anchor::resolve_encrypted_relation_anchor(
                 anchor,
@@ -705,7 +716,7 @@ impl CandidateSet {
         let plan = PasswordPlan {
             layout_passwords,
             verified_password: None,
-            candidates: Arc::new(pending),
+            candidates: (!pending.is_empty()).then(|| Arc::new(pending)),
             encrypted: needs_password.then_some(true),
             evidence,
         };
@@ -713,13 +724,20 @@ impl CandidateSet {
     }
 }
 
-fn prioritize<'a, T: Copy>(
+fn prioritize<'a, 'b, T: Copy>(
     recent: &VecDeque<Arc<str>>,
+    cached: impl Iterator<Item = (&'b str, Option<T>)>,
     configured: impl Iterator<Item = (T, &'a Arc<str>)>,
-) -> Vec<(usize, T)> {
+) -> Vec<Option<T>> {
     let mut positions: HashMap<_, _> = recent.iter().enumerate()
         .map(|(index, password)| (password.as_ref(), index)).collect();
     let mut priority = vec![None; recent.len()];
+    for (password, value) in cached {
+        if let Some(index) = positions.remove(password) {
+            priority[index] = value;
+        }
+    }
+    if positions.is_empty() { return priority; }
     for (id, password) in configured {
         #[cfg(test)]
         PRIORITY_CANDIDATES.with(|count| count.set(count.get() + 1));
@@ -728,7 +746,7 @@ fn prioritize<'a, T: Copy>(
             if positions.is_empty() { break; }
         }
     }
-    priority.into_iter().enumerate().filter_map(|(rank, value)| value.map(|value| (rank, value))).collect()
+    priority
 }
 
 fn open_sessions(input: &ArchiveInput) -> io::Result<Vec<NativeArchiveSession>> {
@@ -765,17 +783,21 @@ fn member_sessions(input: &ArchiveInput, head: NativeArchiveSession) -> Vec<Nati
 pub(super) struct PasswordPlan {
     pub layout_passwords: password::evidence::LayoutPasswords,
     pub verified_password: Option<Arc<str>>,
-    pub candidates: Arc<Vec<Arc<str>>>,
+    pub candidates: Option<Arc<Vec<Arc<str>>>>,
     pub encrypted: Option<bool>,
     pub evidence: Option<&'static str>,
 }
 
 impl PasswordPlan {
+    fn candidates(&self) -> &[Arc<str>] {
+        self.candidates.as_deref().map_or(&[], Vec::as_slice)
+    }
+
     fn empty_fallback() -> Self {
         Self {
             layout_passwords: Default::default(),
             verified_password: None,
-            candidates: Arc::new(vec![Arc::from("")]),
+            candidates: Some(Arc::new(vec![Arc::from("")])),
             encrypted: None,
             evidence: Some("empty_password_direct"),
         }
@@ -785,7 +807,7 @@ impl PasswordPlan {
         Self {
             layout_passwords: Default::default(),
             verified_password: None,
-            candidates: Arc::default(),
+            candidates: None,
             encrypted: Some(false),
             evidence: None,
         }
@@ -795,7 +817,7 @@ impl PasswordPlan {
         Self {
             layout_passwords: Default::default(),
             verified_password: Some(password),
-            candidates: Arc::default(),
+            candidates: None,
             encrypted: Some(true),
             evidence: None,
         }
@@ -806,12 +828,13 @@ impl PasswordPlan {
         index: Option<usize>,
         recent: &RecentPasswords,
     ) -> Option<&str> {
+        let candidates = self.candidates();
         let password = match index {
-            Some(index) => self.candidates.get(index)?,
-            None if self.candidates.len() <= 1 => self
+            Some(index) => candidates.get(index)?,
+            None if candidates.len() <= 1 => self
                 .verified_password
                 .as_ref()
-                .or_else(|| self.candidates.first())?,
+                .or_else(|| candidates.first())?,
             None => return None,
         };
         recent.remember_recent(Arc::clone(password));

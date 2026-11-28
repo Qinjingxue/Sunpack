@@ -157,13 +157,10 @@ impl CatalogStore {
             if wal.exists() {
                 store.wal_bytes = fs::metadata(&wal)?.len();
                 let mut reader = wal::Reader::new(File::open(wal)?, Kind::CatalogWal)?;
-                while let Some(seq) = reader.next()? {
+                while let Some(seq) = reader.next(Some(store.seq))? {
                     let deltas: Vec<Delta> = wal::decode(&reader.payload)?;
                     if deltas.is_empty() {
                         return Err(wal::invalid("empty catalog transaction"));
-                    }
-                    if seq <= store.seq {
-                        continue;
                     }
                     if store.seq.checked_add(1) != Some(seq) {
                         return Err(wal::invalid("catalog WAL gap"));

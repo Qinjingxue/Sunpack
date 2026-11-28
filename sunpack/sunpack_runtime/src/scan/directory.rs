@@ -1305,6 +1305,7 @@ fn scan_directory_impl(
         });
     }
     let mut stack = vec![(root.clone(), start_depth)];
+    let mut entry_stem = String::new();
     while let Some((dir, depth)) = stack.pop() {
         let read_dir = match fs::read_dir(&dir) {
             Ok(entries) => entries,
@@ -1329,7 +1330,10 @@ fn scan_directory_impl(
             let outside_relation = options
                 .relation_stem
                 .as_ref()
-                .is_some_and(|stem| catalog_stem(&path.to_string_lossy()) != *stem);
+                .is_some_and(|stem| {
+                    super::catalog::catalog_stem_into(&path.to_string_lossy(), &mut entry_stem);
+                    entry_stem != *stem
+                });
             // Windows caches file_type in the directory entry. Skip unrelated
             // files before building full metadata, but keep directories and
             // unknown types on the existing traversal/reparse-point path.
@@ -1617,9 +1621,9 @@ impl NativeWatchCatalog {
                 if !contained && !crate::watch_store::is_path_under(scope.key(), key) {
                     continue;
                 }
-                let path = record.aliases.iter().find(|path| crate::path_keys::path_key(path) == *key).unwrap().as_str();
+                let path = record.path(key);
                 let (target, target_key) = if contained {
-                    (path, key.as_str())
+                    (path, key.as_ref())
                 } else {
                     (scope.root.as_str(), root_key.as_str())
                 };
@@ -1630,7 +1634,7 @@ impl NativeWatchCatalog {
                 // interior junction. Publish the physical alias, not both views.
                 if Path::new(target).exists() && !walk_can_reach(scope.key(), target) {
                     // Dependency files use one canonical alias even outside ordinary enumeration.
-                    if !dependency || key != &crate::path_keys::resolved_path_key(Path::new(path)) { continue; }
+                    if !dependency || key.as_ref() != crate::path_keys::resolved_path_key(Path::new(path)) { continue; }
                 }
                 let prepared = scan_catalog(options, self, scope, target, true)?;
                 let (errors, _) = apply_catalog_scan(self, scope, Some(target), false, true, false, prepared, catalogs)?;
@@ -1669,6 +1673,24 @@ impl NativeWatchCatalog {
         // Admission owns the fresh observation. The catalog supplies
         // paths only, without opening each file before the actual probe.
         paths.retain(|path| !self.is_owned(path));
+        paths
+    }
+
+    /// Freeze known paths before a live dedup policy change. The rebuild may
+    /// refresh this catalog, but a later arrival must go through admission.
+    pub(crate) fn dedup_baseline_paths<'a>(
+        &self,
+        scopes: impl Iterator<Item = &'a crate::scan::scope::NativeDiscoveryScope>,
+    ) -> HashSet<Arc<str>> {
+        let catalogs = self.catalogs.lock().unwrap_or_else(|error| error.into_inner());
+        let mut paths = HashSet::new();
+        for scope in scopes {
+            if let Some(table) = catalogs.scopes.get(scope.key()) {
+                paths.extend(table.rows_at_or_under(scope.key()).filter(|(key, row)| {
+                    !row.is_dir() && scope.contains_key(key)
+                }).map(|(key, _)| Arc::clone(key)));
+            }
+        }
         paths
     }
 

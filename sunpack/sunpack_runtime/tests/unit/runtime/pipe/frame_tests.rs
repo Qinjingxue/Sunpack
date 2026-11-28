@@ -1,19 +1,24 @@
 use super::*;
 
 #[test]
-fn prompt_line_continues_across_more_than_one_frame_limit() {
+fn prompt_streams_a_long_line_and_releases_its_buffer_without_losing_the_suffix() {
     let mut input = PromptInput::default();
     let chunk = vec![b'x'; 4096];
     for _ in 0..(MAX_FIELD / chunk.len()) {
         input.push(chunk.clone()).unwrap();
         assert!(input.line().is_none());
     }
-    input.push(b"tail\r".to_vec()).unwrap();
+    input.push(b"tail\r\nnext".to_vec()).unwrap();
     let line = input.line().unwrap();
-    assert_eq!(line.len(), MAX_FIELD + 5);
-    assert!(line.ends_with("tail\r"));
-    input.push(b"\nnext\n".to_vec()).unwrap();
-    assert_eq!(input.line().as_deref(), Some("next\n"));
+    assert_eq!(line.len(), MAX_FIELD + 6);
+    assert!(line.ends_with("tail\r\n"));
+    drop(line);
+    assert!(input.bytes.capacity() <= 64 * 1024);
+    assert!(input.line().is_none());
+    input.push(b" line\r".to_vec()).unwrap();
+    assert_eq!(input.line().as_deref(), Some("next line\r"));
+    input.push(b"\nlast\n".to_vec()).unwrap();
+    assert_eq!(input.line().as_deref(), Some("last\n"));
 }
 
 #[test]

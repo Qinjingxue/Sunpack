@@ -205,14 +205,19 @@ def test_gzip_extracts_past_long_optional_header_fields(package, tmp_path, name_
 
 @pytest.mark.parametrize("options", [
     {}, {"solid": False}, {"branch": "BCJ"}, {"branch": "BCJ2"},
+    {"branch": "BCJ2", "single_credit": True},
     {"password": "secret", "header_encrypt": False},
     {"password": "secret"}, {"split": True}, {"split": True, "password": "secret"},
     {"disguise": True}, {"payload_size": 16}, {"payload_size": 9 * 1024 * 1024},
-], ids=["solid", "nonsolid", "bcj", "bcj2", "encrypted-data", "encrypted-header",
+], ids=["solid", "nonsolid", "bcj", "bcj2", "bcj2-single-credit", "encrypted-data", "encrypted-header",
         "split", "encrypted-split", "disguised", "small", "multichunk-large"])
 def test_7z_lz4_interoperability(package, tmp_path, options):
     require_generator("7z", seven_zip_lz4=True)
-    case = create_7z_lz4_case(tmp_path, "interop", **options)
+    if options.get("single_credit"):
+        package.env["SUNPACK_TEST_WORKER_CAPACITY"] = "1"
+    case = create_7z_lz4_case(tmp_path, "interop", **{
+        key: value for key, value in options.items() if key != "single_credit"
+    })
     password_args = [f"-p{case.password}"] if case.password else []
     run_cmd([str(require_7z_zstd()), "t", "-y", *password_args, str(case.entry_path)], case.archive_dir)
     assert_archive_round_trip(package, case, tmp_path / "out", passwords=("wrong", "secret"))

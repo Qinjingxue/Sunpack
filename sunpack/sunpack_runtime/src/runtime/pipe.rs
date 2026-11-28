@@ -261,24 +261,6 @@ fn encode_terminal_size(columns: u32, rows: u32) -> Option<u32> {
     ((1..=32767).contains(&columns) && (1..=32767).contains(&rows)).then_some(columns | rows << 16)
 }
 
-fn read_u32(input: &mut impl Read) -> io::Result<u32> {
-    let mut word = [0; 4];
-    input.read_exact(&mut word)?;
-    Ok(u32::from_be_bytes(word))
-}
-
-fn read_field(input: &mut impl Read, len: usize) -> io::Result<Vec<u8>> {
-    if len > MAX_FIELD {
-        return Err(io::ErrorKind::InvalidData.into());
-    }
-    let mut output = Vec::new();
-    input.take(len as u64).read_to_end(&mut output)?;
-    if output.len() != len {
-        return Err(io::ErrorKind::UnexpectedEof.into());
-    }
-    Ok(output)
-}
-
 #[derive(Default)]
 struct PipeReader {
     // Keep bytes already fetched after the last argument for the control stream.
@@ -432,8 +414,12 @@ impl PromptInput {
                 return None;
             }
         };
-        if end == unread.len() && self.bytes.capacity() > 64 * 1024 {
+        let remaining = unread.len() - end;
+        if self.bytes.capacity() > 64 * 1024 && remaining <= self.bytes.capacity() / 4 {
             let mut bytes = std::mem::take(&mut self.bytes);
+            // The returned line takes the large allocation with it. Keep
+            // only the small unconsumed suffix between prompts.
+            self.bytes = bytes.split_off(self.start + end);
             if self.start != 0 {
                 bytes.copy_within(self.start.., 0);
                 bytes.truncate(end);
@@ -450,14 +436,24 @@ impl PromptInput {
     }
 
     fn push(&mut self, chunk: Vec<u8>) -> io::Result<()> {
-        if self.start != 0 {
+        self.eof = chunk.is_empty();
+        if self.eof {
+            return Ok(());
+        }
+        let unread = self.bytes.len() - self.start;
+        if unread == 0 {
+            self.bytes.clear();
+            self.start = 0;
+            self.searched = 0;
+        } else if self.start >= unread && chunk.len() > self.bytes.capacity() - self.bytes.len() {
+            // Reclaim a consumed prefix before growing. Charging the move to
+            // that prefix keeps the total copy work linear across frames.
             self.bytes.copy_within(self.start.., 0);
-            self.bytes.truncate(self.bytes.len() - self.start);
+            self.bytes.truncate(unread);
             self.searched -= self.start;
             self.start = 0;
         }
-        self.eof = chunk.is_empty();
-        if self.bytes.is_empty() && self.bytes.capacity() < chunk.len() {
+        if unread == 0 && self.bytes.capacity() < chunk.len() {
             self.bytes = chunk;
         } else {
             self.bytes.try_reserve(chunk.len()).map_err(|error|
@@ -789,14 +785,18 @@ impl Server {
             }
             if header.argv.as_slice() == ["--watch-status-follow"] {
                 let _observer = StatusObserver::new(self);
+                let mut previous = None;
                 loop {
                     cancel.check_io()?;
-                    crate::pipeline::stage("cli", &cancel).await?;
                     let revision = self.host.watch.status_revision();
-                    let status = self.host.watch.status(&header.cwd)?;
-                    let mut line = serde_json::to_vec(&status).map_err(io::Error::other)?;
-                    line.push(b'\n');
-                    connection.awrite(Stream::Out, &line).await?;
+                    let activity = self.host.watch.activity();
+                    if previous != Some(activity) {
+                        crate::pipeline::stage("cli", &cancel).await?;
+                        let mut line = serde_json::to_vec(&activity).map_err(io::Error::other)?;
+                        line.push(b'\n');
+                        connection.awrite(Stream::Out, &line).await?;
+                        previous = Some(activity);
+                    }
                     self.host.watch.wait_status_change(revision, &cancel).await?;
                 }
             }
@@ -1036,13 +1036,22 @@ pub(super) fn submit_existing(
         return Err(io::ErrorKind::InvalidData.into());
     }
     loop {
-        let mut kind = [0];
-        pipe.read_exact(&mut kind)?;
-        let size = read_u32(&mut pipe)? as usize;
-        let payload = read_field(&mut pipe, size)?;
-        match kind[0] {
-            0 if size == 4 => return Ok(Some(i32::from_be_bytes(payload.try_into().unwrap()))),
-            1 | 2 => {}
+        let mut frame = [0; 5];
+        pipe.read_exact(&mut frame)?;
+        let size = u32::from_be_bytes(frame[1..].try_into().unwrap()) as usize;
+        match frame[0] {
+            0 if size == 4 => {
+                let mut status = [0; 4];
+                pipe.read_exact(&mut status)?;
+                return Ok(Some(i32::from_be_bytes(status)));
+            }
+            1 | 2 if size <= MAX_FIELD => {
+                // Internal callers only need the exit status.
+                let consumed = io::copy(&mut (&mut pipe).take(size as u64), &mut io::sink())?;
+                if consumed != size as u64 {
+                    return Err(io::ErrorKind::UnexpectedEof.into());
+                }
+            }
             _ => return Err(io::ErrorKind::InvalidData.into()),
         }
     }

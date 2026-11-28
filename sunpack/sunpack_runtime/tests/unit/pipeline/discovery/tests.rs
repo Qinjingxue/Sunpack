@@ -355,4 +355,63 @@ fn shared_logical_order_does_not_replace_relation_primary() {
         assert_eq!(task.source, DiscoverySource::Embedded);
         assert_eq!(task.owned_paths.len(), 2);
     }
+
+    // A transitive bridge makes the component root later than its first
+    // member. The independent task between them keeps its root order.
+    let task = |entry: &str, owned: &[&str]| Task::single(
+        ArchiveInput::file(entry.into(), "zip".into(), entry.into()),
+        owned.iter().map(|path| (*path).into()).collect(),
+        DiscoverySource::Embedded,
+        None,
+    );
+    let mut tasks = vec![
+        task("first", &["first"]),
+        task("independent", &["independent"]),
+        task("last", &["last"]),
+        task("bridge", &["first", "last"]),
+    ];
+    merge_shared_inputs(&mut tasks, &mut HashSet::new());
+    let [independent, merged] = tasks.as_slice() else { panic!("two components") };
+    assert_eq!(independent.entry().entry_path, "independent");
+    assert_eq!(merged.entry().entry_path, "first");
+    assert_eq!(merged.inputs.len(), 3);
+}
+
+#[test]
+fn prepared_continuation_requires_one_plan_to_cover_all_members() {
+    let part = |path: &str, number, start| {
+        let mut part = InputPart::range(InputExtent {
+            path: path.into(), view: None, start, end: Some(start + 20),
+        });
+        part.volume_number = Some(number);
+        part
+    };
+    let plan = |path: &str, tail: [InputPart; 2], completeness| {
+        let mut input = ArchiveInput::file(path.into(), "zip".into(), "set".into());
+        input.mode = OpenMode::NativeVolumes;
+        input.analysis.volume_completeness = Some(completeness);
+        input.parts = if completeness == VolumeCompleteness::Complete {
+            let [left, right] = tail;
+            Box::new([part(path, 1, 0), left, right])
+        } else {
+            Box::new(tail)
+        };
+        Task::single(input, vec![], DiscoverySource::Relations,
+            (completeness == VolumeCompleteness::Missing).then(||
+                discovery_failure("missing_volume", DiscoverySource::Relations, path).unwrap()))
+    };
+
+    let mut prepared = vec![
+        plan("first.head", [part("second.bin", 2, 0), part("third.bin", 3, 40)], VolumeCompleteness::Complete),
+        plan("other.head", [part("second.bin", 2, 40), part("third.bin", 3, 0)], VolumeCompleteness::Complete),
+    ];
+    let mut missing = vec![plan("second.bin", [part("second.bin", 2, 0), part("third.bin", 3, 0)],
+        VolumeCompleteness::Missing)];
+    suppress_prepared_continuations(&prepared, &mut missing);
+    assert_eq!(missing.len(), 1);
+
+    prepared.push(plan("covering.head", [part("second.bin", 2, 0), part("third.bin", 3, 0)],
+        VolumeCompleteness::Complete));
+    suppress_prepared_continuations(&prepared, &mut missing);
+    assert!(missing.is_empty());
 }

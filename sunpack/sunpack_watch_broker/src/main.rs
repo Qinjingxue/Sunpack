@@ -452,21 +452,25 @@ impl JournalDispatcher {
         if next_reap.is_none_or(|deadline| now < deadline) {
             return Ok(*next_reap);
         }
-        let previous_len = entries.len();
         let mut next_deadline: Option<Instant> = None;
-        entries.retain(|_, (_, deadline)| {
-            if *deadline <= now {
-                // An active borrower owns its reader independently. A valid
-                // handle can be admitted again when that operation finishes.
-                return false;
-            }
-            next_deadline = Some(next_deadline.map_or(*deadline, |next| next.min(*deadline)));
-            true
-        });
-        if entries.len() != previous_len {
+        // An active borrower owns its reader independently and can cache it
+        // again when it finishes. Close idle volume handles outside the lock.
+        let retired: Vec<_> = entries
+            .extract_if(|_, (_, deadline)| {
+                if *deadline <= now {
+                    return true;
+                }
+                next_deadline = Some(next_deadline.map_or(*deadline, |next| next.min(*deadline)));
+                false
+            })
+            .map(|(_, (reader, _))| reader)
+            .collect();
+        if !retired.is_empty() {
             trim_volume_table(entries);
         }
         *next_reap = next_deadline;
+        drop(volumes);
+        drop(retired);
         Ok(next_deadline)
     }
 
@@ -499,6 +503,8 @@ impl JournalDispatcher {
         has_volume: bool,
         now: Instant,
     ) -> io::Result<()> {
+        // This can own the last volume handle. Its drop follows the table lock.
+        let _retired;
         let mut volumes = self
             .volumes
             .lock()
@@ -528,7 +534,7 @@ impl JournalDispatcher {
                     .min_by_key(|(_, (_, deadline))| *deadline)
                     .map(|(key, _)| Arc::clone(key));
                 let Some(lru) = lru else { return Ok(()) };
-                entries.remove(&lru);
+                _retired = entries.remove(&lru);
             }
             // Only a successfully opened volume can consume cache capacity.
             entries.insert(Arc::clone(key), (Arc::clone(reader), deadline));

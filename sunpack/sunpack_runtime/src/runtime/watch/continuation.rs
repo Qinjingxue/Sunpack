@@ -176,9 +176,8 @@ impl Scheduler {
             let mut directories = self
                 .journal
                 .state()
-                .runtime_keys(&continuation_output_key(id, ""))
-                .iter()
-                .filter_map(|key| self.journal.state().runtime_record(key))
+                .project_runtime(&continuation_output_key(id, ""), |_, value| Some(Arc::clone(value)))
+                .into_iter()
                 .map(|value| Directory::deserialize(value.as_ref()).map_err(io::Error::other))
                 .collect::<io::Result<Vec<_>>>()?;
             directories.sort_unstable_by_key(|directory| {

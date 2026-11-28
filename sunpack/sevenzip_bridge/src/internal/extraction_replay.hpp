@@ -65,6 +65,13 @@ struct VolumeReadUncertainty {
     std::unique_ptr<std::atomic<bool>[]> observed;
     std::vector<std::size_t> variable_slots;
     std::atomic<bool> untracked_named_volume{false};
+    auto first_overlapping_range(std::uint64_t offset, std::uint64_t size) const {
+        const auto range = std::upper_bound(uncertain_ranges.begin(), uncertain_ranges.end(), offset,
+            [](auto value, const auto& range) { return value < range.second; });
+        if (range == uncertain_ranges.end() || (range->first > offset && range->first - offset >= size))
+            return uncertain_ranges.end();
+        return range;
+    }
     void observe_named_volume(std::size_t slot) {
         if (!observed && uncertain_read.load(std::memory_order_relaxed)) return;
         const auto it = std::lower_bound(variable_slots.begin(), variable_slots.end(), slot);
@@ -74,9 +81,8 @@ struct VolumeReadUncertainty {
     }
     void observe_logical_read(std::uint64_t offset, std::uint32_t size) {
         if (!size || (!observed && uncertain_read.load(std::memory_order_relaxed))) return;
-        const auto range = std::upper_bound(uncertain_ranges.begin(), uncertain_ranges.end(), offset,
-            [](auto value, const auto& range) { return value < range.second; });
-        if (range == uncertain_ranges.end() || (range->first > offset && range->first - offset >= size)) return;
+        const auto range = first_overlapping_range(offset, size);
+        if (range == uncertain_ranges.end()) return;
         uncertain_read.store(true, std::memory_order_relaxed);
         if (!observed) return;
         for (auto it = range; it != uncertain_ranges.end() && (it->first <= offset || it->first - offset < size); ++it) {

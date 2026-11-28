@@ -314,12 +314,16 @@ pub(super) struct ScopeCatalog {
 }
 
 pub(crate) fn catalog_stem(path: &str) -> String {
-    crate::path_keys::case_key(crate::relations::first_dot_stem(
-        std::path::Path::new(path)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default(),
-    ))
+    crate::path_keys::case_key(catalog_stem_source(path))
+}
+
+pub(crate) fn catalog_stem_into(path: &str, stem: &mut String) {
+    crate::path_keys::case_key_into(catalog_stem_source(path), stem);
+}
+
+fn catalog_stem_source(path: &str) -> &str {
+    let name = Path::new(path).file_name().and_then(|name| name.to_str()).unwrap_or_default();
+    crate::relations::first_dot_stem(name)
 }
 
 impl ScopeCatalog {
@@ -454,22 +458,15 @@ impl ScopeCatalog {
             self.persistent_len -= 1;
             if !row.is_dir() {
                 let stem = catalog_stem(&row.name);
-                if row.flags & READY_MEMBER != 0 {
-                    if let Some(bucket) = self.buckets.get_mut(stem.as_str()) { bucket.advance(); }
-                }
-                if let Some(dirty) = dirty.filter(|_| {
-                    matches!(
-                        self.buckets.get(stem.as_str()).map(|bucket| &bucket.rows),
-                        Some(BucketRows::Many(_))
-                    )
-                }) {
-                    dirty.insert(stem);
-                } else if self
-                    .buckets
-                    .get_mut(stem.as_str())
-                    .is_some_and(|bucket| bucket.remove(key))
-                {
-                    self.buckets.remove(stem.as_str());
+                if let Some(bucket) = self.buckets.get_mut(stem.as_str()) {
+                    if row.flags & READY_MEMBER != 0 {
+                        bucket.advance();
+                    }
+                    if let Some(dirty) = dirty.filter(|_| matches!(&bucket.rows, BucketRows::Many(_))) {
+                        dirty.insert(stem);
+                    } else if bucket.remove(key) {
+                        self.buckets.remove(stem.as_str());
+                    }
                 }
             }
         }
@@ -484,11 +481,14 @@ impl ScopeCatalog {
         self.remove_many(std::iter::once(key));
     }
     pub fn remove_many<'a>(&mut self, keys: impl IntoIterator<Item = &'a str>) {
+        let mut keys = keys.into_iter().peekable();
+        let Some(first) = keys.next() else { return; };
+        let batch = keys.peek().is_some();
         let mut dirty = HashSet::new();
-        for key in keys {
+        for key in std::iter::once(first).chain(keys) {
             if let Some(row) = self.rows.remove(key) {
                 self.generated.remove(key);
-                self.remove_indexes(key, &row, Some(&mut dirty));
+                self.remove_indexes(key, &row, batch.then_some(&mut dirty));
             }
         }
         for stem in dirty {

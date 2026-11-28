@@ -9,19 +9,21 @@
 #define BUFFER_SIZE (256 * 1024)
 #define FRAME_MAGIC 0x184d2204U
 
-typedef struct {
+struct sup_lz4_reader {
     void *opaque;
     sup_lz4_read read;
     sup_lz4_skip skip;
-    sup_lz4_write write;
     sup_lz4_progress progress;
     sup_lz4_result *result;
     sup_lz4_allocate allocate;
     sup_lz4_free release;
     LZ4F_dctx *decoder;
-    unsigned char *input, *output;
+    unsigned char *input;
     size_t pos, size;
-} stream;
+    uint64_t start_out;
+    int declared_empty, in_frame, saw_skippable, eof;
+};
+typedef struct sup_lz4_reader stream;
 
 static uint32_t le32(const unsigned char *p) {
     return (uint32_t)p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24);
@@ -75,12 +77,6 @@ static int skip_bytes(stream *s, uint64_t n) {
     }
     return SUP_LZ4_OK;
 }
-static int emit(stream *s, const void *data, size_t n) {
-    if (UINT64_MAX-s->result->output_bytes < n) return SUP_LZ4_DATA;
-    if (n && s->write(s->opaque, data, n)) return SUP_LZ4_IO;
-    s->result->output_bytes += n;
-    return tick(s);
-}
 static int library_error(size_t rc) {
     LZ4F_errorCodes error = LZ4F_getErrorCode(rc);
     if (error == LZ4F_ERROR_contentChecksum_invalid || error == LZ4F_ERROR_blockChecksum_invalid ||
@@ -88,10 +84,9 @@ static int library_error(size_t rc) {
     if (error == LZ4F_ERROR_allocation_failed) return SUP_LZ4_MEMORY;
     return SUP_LZ4_DATA;
 }
-static int modern(stream *s) {
-    LZ4F_frameInfo_t info;
+static int start_frame(stream *s) {
     size_t header_size, hint, source_size;
-    const uint64_t start_out = s->result->output_bytes;
+    LZ4F_frameInfo_t info;
     unsigned char flags;
     int rc = need(s, 7);
     if (rc) return rc;
@@ -116,27 +111,103 @@ static int modern(stream *s) {
     if (LZ4F_isError(hint)) return library_error(hint);
     consume(s, source_size);
     if (flags & 1) return SUP_LZ4_UNSUPPORTED;
-    do {
-        size_t dst_size = BUFFER_SIZE;
-        rc = need(s, 1);
-        if (rc) return rc;
-        source_size = s->size-s->pos;
-        hint = LZ4F_decompress(s->decoder, s->output, &dst_size,
-            s->input+s->pos, &source_size, NULL);
-        if (LZ4F_isError(hint)) return library_error(hint);
-        consume(s, source_size);
-        rc = emit(s, s->output, dst_size);
-        if (rc) return rc;
-        if (hint && !source_size && !dst_size) return SUP_LZ4_DATA;
-    } while (hint);
-    // LZ4F validates nonzero content sizes itself. An explicit zero also
-    // promises an empty payload, even though LZ4F treats it like an absent size.
-    if ((flags & 8) && !info.contentSize && s->result->output_bytes != start_out) return SUP_LZ4_DATA;
-    ++s->result->frames;
-    if (info.contentChecksumFlag) ++s->result->content_checked_frames;
-    if (info.blockChecksumFlag) ++s->result->block_checked_frames;
+    s->declared_empty = (flags & 8) && !info.contentSize;
+    s->start_out = s->result->output_bytes;
+    s->in_frame = 1;
     return SUP_LZ4_OK;
 }
+
+static int read_chunk(stream *s, void *out, size_t capacity, size_t *written) {
+    *written = 0;
+    while (!s->eof && capacity) {
+        int rc;
+        if (!s->in_frame) {
+            uint32_t magic;
+            rc = need(s, 4);
+            if (rc == SUP_LZ4_TRUNCATED && s->pos == s->size &&
+                (s->result->frames || s->saw_skippable)) {
+                s->eof = 1;
+                return SUP_LZ4_OK;
+            }
+            if (rc) return rc;
+            magic = le32(s->input+s->pos);
+            if (is_skip(magic)) {
+                uint32_t size;
+                rc = need(s, 8);
+                if (rc) return rc;
+                size = le32(s->input+s->pos+4);
+                consume(s, 8);
+                rc = skip_bytes(s, size);
+                if (rc) return rc;
+                s->saw_skippable = 1;
+                continue;
+            }
+            if (magic != FRAME_MAGIC) return SUP_LZ4_DATA;
+            rc = start_frame(s);
+            if (rc) return rc;
+        }
+        {
+            size_t hint, source_size, dst_size = capacity;
+            rc = need(s, 1);
+            if (rc) return rc;
+            source_size = s->size-s->pos;
+            hint = LZ4F_decompress(s->decoder, out, &dst_size,
+                s->input+s->pos, &source_size, NULL);
+            if (LZ4F_isError(hint)) return library_error(hint);
+            if (hint && !source_size && !dst_size) return SUP_LZ4_DATA;
+            consume(s, source_size);
+            if (UINT64_MAX-s->result->output_bytes < dst_size) return SUP_LZ4_DATA;
+            s->result->output_bytes += dst_size;
+            if (!hint) {
+                // An explicitly declared zero length must also be checked.
+                if (s->declared_empty && s->result->output_bytes != s->start_out) return SUP_LZ4_DATA;
+                s->in_frame = 0;
+                ++s->result->frames;
+            }
+            if (dst_size) {
+                *written = dst_size;
+                return SUP_LZ4_OK;
+            }
+            rc = tick(s);
+            if (rc) return rc;
+        }
+    }
+    return SUP_LZ4_OK;
+}
+
+static int init(stream *s, void *opaque, sup_lz4_read read, sup_lz4_skip skip,
+    sup_lz4_progress progress, sup_lz4_result *result, sup_lz4_allocate allocate,
+    sup_lz4_free release) {
+    memset(result, 0, sizeof(*result));
+    memset(s, 0, sizeof(*s));
+    s->opaque=opaque; s->read=read; s->skip=skip; s->progress=progress;
+    s->result=result; s->allocate=allocate; s->release=release;
+    s->input=(unsigned char *)malloc(BUFFER_SIZE);
+    if (!s->input) return SUP_LZ4_MEMORY;
+    return SUP_LZ4_OK;
+}
+static void close_stream(stream *s) {
+    LZ4F_freeDecompressionContext(s->decoder);
+    free(s->input);
+}
+
+sup_lz4_reader *sup_lz4_reader_open(void *opaque, sup_lz4_read read, sup_lz4_result *result,
+    sup_lz4_allocate allocate, sup_lz4_free release) {
+    stream *s=(stream *)malloc(sizeof(*s));
+    if (!s) return NULL;
+    if (init(s, opaque, read, NULL, NULL, result, allocate, release)) {
+        free(s);
+        return NULL;
+    }
+    return s;
+}
+int sup_lz4_reader_read(sup_lz4_reader *s, void *out, size_t capacity, size_t *written) {
+    return read_chunk(s, out, capacity, written);
+}
+void sup_lz4_reader_close(sup_lz4_reader *s) {
+    if (s) { close_stream(s); free(s); }
+}
+
 int sup_lz4_decode(void *opaque, sup_lz4_read read, sup_lz4_skip skip,
     sup_lz4_write write, sup_lz4_progress progress, sup_lz4_result *result) {
     return sup_lz4_decode_with_memory(opaque, read, skip, write, progress, result, NULL, NULL);
@@ -145,38 +216,16 @@ int sup_lz4_decode_with_memory(void *opaque, sup_lz4_read read, sup_lz4_skip ski
     sup_lz4_write write, sup_lz4_progress progress, sup_lz4_result *result,
     sup_lz4_allocate allocate, sup_lz4_free release) {
     stream s;
-    int rc = SUP_LZ4_OK;
-    memset(result, 0, sizeof(*result));
-    memset(&s, 0, sizeof(s));
-    s.opaque=opaque; s.read=read; s.skip=skip; s.write=write;
-    s.progress=progress; s.result=result;
-    s.allocate=allocate; s.release=release;
-    s.input=(unsigned char *)malloc(BUFFER_SIZE);
-    s.output=(unsigned char *)malloc(BUFFER_SIZE);
-    if (!s.input || !s.output) { rc=SUP_LZ4_MEMORY; goto done; }
-    for (;;) {
-        uint32_t magic;
-        rc = need(&s, 4);
-        if (rc == SUP_LZ4_TRUNCATED && s.pos == s.size && (result->frames || result->skippable_frames)) {
-            rc=SUP_LZ4_OK; break;
-        }
-        if (rc) break;
-        magic = le32(s.input+s.pos);
-        if (magic == FRAME_MAGIC) rc=modern(&s);
-        else if (is_skip(magic)) {
-            rc=need(&s, 8);
-            if (!rc) {
-                uint32_t size=le32(s.input+s.pos+4);
-                consume(&s, 8);
-                rc=skip_bytes(&s, size);
-                if (!rc) ++result->skippable_frames;
-            }
-        } else rc=SUP_LZ4_DATA;
-        if (rc) break;
+    int rc = init(&s, opaque, read, skip, progress, result, allocate, release);
+    unsigned char *out = rc ? NULL : (unsigned char *)malloc(BUFFER_SIZE);
+    if (!out) rc=SUP_LZ4_MEMORY;
+    while (!rc) {
+        size_t written;
+        rc=read_chunk(&s, out, BUFFER_SIZE, &written);
+        if (rc || !written) break;
+        rc=write(s.opaque, out, written) ? SUP_LZ4_IO : tick(&s);
     }
-done:
-    LZ4F_freeDecompressionContext(s.decoder);
-    free(s.input); free(s.output);
-    result->error=rc;
+    close_stream(&s);
+    free(out);
     return rc;
 }

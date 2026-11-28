@@ -40,6 +40,37 @@ void check_final_results(const std::ostringstream& output, unsigned expected_cou
     require(count == expected_count, "request emitted an unexpected number of final results");
 }
 
+void watch_failure_keeps_partial_manifest(const std::filesystem::path& archive,
+                                          const std::filesystem::path& destination) {
+    // The fixture's stored member begins at byte 36. Keep the ZIP headers
+    // valid so extraction visits the member and discovers the CRC mismatch.
+    const auto damaged = destination.parent_path() / L"watch-crc.zip";
+    std::filesystem::copy_file(archive, damaged);
+    {
+        std::fstream file(damaged, std::ios::in | std::ios::out | std::ios::binary);
+        file.seekp(36);
+        file.put('\0');
+    }
+    WorkerRequest request;
+    request.job_id = "watch-partial-output";
+    request.from_watch = true;
+    request.output_inventory = false;
+    request.archive_input.archive_path = damaged.wstring();
+    request.archive_input.format_hint = L"zip";
+    request.output_dir = destination.wstring();
+    std::ostringstream frames;
+    auto* previous = std::cout.rdbuf(frames.rdbuf());
+    {
+        NativeJobExecutor executor(1, 0);
+        executor.submit(std::move(request));
+        executor.stop(false);
+    }
+    std::cout.rdbuf(previous);
+    check_final_results(frames, 1, "damaged");
+    require(frames.str().find(wire::key("verified_manifest")) != std::string::npos,
+        "retiring the Watch request discarded its partial output manifest");
+}
+
 void check_chunked_request(const std::filesystem::path& archive) {
     const auto path = wide_to_utf8(archive.wstring());
     auto slot = [](unsigned number, const char* name) {
@@ -50,12 +81,17 @@ void check_chunked_request(const std::filesystem::path& archive) {
         return wire::object() + wire::key("path") + wire::text(path) +
             wire::key("start") + wire::number(start) + wire::key("end") + wire::number(end) + wire::end();
     };
+    auto part = [&](unsigned number, const char* name) {
+        return wire::object() + wire::key("volume_number") + wire::number(number) +
+            wire::key("canonical_name") + wire::text(name) + wire::key("path") + wire::text(path);
+    };
     const auto body = wire::object() + wire::key("job_id") + wire::text("chunked") +
         wire::key("archive_input") + wire::object() +
         wire::key("entry_path") + wire::text(path) +
-        wire::key("named_volumes") + wire::boolean(true) +
-        wire::key("open_mode") + wire::text("native_volumes") +
+        wire::key("open_mode") + wire::text("named_volumes") +
         wire::key("format_hint") + wire::text("zip") +
+        wire::key("parts") + wire::array() + part(1, "one") + wire::end() +
+        part(2, "two") + wire::key("start") + wire::number(40) + wire::end() + wire::end() +
         wire::key("volume_attempts") + wire::object() +
         wire::key("sources") + wire::array() + extent(0, 40) + extent(40, std::filesystem::file_size(archive)) + wire::end() +
         wire::key("layouts") + wire::array() + wire::object() +
@@ -101,6 +137,11 @@ void check_chunked_request(const std::filesystem::path& archive) {
             plan.minimum_slots[0] == 2 && plan.tail_totals[1] == UINT64_C(0x123456789) &&
             request.password_candidates == std::vector<std::wstring>{L"\u8def"},
             "chunk boundary corrupted the request");
+    const auto& archive_input = request.archive_input;
+    require(archive_input.part_paths.empty() && archive_input.ranges.size() == 2 &&
+            archive_input.ranges[0].path == archive.wstring() && archive_input.ranges[0].start == 0 &&
+            archive_input.ranges[1].start == 40 && archive_input.canonical_names == std::vector<std::wstring>{L"one", L"two"},
+            "the first sliced volume displaced an earlier whole-file part");
     require(reader.start() && parse_worker_request(reader).worker_command == "shutdown" && !reader.start(),
         "chunked request consumed the following control frame");
 }
@@ -886,6 +927,7 @@ int main() {
     const auto archive = root / L"input.zip";
     { std::ofstream file(archive, std::ios::binary); file.write(zip, sizeof(zip) - 1); }
     check_chunked_request(archive);
+    watch_failure_keeps_partial_manifest(archive, root / L"watch-partial");
     rollback_keeps_registered_root(root / L"rollback");
     competing_volume_keeps_registered_root(archive, root / L"competing");
     warm_volume_waves_reuse_proofs(archive);

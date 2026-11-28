@@ -17,22 +17,27 @@ fn shared_cleanup_waits_for_every_owner_and_preserves_failed_sources() {
     let key = |path: &str| namespace_key(Path::new(path));
     let mut first = CleanupOwner::new(&registry, &paths(&["a.001", "tail.002"]));
     let mut second = CleanupOwner::new(&registry, &paths(&["b.001", "tail.002"]));
-    assert_eq!(first.release(true), HashSet::from([key("a.001")]));
-    assert_eq!(second.release(true), HashSet::from([key("b.001"), key("tail.002")]));
+    assert_eq!(first.allowed(), HashSet::from(["a.001"]));
+    first.release(true);
+    assert_eq!(second.allowed(), HashSet::from(["b.001", "tail.002"]));
+    second.release(true);
     assert!(registry.lock().unwrap().paths.is_empty());
 
     let first = CleanupOwner::new(&registry, &paths(&["a.001", "tail.002"]));
     let mut second = CleanupOwner::new(&registry, &paths(&["b.001", "tail.002"]));
     drop(first); // Includes cancelled and never-dispatched batch owners.
-    assert_eq!(second.release(true), HashSet::from([key("b.001")]));
+    assert_eq!(second.allowed(), HashSet::from(["b.001"]));
+    second.release(true);
     assert!(registry.lock().unwrap().paths.is_empty());
 
     let mut first = CleanupOwner::new(&registry, &paths(&["a.001", "old.002"]));
     let mut second = CleanupOwner::new(&registry, &paths(&["b.001", "new.002"]));
     first.refresh(&paths(&["a.001", "new.002"]));
     assert!(!registry.lock().unwrap().paths.contains_key(&key("old.002")));
-    assert_eq!(second.release(true), HashSet::from([key("b.001")]));
-    assert_eq!(first.release(true), HashSet::from([key("a.001"), key("new.002")]));
+    assert_eq!(second.allowed(), HashSet::from(["b.001"]));
+    second.release(true);
+    assert_eq!(first.allowed(), HashSet::from(["a.001", "new.002"]));
+    first.release(true);
     assert!(registry.lock().unwrap().paths.is_empty());
 }
 
@@ -654,7 +659,7 @@ fn verified_scan_finishes_without_starting_worker() {
 
 #[test]
 fn worker_failure_preserves_only_noncontradicted_strong_password() {
-    use crate::scan::worker_wire::NativeWorkerFrameDecoder;
+    use crate::scan::worker_event::parse_worker_transport_event;
     struct Input(mpsc::Sender<Vec<u8>>);
     impl io::Write for Input {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
@@ -682,17 +687,14 @@ fn worker_failure_preserves_only_noncontradicted_strong_password() {
         engine.worker.lock().unwrap().process = Some(Arc::clone(&process));
         let responder = std::thread::spawn(move || {
             let bytes = received.recv().unwrap();
-            let mut decoder = NativeWorkerFrameDecoder::default();
-            let frames = decoder.feed(&bytes).unwrap();
-            decoder.finish().unwrap();
-            let request = &frames[0].summary;
+            let request = parse_worker_transport_event(&bytes).unwrap().summary;
             let id = &request["job_id"];
             process.test_event(json!({"type":"result", "job_id":id,
                 "status":"error", "failure_kind":failure,
                 "unsupported_method":failure == "unsupported_method",
                 "failure_stage":"item_extract", "encrypted":true}));
             process.test_event(json!({"type":"native_event", "event":"job_finished", "job_id":id}));
-            request.clone()
+            request
         });
         let mut input = ArchiveInput::file(source.to_string_lossy().into_owned(), "rar".into(), "encrypted".into());
         input.analysis.password_required = true;

@@ -2,9 +2,11 @@ use super::*;
 
 #[test]
 fn history_expiration_trims_overlapping_runs_and_reopens_the_surviving_run() {
+    use std::io::Write;
+
     let root = gui_contract::Directory::new("history_overlap");
     let path = root.0.join("events.json");
-    let mut store = Store::open(path).unwrap();
+    let mut store = Store::open(path.clone()).unwrap();
     let row = json!({"event":"done","path":"archive.zip"});
     for ts in [1000, 2000, 1500] {
         store.append(&HistoryRecord::new(&row, ts, &row).unwrap()).unwrap();
@@ -18,10 +20,23 @@ fn history_expiration_trims_overlapping_runs_and_reopens_the_surviving_run() {
         panic!("expected one surviving run");
     };
     assert_eq!((run.head, run.first, run.last, run.count), (1, 2000, 3000, 3));
-    assert_eq!(store.expire(3000).unwrap(), None);
+    let folder = root.0.join("events.json.store");
+    let data = folder.join(format!("{}.data", run.name));
+    let index = folder.join(format!("{}.index", run.name));
     store.publish().unwrap();
+    let committed = std::fs::metadata(&data).unwrap().len();
+    drop(store);
+    std::fs::OpenOptions::new().append(true).open(&data).unwrap().write_all(b"uncommitted").unwrap();
+    let mut store = Store::open(path).unwrap();
     store.append(&HistoryRecord::new(&row, 4000, &row).unwrap()).unwrap();
+    let rows = std::fs::read(&index).unwrap();
+    let offset_start = 3 * crate::io::display_store::ENTRY_BYTES + 8;
+    assert_eq!(u64::from_le_bytes(rows[offset_start..offset_start + 8].try_into().unwrap()), committed);
     assert_eq!(store.expire(3000).unwrap(), Some(4000));
+    assert_eq!(store.expire(4000).unwrap(), None);
+    store.publish().unwrap();
+    store.append(&HistoryRecord::new(&row, 5000, &row).unwrap()).unwrap();
+    assert_eq!(store.expire(4000).unwrap(), Some(5000));
 }
 
 #[test]
@@ -154,7 +169,7 @@ fn expired_processing_row_releases_payload_and_still_routes_completion() {
     projection.expire_live(vec![Arc::clone(&id)], 1_000_000);
     assert!(lifetime.upgrade().is_none());
     projection.mark_all();
-    assert!(projection.updates().0[0].1.is_none());
+    assert!(projection.updates().0.is_empty());
 
     projection.apply(&mut json!({"event":"candidate_departed","path":member}));
     let mut completion = json!({"event":"done","path":member,"owner":"run","ts":2});

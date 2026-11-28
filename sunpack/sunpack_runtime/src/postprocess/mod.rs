@@ -87,29 +87,39 @@ pub(crate) fn watch_candidate_for_path(
     path: &Path,
     since_usn: Option<i64>,
 ) -> io::Result<Option<WatchCandidateRow>> {
-    watch_candidate(path, since_usn, false)
+    Ok(watch_candidate(path, since_usn, false, |_, _| Ok(()))?.map(|(row, ())| row))
 }
 
 pub(crate) fn watch_candidate_for_observation(
     path: &Path,
     since_usn: Option<i64>,
 ) -> io::Result<Option<WatchCandidateRow>> {
-    watch_candidate(path, since_usn, true)
+    Ok(watch_candidate(path, since_usn, true, |_, _| Ok(()))?.map(|(row, ())| row))
 }
 
-fn watch_candidate(
+pub(crate) fn watch_candidate_with_generation(
+    path: &Path,
+    since_usn: Option<i64>,
+) -> io::Result<Option<(WatchCandidateRow, crate::io::reader::PhysicalFileGeneration)>> {
+    Ok(watch_candidate(path, since_usn, false, |file, metadata| {
+        Ok(crate::io::reader::physical_file_generation_from_metadata(file, metadata).ok())
+    })?.and_then(|(candidate, generation)| generation.map(|generation| (candidate, generation))))
+}
+
+fn watch_candidate<T>(
     path: &Path,
     since_usn: Option<i64>,
     report_absent: bool,
-) -> io::Result<Option<WatchCandidateRow>> {
-    let Some(snapshot) = watch_observed_file_snapshot(path, since_usn, report_absent, || {
+    capture: impl FnOnce(&fs::File, &fs::Metadata) -> io::Result<T>,
+) -> io::Result<Option<(WatchCandidateRow, T)>> {
+    let Some(snapshot) = watch_observed_file_snapshot(path, since_usn, report_absent, |file, metadata| {
         #[cfg(test)]
         {
             let hook = WATCH_OBSERVATION_HOOK.lock().unwrap().as_ref()
                 .filter(|(target, _)| target == path).map(|(_, hook)| *hook);
             if let Some(hook) = hook { hook(path)?; }
         }
-        Ok(())
+        capture(file, metadata)
     })? else {
         return Ok(None);
     };
@@ -120,12 +130,13 @@ fn watch_candidate(
     } else {
         std::path::absolute(path)?.to_string_lossy().into_owned()
     };
-    Ok(Some(WatchCandidateRow {
+    let candidate = WatchCandidateRow {
         path: event_path,
         size: snapshot.metadata.len(),
         mtime: mtime_seconds(&snapshot.metadata),
         observation: snapshot.observation(),
-    }))
+    };
+    Ok(Some((candidate, snapshot.captured)))
 }
 
 #[cfg_attr(test, derive(Debug))]

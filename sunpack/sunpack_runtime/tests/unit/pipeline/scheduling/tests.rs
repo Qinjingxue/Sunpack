@@ -6,6 +6,34 @@ fn single_slot() -> Arc<Scheduler> {
 }
 
 #[test]
+fn lifecycle_gate_wakes_one_waiter_and_hands_off_after_drop() {
+    #[derive(Default)]
+    struct WakeCount(AtomicUsize);
+    impl Wake for WakeCount {
+        fn wake(self: Arc<Self>) { self.0.fetch_add(1, Ordering::Relaxed); }
+    }
+    let gate = AsyncGate::new();
+    let held = block_on(gate.lock());
+    let counters: [_; 3] = std::array::from_fn(|_| Arc::new(WakeCount::default()));
+    let wakes = counters.clone().map(Waker::from);
+    let mut first = Box::pin(gate.lock());
+    let mut abandoned = Box::pin(gate.lock());
+    let mut last = Box::pin(gate.lock());
+    assert!(first.as_mut().poll(&mut Context::from_waker(&wakes[0])).is_pending());
+    assert!(abandoned.as_mut().poll(&mut Context::from_waker(&wakes[1])).is_pending());
+    assert!(last.as_mut().poll(&mut Context::from_waker(&wakes[2])).is_pending());
+    drop(abandoned);
+    assert_eq!(Arc::strong_count(&counters[1]), 2);
+
+    drop(held);
+    let count = |i: usize| counters[i].0.load(Ordering::Relaxed);
+    assert_eq!([count(0), count(1), count(2)], [1, 0, 0]);
+    drop(first);
+    assert_eq!([count(0), count(1), count(2)], [1, 0, 1]);
+    assert!(last.as_mut().poll(&mut Context::from_waker(&wakes[2])).is_ready());
+}
+
+#[test]
 fn failed_pool_retry_keeps_parallel_stage_progress() {
     let scheduler = Scheduler::with_capacity(2);
     scheduler.fail_pool.store(1, Ordering::Relaxed);

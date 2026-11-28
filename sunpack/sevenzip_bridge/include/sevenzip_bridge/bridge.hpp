@@ -89,9 +89,10 @@ struct ExtractInputTrace {
 enum class OutputPasswordProof : unsigned char { None, Strong, MeasureSize };
 
 struct ExtractOutputItemTrace {
-    unsigned int index = 0;
     unsigned long long bytes_written = 0;
     unsigned long long expected_size = 0;
+    unsigned long long mtime_ns = 0;
+    unsigned int index = 0;
     int operation_result = 0;
     bool is_dir = false;
     bool encrypted = false;
@@ -100,7 +101,6 @@ struct ExtractOutputItemTrace {
     bool done = false;
     bool failed = false;
     bool has_mtime_ns = false;
-    unsigned long long mtime_ns = 0;
     std::vector<unsigned char> magic;
     std::wstring output_path;
 };

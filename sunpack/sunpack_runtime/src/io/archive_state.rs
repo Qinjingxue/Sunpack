@@ -247,9 +247,14 @@ impl ArchiveInput {
         let attempts = self.volume_attempts.as_deref();
         WorkerInput {
             entry_path: &self.entry_path,
-            open_mode: self.mode,
+            open_mode: match self.mode {
+                OpenMode::File => "file",
+                OpenMode::FileRange => "file_range",
+                OpenMode::NativeVolumes if self.uses_named_volumes() => "named_volumes",
+                OpenMode::NativeVolumes => "native_volumes",
+                OpenMode::SfxWithVolumes => "sfx_with_volumes",
+            },
             format_hint: &self.format_hint,
-            named_volumes: self.uses_named_volumes(),
             parts: if attempts.is_some() { &[] } else { &self.parts },
             volume_attempts: attempts,
             analysis: self
@@ -479,20 +484,14 @@ impl Serialize for AnalysisReport<'_> {
 #[derive(Serialize)]
 pub(crate) struct WorkerInput<'a> {
     entry_path: &'a str,
-    open_mode: OpenMode,
+    open_mode: &'static str,
     format_hint: &'a str,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    named_volumes: bool,
-    #[serde(skip_serializing_if = "slice_empty")]
+    #[serde(skip_serializing_if = "<[InputPart]>::is_empty")]
     parts: &'a [InputPart],
     #[serde(skip_serializing_if = "Option::is_none")]
     volume_attempts: Option<&'a VolumeAttemptPlan>,
     #[serde(skip_serializing_if = "Option::is_none")]
     analysis: Option<WireAnalysis<'a>>,
-}
-
-fn slice_empty<T>(value: &&[T]) -> bool {
-    value.is_empty()
 }
 
 #[derive(Serialize)]

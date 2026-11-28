@@ -5,12 +5,11 @@ use super::{ArchiveResult, DiscoverySource, Failure, FailureKind};
 use crate::io::archive_state::ArchiveInput;
 #[cfg(test)]
 use crate::io::archive_state::OpenMode;
-use crate::io::reader::{capture_file_generation, PhysicalFileGeneration};
+use crate::io::reader::PhysicalFileGeneration;
 use crate::path_keys::path_key;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    io,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -89,11 +88,7 @@ struct SourceGeneration {
 pub(crate) struct GeneratedSource(SourceGeneration);
 
 impl GeneratedSource {
-    pub(crate) fn capture(path: &Path) -> io::Result<Self> {
-        Ok(Self::from_generation(path, &capture_file_generation(path)?))
-    }
-
-    pub(super) fn from_generation(path: &Path, generation: &PhysicalFileGeneration) -> Self {
+    pub(crate) fn from_generation(path: &Path, generation: &PhysicalFileGeneration) -> Self {
         Self(SourceGeneration {
             path: path.to_path_buf(),
             generation: generation.clone(),

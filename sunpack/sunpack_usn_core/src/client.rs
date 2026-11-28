@@ -295,6 +295,7 @@ fn transact_request(
         let generation = state.generation()?;
         (generation, encoded?, state.idle.take())
     };
+    let mut replayed = false;
     loop {
         let mut connection = match idle.take() {
             Some(connection) => connection,
@@ -313,7 +314,12 @@ fn transact_request(
                 if !replay_safe || !is_transient_broker_io(&error) {
                     return Err(error);
                 }
-                thread::sleep(Duration::from_millis(50));
+                // A stale cached pipe can be replaced immediately. Back off
+                // only when a replacement pipe also fails during this request.
+                if replayed {
+                    thread::sleep(Duration::from_millis(50));
+                }
+                replayed = true;
             }
         }
     }

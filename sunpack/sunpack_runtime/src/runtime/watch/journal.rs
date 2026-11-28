@@ -14,10 +14,27 @@ use std::thread::{self, JoinHandle};
 // Scoped to the admitted scheduler stage: worker publications on other
 // threads retain their own durable boundary.
 thread_local! {
-    static DEFERRED: std::cell::RefCell<Option<(usize, Vec<NativeJournalTicket>)>> = const { std::cell::RefCell::new(None) };
+    static DEFERRED: std::cell::RefCell<Option<(usize, PendingCommits)>> = const { std::cell::RefCell::new(None) };
 }
 
-pub(super) struct PendingCommits(Vec<NativeJournalTicket>);
+#[derive(Default)]
+pub(super) struct PendingCommits {
+    last: Option<NativeJournalTicket>,
+    durable: Option<NativeJournalTicket>,
+}
+
+impl PendingCommits {
+    fn push(&mut self, ticket: NativeJournalTicket) {
+        // One deferred scope belongs to one journal stream. The most recent
+        // durable append covers every earlier durability requirement.
+        if ticket.requires_durability() {
+            self.durable = None;
+        } else if self.last.as_ref().is_some_and(NativeJournalTicket::requires_durability) {
+            self.durable = self.last.take();
+        }
+        self.last = Some(ticket);
+    }
+}
 
 struct DeferredScope;
 impl Drop for DeferredScope {
@@ -29,11 +46,13 @@ const CHECKPOINT_BYTES: u64 = 8 * 1024 * 1024;
 const SNAPSHOT_TEMP_NAME: &str = "state.snapshot.tmp";
 
 struct Frontier {
+    retired_source_cleanup: Vec<String>,
     stream: Option<NativeJournalStream>,
     seq: u64,
     segment: u64,
     records: u64,
     bytes: u64,
+    observed_written_bytes: u64,
     fault: Option<String>,
     retirement: Option<u64>,
 }
@@ -69,7 +88,6 @@ pub(super) struct Journal {
     suspended: AtomicBool,
     log: Arc<NativeEventLog>,
     frontier: Mutex<Frontier>,
-    retired_source_cleanup: Mutex<std::collections::HashSet<String>>,
     checkpoint: Mutex<Option<Checkpoint>>,
     maintenance: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     snapshot: PathBuf,
@@ -103,7 +121,6 @@ impl Journal {
             suspended: AtomicBool::new(false),
             log,
             frontier: Mutex::new(frontier),
-            retired_source_cleanup: Mutex::default(),
             checkpoint: Mutex::default(),
             maintenance: Mutex::default(),
             snapshot,
@@ -113,42 +130,39 @@ impl Journal {
 
     fn restore_state(state: &NativeWatchState, dir: &Path) -> io::Result<Frontier> {
         let snapshot = dir.join("state.snapshot");
-        let checkpoint = match state.load_snapshot(snapshot.to_string_lossy().into_owned()) {
+        let checkpoint = match state.load_snapshot(&snapshot) {
             Ok(checkpoint) => checkpoint,
             Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
             Err(error) => return Err(error),
         };
         let mut frontier = Frontier {
+            retired_source_cleanup: Vec::new(),
             stream: None,
             seq: checkpoint,
             segment: checkpoint + 1,
             records: 0,
             bytes: 0,
+            observed_written_bytes: 0,
             fault: None,
             retirement: None,
         };
         let mut tail = None;
         let mut retirement_boundary = checkpoint;
         for (start, path) in segments(dir)? {
-            let replay = state.replay_segment(
-                path.to_string_lossy().into_owned(),
-                checkpoint,
-                frontier.seq + 1,
-            )?;
+            let replay = state.replay_segment(&path, checkpoint, frontier.seq + 1)?;
             if replay.records != 0 {
                 retirement_boundary = retirement_boundary.min(start.saturating_sub(1));
                 frontier.seq = replay.applied_seq;
                 frontier.records += replay.records;
                 frontier.bytes += replay.bytes;
             }
-            tail = Some((start, path, replay.records, replay.valid_bytes));
+            tail = Some((start, path, replay.records, replay.truncate_to));
         }
-        if let Some((start, path, records, valid_bytes)) = tail {
+        if let Some((start, path, records, truncate_to)) = tail {
             if records != 0 || start == frontier.seq + 1 {
-                NativeWatchState::truncate_journal_tail(
-                    path.to_string_lossy().into_owned(),
-                    valid_bytes,
-                )?;
+                if let Some(valid_bytes) = truncate_to {
+                    NativeWatchState::truncate_journal_tail(&path, valid_bytes)?;
+                }
                 frontier.segment = start;
             }
         }
@@ -214,13 +228,13 @@ impl Journal {
     }
 
     pub(super) fn retire_source_cleanup(&self, id: String) {
-        if self.state.runtime_record(&id).is_some() {
-            self.retired_source_cleanup.lock().unwrap().insert(id);
-        }
-    }
-
-    pub(super) fn source_cleanup_retired(&self, id: &str) -> bool {
-        self.retired_source_cleanup.lock().unwrap().contains(id)
+        // Order removal against publication, rebasing, and snapshot capture.
+        // Release the completed payload now. Only its WAL deletion is deferred.
+        let mut frontier = self.frontier.lock().unwrap();
+        let retired = self.state.take_source_cleanup(&id);
+        if retired.is_some() { frontier.retired_source_cleanup.push(id); }
+        drop(frontier);
+        drop(retired);
     }
 
     pub(super) fn event_log(&self) -> &Arc<NativeEventLog> {
@@ -263,21 +277,22 @@ impl Journal {
             ensure_healthy(&frontier)?;
             // A foreground publication captured before the final root was
             // removed no longer belongs to an active Watch scheduler.
-            let Some(stream) = frontier.stream.as_ref() else { return Ok(()); };
+            if frontier.stream.is_none() { return Ok(()); }
             let mut operations = prepare(&self.state)?;
-            if operations.is_empty() {
+            if operations.is_empty() && frontier.retired_source_cleanup.is_empty() {
                 return Ok(());
             }
-            // Settling an idempotent deletion never needs its own append.
-            // Until the next ordinary transaction, a crash may replay it.
-            for id in self.retired_source_cleanup.lock().unwrap().drain() {
-                operations.set_runtime(id, None);
-            }
-            let operations = Arc::new(operations);
             let seq = frontier
                 .seq
                 .checked_add(1)
                 .ok_or(io::ErrorKind::InvalidData)?;
+            // Piggyback settled deletions. Until this append or a snapshot is
+            // durable, a crash may replay the idempotent deletion.
+            for id in std::mem::take(&mut frontier.retired_source_cleanup) {
+                operations.set_runtime(id, None);
+            }
+            let stream = frontier.stream.as_ref().unwrap();
+            let operations = Arc::new(operations);
             let segment = frontier.segment;
             let ticket = stream.submit_task_append(
                 segment_path(self.snapshot.parent().unwrap(), segment),
@@ -285,7 +300,11 @@ impl Journal {
                 seq,
                 Arc::clone(&operations),
                 durable,
-            )?;
+            ).inspect_err(|error| {
+                // Submission only fails when the writer channel has closed.
+                // Block snapshots of this projection until recovery replays WAL.
+                frontier.fault.get_or_insert_with(|| error.to_string());
+            })?;
             let retired_plans = self.state.apply(&operations);
             frontier.seq = seq;
             frontier.records += 1;
@@ -300,7 +319,7 @@ impl Journal {
             } else { Some(ticket) }
         });
         match ticket {
-            Some(ticket) => self.wait_commits(std::slice::from_ref(&ticket)),
+            Some(ticket) => self.wait_commits(&ticket, None),
             None => Ok(()),
         }
     }
@@ -308,17 +327,20 @@ impl Journal {
     pub(super) fn prepare_waits<T>(&self, prepare: impl FnOnce() -> T) -> (T, PendingCommits) {
         DEFERRED.with(|slot| {
             assert!(slot.borrow().is_none(), "nested Watch journal deferral");
-            *slot.borrow_mut() = Some((self as *const Self as usize, Vec::new()));
+            *slot.borrow_mut() = Some((self as *const Self as usize, PendingCommits::default()));
         });
         let scope = DeferredScope;
         let result = prepare();
         let tickets = DEFERRED.with(|slot| slot.borrow_mut().take().unwrap().1);
         drop(scope);
-        (result, PendingCommits(tickets))
+        (result, tickets)
     }
 
     pub(super) fn wait_prepared(&self, tickets: PendingCommits) -> io::Result<()> {
-        self.wait_commits(&tickets.0)
+        match tickets.last {
+            Some(last) => self.wait_commits(&last, tickets.durable.as_ref()),
+            None => Ok(()),
+        }
     }
 
     // A deferred completion must make its intent durable before changing files.
@@ -326,7 +348,7 @@ impl Journal {
         let tickets = DEFERRED.with(|slot| slot.borrow_mut().as_mut()
             .filter(|(owner, _)| *owner == self as *const Self as usize)
             .map(|(_, tickets)| std::mem::take(tickets)).unwrap_or_default());
-        self.wait_commits(&tickets)
+        self.wait_prepared(tickets)
     }
 
     pub(super) fn defer_waits<T>(&self, prepare: impl FnOnce() -> T) -> (T, io::Result<()>) {
@@ -334,18 +356,20 @@ impl Journal {
         (result, self.wait_prepared(tickets))
     }
 
-    fn wait_commits(&self, tickets: &[NativeJournalTicket]) -> io::Result<()> {
-        if tickets.is_empty() {
-            return Ok(());
-        }
-        let result = NativeJournalTicket::wait_appends(tickets);
+    fn wait_commits(&self, last: &NativeJournalTicket, durable: Option<&NativeJournalTicket>) -> io::Result<()> {
+        let result = last.wait_append(durable);
         let mut frontier = self.frontier.lock().unwrap();
+        if !frontier.stream.as_ref().is_some_and(|stream| stream.owns(last)) {
+            return result.map(|_| ());
+        }
         let bytes = result.inspect_err(|error| {
             frontier.fault.get_or_insert_with(|| error.to_string());
         })?;
-        // Count all uncheckpointed WAL, including a segment sealed while
-        // this caller was awaiting its append. A failed snapshot retires none.
-        frontier.bytes = frontier.bytes.saturating_add(bytes);
+        // Concurrent waiters may observe the same count or return out of
+        // order. The stream only contributes each written byte once.
+        let appended = bytes.saturating_sub(frontier.observed_written_bytes);
+        frontier.bytes = frontier.bytes.saturating_add(appended);
+        frontier.observed_written_bytes = frontier.observed_written_bytes.max(bytes);
         ensure_healthy(&frontier)?;
         let needs_checkpoint = frontier.needs_checkpoint();
         drop(frontier);
@@ -377,6 +401,7 @@ impl Journal {
     }
 
     pub(super) fn flush(&self) -> io::Result<()> {
+        self.commit(false, |_| Ok(NativeWatchOperations::empty()))?;
         let ticket = {
             let frontier = self.frontier.lock().unwrap();
             ensure_healthy(&frontier)?;
@@ -397,7 +422,8 @@ impl Journal {
         let checkpoint = self.checkpoint.lock().unwrap();
         if let Some(job) = checkpoint.as_ref() { return job.ready(); }
         let frontier = self.frontier.lock().unwrap();
-        frontier.fault.is_some() || frontier.retirement.is_some() || frontier.needs_checkpoint()
+        !frontier.retired_source_cleanup.is_empty() || frontier.fault.is_some()
+            || frontier.retirement.is_some() || frontier.needs_checkpoint()
     }
 
     pub(super) fn compact(&self) -> io::Result<()> {

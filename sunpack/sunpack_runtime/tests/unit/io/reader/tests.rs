@@ -260,28 +260,6 @@ fn probe_reads_keep_ranges_and_generation_without_retaining_shared_blocks() {
 }
 
 #[test]
-fn probe_reuses_existing_request_window() {
-    let path = temp_file("managed_reader_probe_request", b"abcdefgh");
-    let reader = ManagedReader::open_with_config(
-        &path,
-        ReaderConfig {
-            cache_bytes: BLOCK_SIZE,
-        },
-    )
-    .unwrap();
-    let first = reader.read_cached_at(0, 4).unwrap();
-    let probe = reader.probe_reader();
-    let second = probe.read_cached_at(0, 4).unwrap();
-    let (CachedBytes::Slice(first), CachedBytes::Slice(second)) = (first, second) else {
-        panic!("request windows must remain shared");
-    };
-    assert!(first.shares_backing(&second));
-    assert_eq!(reader.stats().read_bytes, 4);
-    assert_eq!(reader.stats().cache_hits, 1);
-    let _ = std::fs::remove_file(path);
-}
-
-#[test]
 fn scan_probe_windows_preserve_borrowed_ranges_and_generation() {
     // Existing request-cache tests never enable scan windows. This coarse
     // case guards their slicing, eviction lifetime and closed-generation
@@ -438,19 +416,23 @@ fn request_cache_reuses_shared_backing_without_payload_copy() {
     let before = THREAD_REQUEST_COALESCES.with(std::cell::Cell::get);
     let first = reader.read_cached_at(0, 4).unwrap();
     let second = reader.read_cached_at(0, 4).unwrap();
+    let probe = reader.probe_reader().read_cached_at(0, 4).unwrap();
     let after = THREAD_REQUEST_COALESCES.with(std::cell::Cell::get);
 
-    let (CachedBytes::Slice(first), CachedBytes::Slice(second)) = (first, second) else {
+    let (CachedBytes::Slice(first), CachedBytes::Slice(second), CachedBytes::Slice(probe)) =
+        (first, second, probe)
+    else {
         panic!("request cache should return shared slices");
     };
     assert_eq!(&*first, b"abcd");
     assert_eq!(&*second, b"abcd");
     assert!(first.shares_backing(&second));
+    assert!(first.shares_backing(&probe));
     assert_eq!(after - before, 0);
 
     let stats = reader.stats();
     assert_eq!(stats.read_bytes, 4);
-    assert_eq!(stats.cache_hits, 1);
+    assert_eq!(stats.cache_hits, 2);
     let _ = std::fs::remove_file(path);
 }
 
@@ -537,6 +519,9 @@ fn final_reader_releases_source_and_blocks_without_a_cleanup_event() {
 
     drop(first);
     assert!(cached_source_has_blocks(identity.source_id));
+    let reads = THREAD_PHYSICAL_READS.with(std::cell::Cell::get);
+    assert_eq!(second.read_at(1, 3).unwrap(), b"ayl");
+    assert_eq!(THREAD_PHYSICAL_READS.with(std::cell::Cell::get), reads);
     drop(second);
 
     assert!(!manager().handles.lock().unwrap().contains_key(&identity.path));
@@ -549,27 +534,31 @@ fn final_reader_releases_source_and_blocks_without_a_cleanup_event() {
 }
 
 #[test]
-fn tiny_and_empty_blocks_charge_cache_budget() {
-    // Large-payload eviction tests cannot expose unlimited empty cache
-    // entries. Mix a tiny payload with an empty block at each tier's budget.
+fn small_blocks_charge_metadata_and_reserved_capacity() {
+    // A cached short read can own more memory than it returned. Exercise
+    // that and empty block metadata against each tier's budget.
     let path = temp_file("managed_reader_tiny_cache", b"x");
     let source = manager().open_file(&path).unwrap();
-    let budget = 2 * CACHE_BLOCK_METADATA_BYTES + 1;
+    let mut short = Vec::with_capacity(8);
+    short.push(b'x');
+    let capacity = short.capacity();
+    let short = Arc::new(short);
+    let budget = 2 * CACHE_BLOCK_METADATA_BYTES + capacity;
     let mut shard = CacheShard::new(budget, budget);
     let source_path = &source.identity.path;
     for (start, tier) in [(0, CacheTier::Hot), (3, CacheTier::General)] {
         let first = BlockKey::new(&source, start);
         let second = BlockKey::new(&source, start + 1);
         let third = BlockKey::new(&source, start + 2);
-        shard.insert(first, source_path, Arc::from([]), tier);
-        shard.insert(second, source_path, Arc::from([b'x']), tier);
+        shard.insert(first, source_path, Arc::new(Vec::new()), tier);
+        shard.insert(second, source_path, Arc::clone(&short), tier);
         assert!(shard.entries.contains_key(&first));
         assert!(shard.entries.contains_key(&second));
-        shard.insert(third, source_path, Arc::from([]), tier);
+        shard.insert(third, source_path, Arc::new(Vec::new()), tier);
         assert!(!shard.entries.contains_key(&first));
         assert!(shard.entries.contains_key(&second));
         assert!(shard.entries.contains_key(&third));
-        assert_eq!(shard.queue(tier).bytes, 1);
+        assert_eq!(shard.queue(tier).bytes, capacity);
     }
     let _ = std::fs::remove_file(path);
 }
@@ -581,7 +570,7 @@ fn targeted_cache_cleanup_drops_peak_allocations_and_keeps_live_borrows() {
     // readers cannot mask the peak-to-idle transition.
     let path = temp_file("managed_reader_cache_peak", b"payload");
     let source = manager().open_file(&path).unwrap();
-    let payload: Arc<[u8]> = Arc::from(&b"payload"[..]);
+    let payload = Arc::new(b"payload".to_vec());
     let mut shard = CacheShard::new(usize::MAX, usize::MAX);
     let mut keys = Vec::new();
     for generation in 1..=1024 {
@@ -790,22 +779,6 @@ fn multi_volume_stops_at_volume_truncated_after_open() {
 }
 
 #[test]
-fn readers_share_file_handle_and_block_cache() {
-    let path = temp_file("managed_reader_shared", b"abcdefgh");
-    let first = manager().open_file(&path).unwrap();
-    assert_eq!(first.read_at(0, 4).unwrap(), b"abcd");
-    let key = BlockKey::new(&first, 0);
-    assert!(manager()
-        .cached_block(&key)
-        .unwrap()
-        .is_some());
-    let second = manager().open_file(&path).unwrap();
-    assert!(Arc::ptr_eq(&first, &second));
-    assert_eq!(second.read_at(2, 4).unwrap(), b"cdef");
-    let _ = std::fs::remove_file(path);
-}
-
-#[test]
 fn cached_slices_preserve_requested_bytes() {
     let data = vec![0x5au8; BLOCK_SIZE + 32];
     let path = temp_file("managed_reader_slices", &data);
@@ -855,7 +828,7 @@ fn read_block_shares_an_existing_load() {
         .unwrap();
     let key = BlockKey::new(&source, 0);
     manager()
-        .insert_block(&source, key, Arc::from(block), cache_tier(&source, 0))
+        .insert_block(&source, key, Arc::new(block), cache_tier(&source, 0))
         .unwrap();
     manager().finish_block_load(&source, 0, &load).unwrap();
 
@@ -1062,7 +1035,7 @@ fn bug_regression_in_place_write_with_restored_mtime_invalidates_blocks() {
         .insert_block(
             &old_source,
             old_key,
-            Arc::from(&b"new!"[..]),
+            Arc::new(b"new!".to_vec()),
             CacheTier::Hot,
         )
         .unwrap();

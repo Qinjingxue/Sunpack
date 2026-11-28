@@ -524,20 +524,21 @@ impl CleanupOwner {
         self.paths = paths;
     }
 
-    fn release(&mut self, eligible: bool) -> HashSet<String> {
-        let mut allowed = HashSet::new();
+    fn release(&mut self, eligible: bool) {
+        if self.paths.is_empty() { return; }
+        let paths = std::mem::take(&mut self.paths);
         let mut refs = self.registry.lock().unwrap();
-        for key in self.paths.drain() {
-            let entry = refs.paths.get_mut(&key).expect("registered cleanup owner");
+        for key in &paths {
+            let entry = refs.paths.get_mut(key).expect("registered cleanup owner");
             entry.0 -= 1;
             entry.1 |= !eligible;
             if entry.0 == 0 {
-                let remove = !entry.1;
-                refs.paths.remove(&key);
-                if remove { allowed.insert(key); }
+                refs.paths.remove(key);
             }
         }
-        allowed
+        if refs.paths.capacity() > 256 {
+            crate::collections::trim_map(&mut refs.paths);
+        }
     }
 
     fn overlaps(&self) -> bool {
@@ -545,12 +546,12 @@ impl CleanupOwner {
         self.paths.iter().any(|key| refs.paths[key].2)
     }
 
-    fn allowed(&self) -> HashSet<String> {
+    fn allowed(&self) -> HashSet<&str> {
         let refs = self.registry.lock().unwrap();
         self.paths.iter().filter(|&key| {
             let (count, veto, _) = refs.paths[key];
             count == 1 && !veto
-        }).cloned().collect()
+        }).map(String::as_str).collect()
     }
 }
 
@@ -568,7 +569,7 @@ impl SourceCleanup {
 
 impl Drop for CleanupOwner {
     fn drop(&mut self) {
-        if !self.paths.is_empty() { self.release(false); }
+        self.release(false);
     }
 }
 
@@ -3192,7 +3193,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     output_dir: output_string.to_string(),
                     output_volume_key: volume_key,
                     archive_input: Arc::clone(&input),
-                    password_candidates: Arc::clone(&plan.candidates),
+                    password_candidates: plan.candidates.clone(),
                     layout_passwords: std::mem::take(&mut plan.layout_passwords),
                     password: plan.verified_password.clone(),
                     password_verified: plan.verified_password.is_some(),
@@ -3616,11 +3617,16 @@ impl<'run, O: Observer> Run<'run, O> {
         watch_root: bool,
         depth: usize,
     ) -> SourceCleanup {
-        let mut allowed = owner.allowed();
         let mut plan = SourceCleanup { multipart: watch_root && paths.len() > 1, ..Default::default() };
+        if mode == CleanupMode::Keep && depth == self.request.start_depth
+            && !watch_root && self.generated_sources.is_empty()
+        {
+            return plan;
+        }
+        let mut allowed = owner.allowed();
         for path in paths {
             let source = Path::new(path);
-            if !allowed.remove(&namespace_key(source)) { continue; }
+            if !allowed.remove(namespace_key(source).as_str()) { continue; }
             let delete = mode == CleanupMode::Delete || self.generated_source(path, generations, watch_root, depth).is_some();
             if delete || mode == CleanupMode::Recycle {
                 if let Some(generation) = generations.get(&path_key(path)) {

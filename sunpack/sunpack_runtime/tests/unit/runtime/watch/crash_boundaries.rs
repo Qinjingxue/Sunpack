@@ -195,6 +195,8 @@ fn hard_death_replays_delete_receipt_without_reissuing_wal_or_deleting_replaceme
         if std::env::var(CASE).unwrap() == "after_delete" {
             assert!(crate::pipeline::cleanup::clean_source(&deletes[0], true).unwrap());
             observer.source_cleanup_done(1);
+            assert!(journal.state().runtime_record(&id).is_none());
+            assert_eq!(journal.frontier_seq_for_test(), before + 1);
         }
         println!("{READY}");
         io::stdout().flush().unwrap();
@@ -245,15 +247,15 @@ fn hard_death_replays_delete_receipt_without_reissuing_wal_or_deleting_replaceme
             let before = journal.frontier_seq_for_test();
             recover_source_cleanup(&journal, &engine, std::iter::once(base.as_path()), |_, _| true).unwrap();
             assert_eq!(journal.frontier_seq_for_test(), before, "{case}: replay appended a WAL record");
-            assert_eq!(journal.source_cleanup_retired(&id), held.is_none(), "{case}: incorrect receipt status");
+            assert_eq!(journal.state().runtime_record(&id).is_none(), held.is_none(), "{case}: incorrect receipt status");
             if held.is_some() { assert!(source.exists()); }
         }
         if case == "changed_in_place" { held.as_ref().unwrap().set_len(1).unwrap(); }
         drop(held);
-        for _ in 0..2 {
+        {
             let journal = journal::Journal::open(&state_dir, 7).unwrap();
             recover_source_cleanup(&journal, &engine, std::iter::once(base.as_path()), |_, _| true).unwrap();
-            assert!(journal.source_cleanup_retired(&id), "{case}: did not settle the original receipt");
+            assert!(journal.state().runtime_record(&id).is_none(), "{case}: did not settle the original receipt");
             if case != "replace_output" {
                 assert_eq!(output_identity(output.to_str().unwrap()).unwrap(),
                     fs::read_to_string(base.join("output_identity")).unwrap());
@@ -265,7 +267,11 @@ fn hard_death_replays_delete_receipt_without_reissuing_wal_or_deleting_replaceme
                 assert_eq!(fs::read(&source).unwrap(), b"archive");
                 assert_eq!(fs::read(output.join("payload")).unwrap(), b"replacement");
             }
+            journal.flush().unwrap();
         }
+        let journal = journal::Journal::open(&state_dir, 7).unwrap();
+        assert!(journal.state().runtime_record(&id).is_none(), "{case}: flush did not persist receipt retirement");
+        drop(journal);
         fs::remove_dir_all(&base).unwrap();
         fs::remove_file(marker).unwrap();
     }

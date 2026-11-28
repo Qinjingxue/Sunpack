@@ -8,7 +8,7 @@ use crate::analysis_native::volume_anchor::{
 use crate::io::archive_state::{
     AnalysisOrigin, ArchiveInput, InputExtent, InputPart, InputRole, OpenMode, VolumeCompleteness,
 };
-use crate::path_keys::{case_key, path_key};
+use crate::path_keys::{case_key, component_root, path_components, path_key};
 use crate::scan::directory::NativeDirectorySnapshot;
 use crate::scan::executable_carrier::executable_sfx_stub_profile;
 use crate::scan::pe_overlay::{inspect_pe_image_reader, inspect_pe_overlay_reader, PeState};
@@ -670,38 +670,17 @@ fn resolve_single_anchor_volumes<'a>(
 /// Follow shared physical carriers from the requested paths, keeping each group once.
 pub(crate) fn retain_connected_groups(
     groups: &mut Vec<NativeRelationGroup>, requested: &HashSet<String>,
-) -> HashSet<String> {
-    let mut by_path: HashMap<String, Vec<usize>> = HashMap::new();
+) -> impl Iterator<Item = String> {
+    let (mut parents, owners) = path_components(groups.iter().map(NativeRelationGroup::related_paths));
     let mut keep = vec![false; groups.len()];
-    let mut work = Vec::new();
-    for (index, group) in groups.iter().enumerate() {
-        for path in group.related_paths() {
-            let key = path_key(path);
-            if requested.contains(&key) && !keep[index] {
-                keep[index] = true;
-                work.push(index);
-            }
-            by_path.entry(key).or_default().push(index);
-        }
+    for &index in requested.iter().filter_map(|path| owners.get(path)) {
+        keep[component_root(&mut parents, index)] = true;
     }
-    let mut owned = HashSet::new();
-    while let Some(index) = work.pop() {
-        for path in groups[index].related_paths() {
-            let key = path_key(path);
-            if let Some(peers) = by_path.remove(&key) {
-                owned.insert(key);
-                for peer in peers {
-                    if !keep[peer] {
-                        keep[peer] = true;
-                        work.push(peer);
-                    }
-                }
-            }
-        }
-    }
-    let mut index = 0;
-    groups.retain(|_| { let retain = keep[index]; index += 1; retain });
-    owned
+    let mut indexes = 0..groups.len();
+    groups.retain(|_| keep[component_root(&mut parents, indexes.next().unwrap())]);
+    owners.into_iter().filter_map(move |(path, index)| {
+        keep[component_root(&mut parents, index)].then_some(path)
+    })
 }
 
 /// Resolve logical heads independently while retaining physical snapshot/cache
@@ -1194,11 +1173,24 @@ fn project_proposal(
     });
     // Keep the fixed composition for the Rust password probe. Ordered attempts
     // replace it in the worker request and are materialized only on success.
+    let mut zip_position = (proposal.format == "zip" && input.volume_attempts.is_none()).then_some(0u64);
+    let mut zip_eocd_offset = None;
     input.parts = proposal
         .volumes
         .iter()
         .map(|(path, number)| {
             let anchor = validation.anchor(&path_key(path));
+            if let Some(position) = zip_position {
+                zip_position = anchor.and_then(|anchor| {
+                    let start = anchor.structure_offset.unwrap_or(0);
+                    if let Some(eocd) = anchor.zip_eocd_offset.and_then(|eocd| eocd.checked_sub(start)) {
+                        zip_eocd_offset = position.checked_add(eocd);
+                        None
+                    } else {
+                        Some(position.saturating_add(anchor.payload_size()))
+                    }
+                });
+            }
             let terminal = proposal.style == "zip_spanned"
                 && anchor.is_some_and(|anchor| anchor.has_any(TERMINAL));
             InputPart {
@@ -1225,25 +1217,10 @@ fn project_proposal(
         .collect::<Vec<_>>()
         .into_boxed_slice();
     input.volume_style = style.into_owned();
-    if proposal.format == "zip" && input.volume_attempts.is_none() {
-        let mut logical_start = 0u64;
-        for (path, _) in &proposal.volumes {
-            let Some(anchor) = validation.anchor(&path_key(path)) else {
-                break;
-            };
-            let start = anchor.structure_offset.unwrap_or(0);
-            if let Some(eocd) = anchor
-                .zip_eocd_offset
-                .and_then(|eocd| eocd.checked_sub(start))
-            {
-                input.analysis.zip_eocd_offset = logical_start.checked_add(eocd);
-                break;
-            }
-            logical_start = logical_start.saturating_add(anchor.payload_size());
-        }
-    }
+    input.analysis.zip_eocd_offset = zip_eocd_offset;
     let incomplete = missing_disks || validation.status == ProposalStatus::Inconclusive
-        || validation.any_anchor(|anchor| anchor.has_any(UNRESOLVED_VOLUME));
+        || (input.volume_attempts.is_none() && validation.status == ProposalStatus::Valid
+            && validation.any_anchor(|anchor| anchor.has_any(UNRESOLVED_VOLUME)));
     input.analysis.volume_completeness = Some(
         if missing_disks {
             VolumeCompleteness::Missing

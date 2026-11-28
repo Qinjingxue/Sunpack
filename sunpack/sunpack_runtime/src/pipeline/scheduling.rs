@@ -4,7 +4,7 @@
 use super::{Cancellation, Origin};
 use crate::io::resource_lifecycle::IdleRayonPool;
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io;
 use std::future::{poll_fn, Future};
 use std::pin::Pin;
@@ -13,26 +13,75 @@ use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::task::{Context, Poll, Wake, Waker};
 
 /// Serializes async lifecycle transitions without blocking the shared control driver.
-#[derive(Default)]
-pub(crate) struct AsyncGate(Mutex<(bool, Vec<Waker>)>);
+pub(crate) struct AsyncGate(Mutex<GateState>);
 pub(crate) struct AsyncGateGuard<'a>(&'a AsyncGate);
+
+struct GateState {
+    locked: bool,
+    next: u64,
+    waiters: BTreeMap<u64, Waker>,
+}
+
+struct GateWait<'a> {
+    gate: &'a AsyncGate,
+    ticket: Option<u64>,
+}
+
 impl AsyncGate {
-    pub(crate) const fn new() -> Self { Self(Mutex::new((false, Vec::new()))) }
+    pub(crate) const fn new() -> Self {
+        Self(Mutex::new(GateState { locked: false, next: 0, waiters: BTreeMap::new() }))
+    }
+
     pub(crate) async fn lock(&self) -> AsyncGateGuard<'_> {
+        let mut wait = GateWait { gate: self, ticket: None };
         poll_fn(|cx| {
             let mut state = self.0.lock().unwrap();
-            if !state.0 { state.0 = true; Poll::Ready(AsyncGateGuard(self)) }
-            else {
-                if !state.1.iter().any(|wake| wake.will_wake(cx.waker())) { state.1.push(cx.waker().clone()); }
-                Poll::Pending
+            let front = state.waiters.first_key_value().map(|(&ticket, _)| ticket);
+            if !state.locked && front == wait.ticket {
+                state.locked = true;
+                let waker = wait.ticket.take().and_then(|ticket| state.waiters.remove(&ticket));
+                drop(state);
+                let guard = AsyncGateGuard(self);
+                drop(waker);
+                return Poll::Ready(guard);
             }
+            if let Some(ticket) = wait.ticket {
+                state.waiters.get_mut(&ticket).unwrap().clone_from(cx.waker());
+            } else {
+                let ticket = state.next;
+                state.next += 1;
+                state.waiters.insert(ticket, cx.waker().clone());
+                wait.ticket = Some(ticket);
+            }
+            Poll::Pending
         }).await
     }
 }
+
+impl Default for AsyncGate {
+    fn default() -> Self { Self::new() }
+}
+
+impl Drop for GateWait<'_> {
+    fn drop(&mut self) {
+        let Some(ticket) = self.ticket else { return; };
+        let mut state = self.gate.0.lock().unwrap();
+        let handoff = !state.locked && state.waiters.first_key_value().is_some_and(|(&first, _)| first == ticket);
+        let removed = state.waiters.remove(&ticket);
+        let next = if handoff { state.waiters.first_key_value().map(|(_, waker)| waker.clone()) } else { None };
+        drop(state);
+        drop(removed);
+        if let Some(waker) = next { waker.wake(); }
+    }
+}
+
 impl Drop for AsyncGateGuard<'_> {
     fn drop(&mut self) {
-        let wakes = { let mut state = self.0.0.lock().unwrap(); state.0 = false; std::mem::take(&mut state.1) };
-        for wake in wakes { wake.wake(); }
+        let mut state = self.0.0.lock().unwrap();
+        state.locked = false;
+        let next = state.waiters.first_key_value().map(|(_, waker)| waker.clone());
+        drop(state);
+        if let Some(waker) = next { waker.wake(); }
     }
 }
 

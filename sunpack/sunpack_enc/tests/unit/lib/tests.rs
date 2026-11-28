@@ -1,5 +1,46 @@
 use super::*;
 use std::io::Cursor;
+
+struct CpuLease<'a, F: FnMut(usize)> {
+    extra: usize,
+    release: &'a mut F,
+}
+
+impl<F: FnMut(usize)> Drop for CpuLease<'_, F> {
+    fn drop(&mut self) {
+        if self.extra != 0 {
+            (self.release)(self.extra);
+        }
+    }
+}
+
+impl Decoder {
+    fn decrypt_with_budget<R: Read + Seek, W: Write>(
+        &self,
+        input: &mut R,
+        output: &mut W,
+        mut acquire: impl FnMut(usize) -> usize,
+        mut release: impl FnMut(usize),
+        progress: impl FnMut(u64) -> Result<()>,
+    ) -> Result<()> {
+        self.decrypt(
+            input,
+            output,
+            |cipher, offset, bytes, wanted| {
+                let wanted = if wanted == 0 {
+                    0
+                } else {
+                    wanted.min(rayon::current_num_threads().saturating_sub(1))
+                };
+                let extra = if wanted == 0 { 0 } else { acquire(wanted) };
+                let _lease = CpuLease { extra, release: &mut release };
+                cipher.apply_with_threads(offset, bytes, 1 + extra.min(wanted), None);
+            },
+            progress,
+        )
+    }
+}
+
 const FIXTURES: [&[u8]; 10] = [
     include_bytes!("../../data/algorithm_0.mov"),
     include_bytes!("../../data/algorithm_1.mov"),

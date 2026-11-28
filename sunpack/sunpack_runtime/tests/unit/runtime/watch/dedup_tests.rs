@@ -525,6 +525,16 @@ fn logical_archive_boundaries_and_formats_survive_dedup_replay() {
     assert!(!admit(&mut index, &shifted, false));
     let same = spanned(dir.file("spanned-c", b"ABCDEF"), 3);
     assert!(admit(&mut index, &same, false));
+
+    // Replacing one owner's layout must retire its old signature during
+    // replay too, even if the old format would match another live file.
+    other_format.format_hint = "zip".into();
+    assert!(admit(&mut index, &other_format, false));
+    drop(index);
+    let mut index = open();
+    let mut old_layout = dir.file("old-layout", b"ABCDEF");
+    old_layout.format_hint = "rar".into();
+    assert!(!admit(&mut index, &old_layout, false));
 }
 
 #[test]
@@ -630,7 +640,11 @@ fn mapped_parts_keep_exact_physical_source_paths() {
     let record = describe_with_snapshots(&input.entry_path, "scope", &[&input], |path| {
         observed.push(path.to_owned());
         let actual = if path == second { Path::new(&backing.entry_path) } else { path };
-        crate::filesystem::watch_ready_file_snapshot(actual, None, physical_file_generation_from_metadata)
+        let snapshot = crate::filesystem::watch_ready_file_snapshot(actual, None, physical_file_generation_from_metadata)?;
+        if let Some(snapshot) = &snapshot {
+            assert_eq!(snapshot.captured.modified_seconds(), crate::postprocess::mtime_seconds(&snapshot.metadata));
+        }
+        Ok(snapshot)
     }).unwrap().unwrap();
 
     assert_eq!(observed, [PathBuf::from(&first.entry_path), second]);

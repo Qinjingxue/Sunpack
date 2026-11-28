@@ -1,4 +1,5 @@
 use super::*;
+use crate::io::reader::capture_file_generation;
 use crate::io::archive_state::{InputExtent, InputPart, VolumeAttemptPlan, VolumeDomain, VolumeLayout, VolumeSlot};
 use std::{fs, sync::Arc};
 

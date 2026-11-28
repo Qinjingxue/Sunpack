@@ -12,7 +12,7 @@ use crate::scan::discovery::ReadScope;
 use crate::scan::root::{ArchiveRoot, RootRoute};
 
 use crate::scan::{
-    catalog::catalog_stem,
+    catalog::{catalog_stem, catalog_stem_into},
     embedded::scan_embedded_view,
 };
 use rayon::prelude::*;
@@ -685,13 +685,16 @@ pub(super) fn discover<'a>(
     if let Some(aliases) = aliases {
         stems.extend(aliases.stems.iter().cloned());
     }
+    let mut stem = String::new();
     let rows: Vec<_> = raw
         .rows()
         .filter(|&r| {
             !raw.table.is_dir(r)
                 && (is_selected(r)
-                    || raw.table.relation_member_eligible(r)
-                        && stems.contains(&catalog_stem(&raw.table.paths[r])))
+                    || !stems.is_empty() && raw.table.relation_member_eligible(r) && {
+                        catalog_stem_into(&raw.table.paths[r], &mut stem);
+                        stems.contains(stem.as_str())
+                    })
         })
         .collect();
     let pool = cheap_fast_probe_pool();
@@ -1244,7 +1247,7 @@ pub(super) fn discover<'a>(
                     }
                 }
             }
-            crate::relations::retain_connected_groups(&mut relations, &requested);
+            drop(crate::relations::retain_connected_groups(&mut relations, &requested));
         }
         if !peer_tasks.is_empty() {
             for path in relations.iter().flat_map(|group| group.related_paths()) {
@@ -1544,16 +1547,24 @@ pub(super) fn retain_distinct_view_anchors(facts: &mut Vec<Arc<VolumeAnchor>>) {
     fn range(anchor: &VolumeAnchor) -> Option<(u64, u64)> {
         anchor.structure_offset.zip(anchor.proven_extent_end().or(anchor.carrier_limit))
     }
+    if facts.len() < 2 || facts.iter().all(|anchor| anchor.view.is_none()) {
+        return;
+    }
     let plain: HashSet<_> = facts.iter()
         .filter(|anchor| anchor.view.is_none())
-        .filter_map(|anchor| Some((anchor.path.clone(), anchor.format, range(anchor)?)))
+        .filter_map(|anchor| Some((anchor.path.as_str(), anchor.format, range(anchor)?)))
         .collect();
     if plain.is_empty() { return; }
     // Equal heads may still nominate independent boundaries in different views.
-    facts.retain(|anchor| {
-        !anchor.view.as_ref().zip(range(anchor)).is_some_and(|(view, (start, end))| {
+    let duplicates: Vec<_> = facts.iter().enumerate().filter_map(|(index, anchor)| {
+        anchor.view.as_ref().zip(range(anchor)).is_some_and(|(view, (start, end))| {
             view.unchanged(start, end)
-                && plain.contains(&(anchor.path.clone(), anchor.format, (start, end)))
-        })
-    });
+                && plain.contains(&(anchor.path.as_str(), anchor.format, (start, end)))
+        }).then_some(index)
+    }).collect();
+    if !duplicates.is_empty() {
+        let mut duplicates = duplicates.into_iter().peekable();
+        let mut indexes = 0..;
+        facts.retain(|_| duplicates.next_if_eq(&indexes.next().unwrap()).is_none());
+    }
 }

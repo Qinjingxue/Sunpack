@@ -1298,11 +1298,6 @@ pub(super) async fn settle_unwind<T>(future: impl std::future::Future<Output = T
     }).await
 }
 
-struct ReportClose<'a>(&'a reporting::Reports);
-impl Drop for ReportClose<'_> {
-    fn drop(&mut self) { self.0.close(); }
-}
-
 #[derive(Default)]
 struct Display {
     panel: Option<live::Panel>,
@@ -1428,7 +1423,7 @@ impl Observer for Progress {
     }
 
     fn notify(&self, event: Event) {
-        if self.visible && !self.cancel.cancelled() {
+        if self.visible && (self.verbose || !matches!(event, Event::Extracting { .. })) && !self.cancel.cancelled() {
             self.reporting.notify(event);
         }
     }
@@ -1713,10 +1708,10 @@ async fn archives(
         request.cancel = cancel.clone();
         request.checkpoints = std::mem::take(&mut checkpoints);
         request.generated_sources = std::mem::take(&mut generated_sources);
-        let _report_close = ReportClose(&progress.reporting);
+        let _report_close = reporting::CloseOnDrop(&progress.reporting);
         let reporting = if progress.visible {
             let progress = Arc::clone(&progress);
-            Some(engine.spawn_control(crate::pipeline::Origin::Foreground, &Cancellation::new(), async move {
+            Some(engine.spawn_control(crate::pipeline::Origin::Foreground, &Cancellation::default(), async move {
                 progress.reporting.serve_async(|| progress.flush_events()).await;
             })?)
         } else { None };

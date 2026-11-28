@@ -91,13 +91,14 @@ fn dedup_rebuild_keeps_current_baseline_and_replaces_stale_generation() {
     scheduler.dedup_job_id = 1;
     scheduler.dedup_rebuild = Some(DedupRebuild {
         id: 1, generation, cancel: cancel.clone(), handle: None, roots: VecDeque::new(),
+        baseline_paths: None,
     });
-    scheduler.rebuild_dedup(false, false).unwrap();
+    scheduler.rebuild_dedup(false, false, false).unwrap();
     assert_eq!(scheduler.dedup_rebuild.as_ref().unwrap().generation, generation);
     assert!(!cancel.cancelled());
 
     assert!(scheduler.dedup.lock().unwrap().reconcile_journals(&stamps(2)).unwrap());
-    scheduler.rebuild_dedup(false, false).unwrap();
+    scheduler.rebuild_dedup(false, false, false).unwrap();
     assert!(cancel.cancelled());
     assert!(scheduler.dedup_rebuild.is_none());
     assert!(!scheduler.dedup.lock().unwrap().needs_rebuild());
@@ -536,7 +537,8 @@ fn checkpoint_submits_the_first_ready_generation() {
                 assert_eq!(scheduler.pending[&id].candidate.size, admitted.size);
             } else {
                 let active = scheduler.active.values().next().expect("first prepared batch was not submitted");
-                assert!(active.inputs[&id].size == admitted.size && active.inputs[&id].mtime == admitted.mtime,
+                let candidate = &active.inputs[&id].candidate;
+                assert!(candidate.size == admitted.size && candidate.mtime == admitted.mtime,
                     "checkpoint substituted a different generation: {case}");
                 if matches!(case, "content" | "owned_content") {
                     assert!(scheduler.pending[&id].candidate.size > admitted.size,
@@ -1285,8 +1287,11 @@ fn coalesced_watch_completion_keeps_the_leaders_blocker() {
         scheduler.active.insert("follower".into(), Active {
             max_depth: usize::MAX,
             deep: false, root: key(&watched), recovery: None, password_scope: watched.clone(),
-            passwords: scheduler.passwords.snapshot(), inputs: HashMap::from([(id.clone(), candidate.clone())]),
-            quiet: HashMap::new(), dirty: HashSet::new(), claimed,
+            passwords: scheduler.passwords.snapshot(),
+            inputs: HashMap::from([(id.clone(), AdmittedInput {
+                candidate: candidate.clone(), quiet: quiet::Activity::default(),
+            })]),
+            dirty: HashSet::new(), claimed,
             groups: Arc::default(), toast: None, cancel: cancel.clone(), request,
         });
         // The leader has already released its physical claim but the follower

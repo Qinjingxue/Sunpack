@@ -29,7 +29,7 @@ fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 pub(crate) struct Run {
     pub name: String,
     pub first: i64,
@@ -48,7 +48,6 @@ pub(crate) struct Manifest {
     pub live: Option<Run>,
 }
 struct Live {
-    run: Run,
     data: TrackedFile,
     index: TrackedFile,
     rows: HashMap<Arc<str>, LiveRow>,
@@ -65,6 +64,22 @@ struct LiveRow {
     size: u64,
 }
 
+struct HistoryRun {
+    data: TrackedFile,
+    index: TrackedFile,
+    end: u64,
+}
+
+impl HistoryRun {
+    fn open(folder: &Path, run: &Run) -> io::Result<Self> {
+        let (data, index) = files(folder, &run.name);
+        let mut data = open_sparse(&data)?;
+        let index = open_sparse(&index)?;
+        let end = data.seek(SeekFrom::End(0))?;
+        Ok(Self { data, index, end })
+    }
+}
+
 impl Live {
     fn set_revision(&mut self, revision: u64) -> io::Result<()> {
         if self.revision != revision {
@@ -74,8 +89,9 @@ impl Live {
         }
         Ok(())
     }
-    fn remove(&mut self, id: &str) -> io::Result<()> {
+    fn remove(&mut self, id: &str) -> io::Result<bool> {
         if let Some(row) = self.rows.remove(id) {
+            self.set_revision(0)?;
             let slot = row.slot;
             zero(
                 &mut self.index,
@@ -84,8 +100,9 @@ impl Live {
             )?;
             self.release_data(row)?;
             self.free.push(slot);
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
     fn release_data(&mut self, row: LiveRow) -> io::Result<()> {
@@ -99,7 +116,8 @@ pub(crate) struct Store {
     path: PathBuf,
     folder: PathBuf,
     pub manifest: Manifest,
-    current: Option<(TrackedFile, TrackedFile)>,
+    oldest_history: Option<i64>,
+    current: Option<HistoryRun>,
     compressed: Vec<u8>,
     obsolete: Vec<String>,
     live: Option<Live>,
@@ -187,14 +205,14 @@ fn zero(file: &mut TrackedFile, start: u64, end: u64) -> io::Result<()> {
         Ok(())
     }
 }
-fn compress_block(raw: &[u8], compressed: &mut Vec<u8>) -> io::Result<usize> {
+fn compress_block<'a>(raw: &[u8], compressed: &'a mut Vec<u8>) -> io::Result<&'a [u8]> {
     let bound = unsafe { LZ4_compressBound(raw.len() as i32) };
     if bound <= 0 {
         return Err(invalid("display block cannot be compressed"));
     }
-    if compressed.len() < bound as usize {
-        compressed.resize(bound as usize, 0);
-    }
+    compressed.clear();
+    compressed.try_reserve(bound as usize).map_err(|error|
+        io::Error::new(io::ErrorKind::OutOfMemory, error))?;
     let len = unsafe {
         LZ4_compress_default(
             raw.as_ptr(),
@@ -206,7 +224,9 @@ fn compress_block(raw: &[u8], compressed: &mut Vec<u8>) -> io::Result<usize> {
     if len <= 0 {
         return Err(invalid("display compression failed"));
     }
-    Ok(len as usize)
+    // LZ4 initializes the prefix it reports on success.
+    unsafe { compressed.set_len(len as usize) };
+    Ok(compressed)
 }
 fn record_size(data: &mut TrackedFile, entry: &[u8]) -> io::Result<u64> {
     let size = u32::from_le_bytes(entry[16..20].try_into().unwrap());
@@ -246,20 +266,32 @@ fn mix(mut value: u32) -> u32 {
     value = value.wrapping_mul(0x846ca68b);
     value ^ (value >> 16)
 }
-fn add_text(bits: &mut [u64; 4], text: &str) {
-    let text = crate::path_keys::case_key(text);
+fn add_path(bits: &mut [u64; 4], path: &str) {
+    const SLASH: u16 = b'/' as u16;
+    const BACKSLASH: u16 = b'\\' as u16;
+    let mut add = |token| {
+        let hash = mix(token);
+        for bit in [hash & 255, (hash >> 8) & 255] {
+            bits[(bit / 64) as usize] |= 1 << (bit % 64);
+        }
+    };
+    let normalized = |unit| if unit == SLASH { BACKSLASH } else { unit };
     let mut previous = None;
-    for ch in text.encode_utf16() {
-        for token in [
-            Some(ch as u32),
-            previous.map(|p: u16| 0x80000000u32 ^ ((p as u32) << 16) ^ ch as u32),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            let hash = mix(token);
-            for bit in [hash & 255, (hash >> 8) & 255] {
-                bits[(bit / 64) as usize] |= 1 << (bit % 64);
+    for unit in path.encode_utf16() {
+        let ch = if (0xd800..=0xdfff).contains(&unit) {
+            unit
+        } else {
+            crate::path_keys::case_key_unit(unit)
+        };
+        add(u32::from(ch));
+        if ch == SLASH {
+            add(u32::from(BACKSLASH));
+        }
+        if let Some(prev) = previous {
+            add(0x8000_0000 ^ (u32::from(prev) << 16) ^ u32::from(ch));
+            // Only tokens touching a slash differ in the normalized spelling.
+            if prev == SLASH || ch == SLASH {
+                add(0x8000_0000 ^ (u32::from(normalized(prev)) << 16) ^ u32::from(normalized(ch)));
             }
         }
         previous = Some(ch);
@@ -267,25 +299,19 @@ fn add_text(bits: &mut [u64; 4], text: &str) {
 }
 fn filter(value: &Value, group: Option<&Value>) -> [u64; 4] {
     let mut bits = [0; 4];
-    let mut path = |s: &str| {
-        add_text(&mut bits, s);
-        if s.contains('/') {
-            add_text(&mut bits, &s.replace('/', "\\"));
-        }
-    };
     let event_path = value["path"].as_str();
     if let Some(s) = event_path {
-        path(s);
+        add_path(&mut bits, s);
     }
     let layout = group.or_else(|| value.get("group")).unwrap_or(value);
     let group_path = layout["path"].as_str();
     if let Some(s) = group_path.filter(|s| Some(*s) != event_path) {
-        path(s);
+        add_path(&mut bits, s);
     }
     if let Some(members) = layout["members"].as_array() {
         for member in members.iter().filter_map(Value::as_str) {
             if Some(member) != event_path && Some(member) != group_path {
-                path(member);
+                add_path(&mut bits, member);
             }
         }
     }
@@ -412,6 +438,7 @@ impl Store {
         let mut store = Self {
             path,
             folder,
+            oldest_history: manifest.runs.iter().map(|run| run.first).min(),
             manifest,
             current: None,
             compressed: Vec::new(),
@@ -440,16 +467,16 @@ impl Store {
             }
         }
         if let Some(run) = store.manifest.runs.last() {
-            let (data, index) = files(&store.folder, &run.name);
-            let mut data = open_sparse(&data)?;
-            let mut index = open_sparse(&index)?;
+            let mut current = HistoryRun::open(&store.folder, run)?;
             if run.count > 0 {
-                let last = entry(&mut index, run.count - 1)?;
-                let length = record_size(&mut data, &last)?;
-                data.set_len(offset(&last).saturating_add(length))?;
+                let last = entry(&mut current.index, run.count - 1)?;
+                let length = record_size(&mut current.data, &last)?;
+                current.end = offset(&last).saturating_add(length);
+                current.data.set_len(current.end)?;
+                current.data.seek(SeekFrom::Start(current.end))?;
             }
-            index.set_len(run.count * ENTRY_BYTES as u64)?;
-            store.current = Some((data, index));
+            current.index.set_len(run.count * ENTRY_BYTES as u64)?;
+            store.current = Some(current);
         }
         Ok(store)
     }
@@ -471,15 +498,15 @@ impl Store {
         compressed: &mut Vec<u8>,
         data: &mut TrackedFile,
         index: &mut TrackedFile,
+        position: u64,
         slot: u64,
         raw: &[u8],
         record: &RecordIndex,
     ) -> io::Result<LiveRow> {
-        let position = data.seek(SeekFrom::End(0))?;
         let (packed_length, raw_length, size) = if raw.len() <= super::scratch::MEMORY_BYTES {
-            let len = compress_block(raw, compressed)?;
-            data.write_all(&compressed[..len])?;
-            (len as u32, raw.len() as u32, len as u64)
+            let packed = compress_block(raw, compressed)?;
+            data.write_all(packed)?;
+            (packed.len() as u32, raw.len() as u32, packed.len() as u64)
         } else {
             // Zero sizes in the fixed index select a u64 envelope of bounded
             // LZ4 blocks. Publish the index only after the complete record.
@@ -487,18 +514,19 @@ impl Store {
             header[..4].copy_from_slice(b"SPDC");
             header[16..24].copy_from_slice(&(raw.len() as u64).to_le_bytes());
             data.write_all(&header)?;
+            let mut size = header.len() as u64;
             for block in raw.chunks(RECORD_BLOCK_BYTES) {
-                let len = compress_block(block, compressed)?;
-                data.write_all(&(len as u32).to_le_bytes())?;
+                let packed = compress_block(block, compressed)?;
+                data.write_all(&(packed.len() as u32).to_le_bytes())?;
                 data.write_all(&(block.len() as u32).to_le_bytes())?;
-                data.write_all(&compressed[..len])?;
+                data.write_all(packed)?;
+                size += 8 + packed.len() as u64;
             }
-            let end = data.stream_position()?;
-            header[8..16].copy_from_slice(&(end - position).to_le_bytes());
+            header[8..16].copy_from_slice(&size.to_le_bytes());
             data.seek(SeekFrom::Start(position))?;
             data.write_all(&header)?;
-            data.seek(SeekFrom::Start(end))?;
-            (0, 0, end - position)
+            data.seek(SeekFrom::Start(position + size))?;
+            (0, 0, size)
         };
         let mut bytes = [0; ENTRY_BYTES];
         bytes[..8].copy_from_slice(&record.ts.to_le_bytes());
@@ -531,28 +559,30 @@ impl Store {
             .is_none_or(|r| ts < r.last || ts.div_euclid(DAY_US) != r.last.div_euclid(DAY_US));
         if new {
             let run = self.create_run("history");
-            let (data, index) = files(&self.folder, &run.name);
-            self.current = Some((open_sparse(&data)?, open_sparse(&index)?));
+            self.current = Some(HistoryRun::open(&self.folder, &run)?);
             self.manifest.runs.push(run);
         }
-        let (data, index) = self.current.as_mut().unwrap();
+        let current = self.current.as_mut().unwrap();
         let run = self.manifest.runs.last_mut().unwrap();
-        Self::write_record(
+        let row = Self::write_record(
             &mut self.compressed,
-            data,
-            index,
+            &mut current.data,
+            &mut current.index,
+            current.end,
             run.count,
             &record.raw,
             &record.index,
         )?;
+        current.end += row.size;
         if run.count == 0 {
             run.first = ts;
+            self.oldest_history = Some(self.oldest_history.map_or(ts, |first| first.min(ts)));
         }
         run.last = ts;
         run.count += 1;
         Ok(())
     }
-    fn new_live(&self) -> io::Result<Live> {
+    fn new_live(&self) -> io::Result<(Run, Live)> {
         let mut run = self.create_run("live");
         run.unordered = true;
         // The first index entry is a commit marker, outside the row range.
@@ -563,16 +593,18 @@ impl Store {
         let (data, index) = files(&self.folder, &run.name);
         let mut index = open_sparse(&index)?;
         index.write_all(&[0; ENTRY_BYTES])?;
-        Ok(Live {
+        Ok((
             run,
-            data: open_sparse(&data)?,
-            index,
-            rows: HashMap::new(),
-            time: BTreeMap::new(),
-            free: Vec::new(),
-            bytes: 0,
-            revision: 0,
-        })
+            Live {
+                data: open_sparse(&data)?,
+                index,
+                rows: HashMap::new(),
+                time: BTreeMap::new(),
+                free: Vec::new(),
+                bytes: 0,
+                revision: 0,
+            },
+        ))
     }
     pub(crate) fn update_live(
         &mut self,
@@ -580,25 +612,20 @@ impl Store {
         reset: bool,
         cutoff: i64,
     ) -> io::Result<()> {
-        let mut rows = rows.peekable();
-        if !reset && rows.peek().is_none() {
-            return Ok(());
-        }
+        let mut changed = false;
         if reset {
             self.live = None;
             if let Some(old) = self.manifest.live.take() {
                 self.obsolete.push(old.name);
+                changed = true;
             }
-        }
-        if let Some(live) = &mut self.live {
-            live.set_revision(0)?;
         }
         for row in rows {
             let (id, value) = row?;
             let expired = value.as_ref().is_some_and(|event| event.ts <= cutoff);
             let Some(LiveEvent { ts, value, group }) = value.filter(|_| !expired) else {
                 if let Some(live) = &mut self.live {
-                    live.remove(&id)?;
+                    changed |= live.remove(&id)?;
                 }
                 if expired {
                     self.expired_live.push(id);
@@ -606,9 +633,15 @@ impl Store {
                 continue;
             };
             if self.live.is_none() {
-                self.live = Some(self.new_live()?);
+                let (run, live) = self.new_live()?;
+                if let Some(old) = self.manifest.live.replace(run) {
+                    self.obsolete.push(old.name);
+                }
+                self.live = Some(live);
             }
             let live = self.live.as_mut().unwrap();
+            let run = self.manifest.live.as_mut().unwrap();
+            live.set_revision(0)?;
             let slot = if let Some(row) = live.rows.remove(id.as_ref()) {
                 // Readers already reject this revision. Overwrite the index slot
                 // directly and reclaim only the old record's data.
@@ -616,7 +649,7 @@ impl Store {
                 live.release_data(row)?;
                 slot
             } else {
-                live.free.pop().unwrap_or(live.run.count)
+                live.free.pop().unwrap_or(run.count)
             };
             let mut raw = super::scratch::Spool::default();
             let group = group.as_deref();
@@ -629,45 +662,50 @@ impl Store {
                 None => rmp_serde::encode::write(&mut raw, &value),
             }
             .map_err(io::Error::other)?;
+            let position = live.data.seek(SeekFrom::End(0))?;
             let row = Self::write_record(
                 &mut self.compressed,
                 &mut live.data,
                 &mut live.index,
+                position,
                 slot,
                 &raw.finish()?,
                 &RecordIndex::new(&value, ts, group),
             )?;
-            live.run.count = live.run.count.max(slot + 1);
+            run.count = run.count.max(slot + 1);
             live.bytes += row.size;
             live.time.insert((ts, slot), Arc::clone(&id));
             live.rows.insert(id, row);
+            changed = true;
         }
-        self.manifest.task_revision += 1;
-        self.finish_live()
+        if changed {
+            self.manifest.task_revision += 1;
+            self.finish_live()?;
+        }
+        Ok(())
     }
     fn finish_live(&mut self) -> io::Result<()> {
-        if self.live.as_ref().is_some_and(|live| live.rows.is_empty()) {
-            let live = self.live.take().unwrap();
-            self.obsolete.push(live.run.name);
-            self.manifest.live = None;
-        }
-        if let Some(live) = &mut self.live {
-            let ((first, _), _) = live.time.first_key_value().unwrap();
-            live.run.first = *first;
-            let ((last, _), _) = live.time.last_key_value().unwrap();
-            live.run.last = *last;
-            let repack = live.data.metadata()?.len()
-                > (4 * 1024 * 1024).max(live.bytes.saturating_mul(2))
-                || live.run.count > 256.max(live.rows.len() as u64 * 4);
-            if repack {
-                self.repack_live()?;
-            }
-            self.manifest.live = self.live.as_ref().map(|live| live.run.clone());
+        let Some(live) = &mut self.live else {
+            return Ok(());
+        };
+        let Some((&(first, _), _)) = live.time.first_key_value() else {
+            self.live = None;
+            self.obsolete.push(self.manifest.live.take().unwrap().name);
+            return Ok(());
+        };
+        let run = self.manifest.live.as_mut().unwrap();
+        run.first = first;
+        let (&(last, _), _) = live.time.last_key_value().unwrap();
+        run.last = last;
+        if live.data.metadata()?.len() > (4 * 1024 * 1024).max(live.bytes.saturating_mul(2))
+            || run.count > 256.max(live.rows.len() as u64 * 4)
+        {
+            self.repack_live()?;
         }
         Ok(())
     }
     fn repack_live(&mut self) -> io::Result<()> {
-        let mut new = self.new_live()?;
+        let (mut run, mut new) = self.new_live()?;
         let old = self.live.as_mut().unwrap();
         let mut buffer = [0u8; 65536];
         for ((ts, _), id) in &old.time {
@@ -683,29 +721,29 @@ impl Store {
                 remaining -= count as u64;
             }
             bytes[8..16].copy_from_slice(&position.to_le_bytes());
-            bytes[28..32].copy_from_slice(&(new.run.count as u32).to_le_bytes());
+            bytes[28..32].copy_from_slice(&(run.count as u32).to_le_bytes());
             new.index.write_all(&bytes)?;
-            new.time.insert((*ts, new.run.count), id.clone());
+            new.time.insert((*ts, run.count), id.clone());
             new.rows.insert(id.clone(), LiveRow {
-                slot: new.run.count,
+                slot: run.count,
                 stamp: *ts,
                 offset: position,
                 size: row.size,
             });
-            new.run.count += 1;
+            run.count += 1;
             new.bytes += row.size;
         }
-        new.run.first = old.run.first;
-        new.run.last = old.run.last;
-        self.obsolete.push(old.run.name.clone());
+        let current = self.manifest.live.as_mut().unwrap();
+        run.first = current.first;
+        run.last = current.last;
+        self.obsolete.push(std::mem::replace(current, run).name);
         self.live = Some(new);
         Ok(())
     }
     pub(crate) fn expire(&mut self, cutoff: i64) -> io::Result<Option<i64>> {
-        let mut next = self.manifest.runs.iter().map(|run| run.first).min();
-        if next.is_some_and(|first| first <= cutoff) {
+        if self.oldest_history.is_some_and(|first| first <= cutoff) {
             self.expire_history(cutoff)?;
-            next = self.manifest.runs.iter().map(|run| run.first).min();
+            self.oldest_history = self.manifest.runs.iter().map(|run| run.first).min();
         }
         let mut expired = false;
         if let Some(live) = &mut self.live {
@@ -714,10 +752,8 @@ impl Store {
                     break;
                 }
                 let id = id.clone();
-                if !expired {
-                    live.set_revision(0)?;
-                }
-                live.remove(id.as_ref())?;
+                let removed = live.remove(id.as_ref())?;
+                debug_assert!(removed);
                 self.expired_live.push(id);
                 expired = true;
             }
@@ -726,10 +762,8 @@ impl Store {
             self.manifest.task_revision += 1;
             self.finish_live()?;
         }
-        Ok(next
-            .into_iter()
-            .chain(self.live.iter().map(|live| live.run.first))
-            .min())
+        let oldest_live = self.live.as_ref().and(self.manifest.live.as_ref()).map(|run| run.first);
+        Ok(self.oldest_history.into_iter().chain(oldest_live).min())
     }
     fn expire_history(&mut self, cutoff: i64) -> io::Result<()> {
         let runs = &mut self.manifest.runs;
@@ -773,8 +807,7 @@ impl Store {
         }
         if self.current.is_none() {
             if let Some(run) = runs.last() {
-                let (data, index) = files(&self.folder, &run.name);
-                self.current = Some((open_sparse(&data)?, open_sparse(&index)?));
+                self.current = Some(HistoryRun::open(&self.folder, run)?);
             }
         }
         self.manifest.task_revision += 1;

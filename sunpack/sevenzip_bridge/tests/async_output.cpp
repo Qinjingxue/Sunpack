@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <array>
+#include <atomic>
 #include <cstdlib>
 #include <cstdint>
 #include <filesystem>
@@ -83,8 +84,12 @@ bool write_same_file_concurrently(const std::filesystem::path& directory) {
     AsyncWriterConfig config;
     config.threads_per_volume = 4;
     config.buffer_count = 8;
+    std::atomic<int> open_calls{0};
+    const std::string volume = "test:parallel";
     AsyncFileWriter writer(
-        std::make_shared<VolumeState>("test:parallel", false), config);
+        std::make_shared<VolumeState>(volume, false,
+            std::make_shared<sunpack::sevenzip::VolumeSpaceGate>(volume, nullptr)), config);
+    writer.set_open_probe_for_test([&open_calls](const std::wstring &) { open_calls.fetch_add(1); });
     const auto job = writer.make_job();
     auto times = historical_times();
     times.defined |= ArchiveItemMetadata::Attributes;
@@ -114,10 +119,11 @@ bool write_same_file_concurrently(const std::filesystem::path& directory) {
         snapshot.written_bytes != expected.size() || snapshot.peak_active_data_writes < 2 ||
         metrics.accepted_bytes != expected.size() || metrics.written_bytes != expected.size() ||
         metrics.pending_bytes != 0 || metrics.discarded_bytes != 0 ||
-        metrics.completed_files != 1 || metrics.completed_jobs != 1) {
+        metrics.completed_files != 1 || metrics.completed_jobs != 1 || open_calls.load() != 1) {
         std::cerr << "parallel output state: accepted=" << snapshot.accepted_bytes
                   << " written=" << snapshot.written_bytes
-                  << " peak=" << snapshot.peak_active_data_writes << "\n";
+                  << " peak=" << snapshot.peak_active_data_writes
+                  << " opens=" << open_calls.load() << "\n";
         return false;
     }
 
@@ -811,6 +817,7 @@ bool registry_reclaims_idle_facilities() {
 bool registry_trims_payloads_at_completion(const std::filesystem::path& directory) {
     AsyncWriterConfig config;
     config.buffer_count = 16;
+    config.queue_limit = 8;
     std::size_t reap_changes = 0;
     VolumeWriterRegistry registry(config, {}, [&] { ++reap_changes; });
     auto lease = registry.acquire("batch-volume");
@@ -832,11 +839,12 @@ bool registry_trims_payloads_at_completion(const std::filesystem::path& director
     }
     if (writer->finish_job(job) != S_OK || writer->idle_memory_bytes() != (12U << 20)) return false;
     lease.reset();
-    if (writer->idle_memory_bytes() != (12U << 20) || reap_changes != 0) return false;
+    if (writer->idle_memory_bytes() != (12U << 20) || reap_changes != 0 ||
+        writer->active_file_slots_for_test() < files.size()) return false;
     overlapping.reset();
     auto reused = registry.acquire("batch-volume");
     if (&reused.writer() != writer.get() || writer->idle_memory_bytes() != AsyncFileWriter::kDefaultFileInFlightBytes ||
-        reap_changes != 1) return false;
+        reap_changes != 1 || writer->active_file_slots_for_test() > config.queue_limit) return false;
 
     // A smaller batch keeps the same writer busy but no longer needs the
     // large payloads. Advance only their retention clock.

@@ -47,17 +47,20 @@ fn deferred_completion_submits_every_projection_before_waiting() {
     let marker = crate::test_support::temp_file("deferred_journal", b"");
     let dir = marker.with_extension("state");
     let journal = Journal::open(&dir, 7).unwrap();
-    let (prepared, durable) = journal.defer_waits(|| {
-        for generation in 1..=32 {
+    let submit = |generations: std::ops::RangeInclusive<i64>| {
+        for generation in generations {
             journal.commit(generation % 2 == 1, |_| Ok(NativeWatchOperations::password_generation(
                 generation, generation.to_string()))).unwrap();
-            DEFERRED.with(|slot| assert_eq!(slot.borrow().as_ref().unwrap().1.len(), generation as usize));
         }
-        assert_eq!(journal.state().password_generation(), 32);
-        journal.frontier.lock().unwrap().seq
-    });
+    };
+    let (_, earlier) = journal.prepare_waits(|| submit(1..=16));
+    assert_eq!(journal.state().password_generation(), 16);
+    let (_, durable) = journal.defer_waits(|| submit(17..=32));
     durable.unwrap();
-    assert_eq!(prepared, 32);
+    // A later acknowledgement can account for both batches before the
+    // earlier waiter resumes. Count the shared prefix once.
+    journal.wait_prepared(earlier).unwrap();
+    assert_eq!(journal.state().password_generation(), 32);
     assert_eq!(
         journal.frontier.lock().unwrap().bytes + crate::wal::FILE_HEADER_BYTES,
         fs::metadata(segment_path(&dir, 1)).unwrap().len(),

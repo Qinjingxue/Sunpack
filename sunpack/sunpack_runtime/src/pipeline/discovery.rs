@@ -9,7 +9,7 @@ use crate::io::archive_state::{
 use crate::io::directory_errors::{DirectoryReadError, DirectoryReadErrors};
 use crate::io::reader::{ManagedReader, NativeArchiveSession};
 use crate::password::rar::resolve_embedded_rar_boundaries;
-use crate::path_keys::{path_ancestors, path_key};
+use crate::path_keys::{component_root, path_ancestors, path_components, path_key};
 use crate::scan::directory::{
     classify_scan_targets, filesystem_logical_name, walk_reachable_keys, NativeDirectoryScanOptions,
     NativeDirectorySnapshot, NativeOutputInventory,
@@ -511,8 +511,9 @@ fn suppress_prepared_continuations(prepared: &[Task], tasks: &mut Vec<Task>) {
     }
 
     fn covers(claim: &InputExtent, member: &InputExtent) -> bool {
-        claim.view == member.view && claim.start <= member.start
+        claim.start <= member.start
             && claim.end.is_none_or(|end| member.end.is_some_and(|member_end| end >= member_end))
+            && claim.view == member.view
     }
 
     if !tasks.iter().any(|task| headless_missing(task).is_some()) { return; }
@@ -544,9 +545,13 @@ fn suppress_prepared_continuations(prepared: &[Task], tasks: &mut Vec<Task>) {
         !first_claims.iter().any(|&(plan, format, claim)| {
             format == input.format_hint && covers(claim, first)
                 && others.iter().all(|&(claims, extent)| {
-                    claims.is_some_and(|claims| claims.iter().any(|&(owner, _, claim)|
-                        owner == plan && covers(claim, extent)
-                    ))
+                    claims.is_some_and(|claims| {
+                        // The prepared pass appends all claims in plan order.
+                        let start = claims.partition_point(|&(owner, _, _)| owner < plan);
+                        claims[start..].iter()
+                            .take_while(|&&(owner, _, _)| owner == plan)
+                            .any(|&(_, _, claim)| covers(claim, extent))
+                    })
                 })
         })
     });
@@ -1479,51 +1484,40 @@ fn dedup_shared_inputs(inputs: &mut Vec<LogicalInput>) {
 }
 
 fn merge_shared_inputs(tasks: &mut Vec<Task>, blocked_paths: &mut HashSet<String>) {
-    let mut owners = HashMap::new();
-    let mut parents: Vec<_> = (0..tasks.len()).collect();
-    let mut shared = false;
-    for (index, task) in tasks.iter().enumerate() {
-        for path in &task.owned_paths {
-            if let Some(other) = owners.insert(path_key(path), index) {
-                let left = root(&mut parents, index);
-                let right = root(&mut parents, other);
-                if left != right {
-                    parents[left] = right;
-                    shared = true;
-                }
-            }
-        }
-    }
-    if !shared {
+    let (mut parents, _) = path_components(tasks.iter().map(|task| task.owned_paths.iter().map(String::as_str)));
+    if parents.iter().enumerate().all(|(index, &parent)| index == parent) {
         return;
     }
-    let mut combined: BTreeMap<usize, (Task, bool)> = BTreeMap::new();
-    for (index, task) in std::mem::take(tasks).into_iter().enumerate() {
-        let group = root(&mut parents, index);
-        match combined.entry(group) {
-            std::collections::btree_map::Entry::Vacant(slot) => {
-                slot.insert((task, false));
-            }
-            std::collections::btree_map::Entry::Occupied(mut slot) => {
-                let (combined, shared) = slot.get_mut();
-                *shared = true;
-                if task.source == DiscoverySource::Relations
-                    && combined.source != DiscoverySource::Relations
-                {
-                    combined.primary = Some(Box::new(task.entry().clone()));
-                    combined.source = DiscoverySource::Relations;
-                } else if combined.primary.is_none() {
-                    combined.primary = Some(Box::new(combined.entry().clone()));
-                }
-                combined.inputs.extend(task.inputs);
-                combined.owned_paths.extend(task.owned_paths);
-            }
+    // Component roots are dense task indices. Keep the sole task for an
+    // independent component in its existing slot, even if another overlaps.
+    let mut groups: Vec<Option<(usize, bool)>> = vec![None; tasks.len()];
+    for index in 0..tasks.len() {
+        let root = component_root(&mut parents, index);
+        let Some((first, shared)) = &mut groups[root] else {
+            groups[root] = Some((index, false));
+            continue;
+        };
+        *shared = true;
+        let (previous, current) = tasks.split_at_mut(index);
+        let combined = &mut previous[*first];
+        let task = &mut current[0];
+        if task.source == DiscoverySource::Relations && combined.source != DiscoverySource::Relations {
+            combined.primary = Some(task.primary.take().unwrap_or_else(|| Box::new(task.entry().clone())));
+            combined.source = DiscoverySource::Relations;
+        } else if combined.primary.is_none() {
+            combined.primary = Some(Box::new(combined.entry().clone()));
         }
+        combined.inputs.extend(std::mem::take(&mut task.inputs));
+        combined.owned_paths.extend(std::mem::take(&mut task.owned_paths));
+        task.primary = None;
+        task.context = None;
     }
-    tasks.extend(combined.into_values().map(|(mut task, shared)| {
-        if !shared {
-            return task;
-        }
+    for (root, group) in groups.iter().enumerate() {
+        let Some((first, true)) = *group else { continue; };
+        // Different components have disjoint slots. Moving the retained task
+        // to its root preserves the previous root order after compaction.
+        tasks.swap(root, first);
+        let task = &mut tasks[root];
         let mut seen = HashSet::new();
         task.owned_paths.retain(|path| {
             let key = path_key(path);
@@ -1546,16 +1540,13 @@ fn merge_shared_inputs(tasks: &mut Vec<Task>, blocked_paths: &mut HashSet<String
         } else if task.inputs.len() == 1 {
             task.primary = None;
         }
-        task
-    }));
-}
-
-fn root(parents: &mut [usize], mut index: usize) -> usize {
-    while parents[index] != index {
-        parents[index] = parents[parents[index]];
-        index = parents[index];
     }
-    index
+    let mut groups = groups.into_iter();
+    tasks.retain(|_| groups.next().unwrap().is_some());
+    drop(groups);
+    if tasks.capacity() > tasks.len().saturating_mul(2).max(16) {
+        tasks.shrink_to_fit();
+    }
 }
 
 #[cfg(test)]

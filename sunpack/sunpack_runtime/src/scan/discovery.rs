@@ -454,9 +454,10 @@ impl NativeEmbeddedBatch {
 fn scan_embedded_jobs(
     groups: &[(&NativeCandidateTable, &NativeEmbeddedBatch)],
     jobs: &[(usize, usize)],
-) -> std::io::Result<Vec<(usize, usize, EmbeddedOutcome)>> {
+) -> std::io::Result<Vec<(usize, EmbeddedOutcome)>> {
     let cancellation = crate::io::cancellation::Cancellation::current();
     cancellation.check_io()?;
+    if jobs.is_empty() { return Ok(Vec::new()); }
     let outcomes = (|| {
         // File producers also own per-file validation state. Matching jobs
         // continue to share the existing eight-thread IOCP scan pool.
@@ -468,8 +469,8 @@ fn scan_embedded_jobs(
                 let (path, pe) = table.rows[index].embedded_source();
                 !path.is_empty() && (batch.force_scan || pe != Some(PeState::Confirmed))
             })
+            .take(parallel_jobs)
             .count()
-            .min(parallel_jobs)
             .max(1);
         let mut order = Vec::new();
         if parallel_files > 1 && jobs.len() > parallel_jobs {
@@ -512,21 +513,24 @@ fn scan_embedded_jobs(
                             retention,
                         );
                         if !matches!(outcome, EmbeddedOutcome::Residual) {
-                            completed.push((position, group, index, outcome));
+                            completed.push((position, outcome));
                         }
                     }
                     completed
                 })
             })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .flatten()
-            .collect();
-        outcomes.sort_unstable_by_key(|(position, ..)| *position);
+            .reduce_with(|mut first, mut second| {
+                if first.capacity() < second.capacity() {
+                    std::mem::swap(&mut first, &mut second);
+                }
+                first.append(&mut second);
+                first
+            })
+            .unwrap();
+        if parallel_jobs > 1 {
+            outcomes.sort_unstable_by_key(|(position, _)| *position);
+        }
         outcomes
-            .into_iter()
-            .map(|(_, group, index, outcome)| (group, index, outcome))
-            .collect()
     })();
     cancellation.check_io()?;
     Ok(outcomes)
@@ -574,7 +578,10 @@ impl NativeEmbeddedBatch {
         let borrowed: Vec<_> = groups.iter().map(|(table, batch)| (&**table, &**batch)).collect();
         let outcomes = scan_embedded_jobs(&borrowed, &jobs)?;
         // Results follow job order, where each group's rows are contiguous.
-        let mut outcomes = outcomes.into_iter().peekable();
+        let mut outcomes = outcomes.into_iter().map(|(position, outcome)| {
+            let (group, index) = jobs[position];
+            (group, index, outcome)
+        }).peekable();
         let mut projected = Vec::new();
         for (group, (table, batch)) in groups.into_iter().enumerate() {
             if outcomes.peek().is_some_and(|(selected, _, _)| *selected == group) {
@@ -914,7 +921,7 @@ impl NativeEmbeddedBatch {
             let requested: HashSet<_> = table.rows.iter().enumerate()
                 .filter(|(index, _)| !batch.supplemental.contains(index))
                 .map(|(_, row)| path_key(row.path())).collect();
-            let owned = crate::relations::retain_connected_groups(&mut groups, &requested);
+            let owned: HashSet<_> = crate::relations::retain_connected_groups(&mut groups, &requested).collect();
             fallback.retain(|row| !batch.supplemental.contains(&row.index())
                 || owned.contains(&path_key(table.rows[row.index()].path())));
         }

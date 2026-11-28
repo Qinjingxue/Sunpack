@@ -18,7 +18,7 @@ enum Phase {
 }
 
 struct TaskRow {
-    path: PathBuf,
+    verbose_path: Option<PathBuf>,
     segment: bool,
     parent: Option<TaskId>,
     children: BTreeSet<TaskId>,
@@ -98,9 +98,9 @@ impl Panel {
             Event::Waiting { id } => (id, Some(Phase::Queued)),
             Event::Working { id } => (id, Some(Phase::Working)),
             Event::Extracting { id } => {
-                if self.verbose {
-                    if let Some(task) = self.tasks.get_mut(&id) {
-                        task.detail = Some(language.translate("extract.log.start", &[("archive", &task.path.to_string_lossy())]).trim().to_owned());
+                if let Some(task) = self.tasks.get_mut(&id) {
+                    if let Some(path) = &task.verbose_path {
+                        task.detail = Some(language.translate("extract.log.start", &[("archive", &path.to_string_lossy())]).trim().to_owned());
                     }
                 }
                 (id, None)
@@ -164,6 +164,7 @@ impl Panel {
                 Phase::Finished(result) => {
                     if result.status == TaskStatus::Complete { task.progress = Some((1, 1)); }
                     task.detail = None;
+                    task.verbose_path = None;
                 }
                 Phase::Queued => {}
             }
@@ -201,7 +202,7 @@ impl Panel {
         self.tasks.insert(
             id,
             TaskRow {
-                path, segment: is_segment,
+                verbose_path: self.verbose.then_some(path), segment: is_segment,
                 parent,
                 label,
                 children: BTreeSet::new(),

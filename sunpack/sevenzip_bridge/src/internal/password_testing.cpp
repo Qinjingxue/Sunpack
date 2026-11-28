@@ -146,37 +146,46 @@ namespace sunpack::sevenzip
         };
 
         struct ProbeVolumeRanges {
-            std::vector<UInt64> starts;
-            std::vector<UInt32> variable;
+            std::vector<UInt64> zip_disk_starts;
+            std::vector<UInt32> rar_variable_prefix;
+            UInt64 total_size = 0;
             mutable std::optional<VolumeReadUncertainty> reads;
             mutable std::atomic<bool> incomplete_read{false};
             const bool password_verified;
             const bool fixed_layout;
+            bool variable_layout = false;
 
             ProbeVolumeRanges(const VolumeAttemptPlan* plan, const std::vector<ExtractInputRange>& ranges,
                               const std::wstring& format, bool verified)
                 : password_verified(verified), fixed_layout(!plan) {
-                if (!plan || std::none_of(plan->variation.begin(), plan->variation.end(),
-                    [](const auto& slot) { return slot.variable; })) return;
-                if ((format == L"7z" || format == L"zip" || format == L"rar" ||
-                     format == L"rar4" || format == L"rar5") && !ranges.empty() &&
-                    std::all_of(ranges.begin(), ranges.end(), [](const auto& range) { return range.has_end; }))
-                    reads.emplace();
-                starts.reserve(ranges.size() + 1);
-                variable.reserve(ranges.size() + 1);
-                starts.push_back(0);
-                variable.push_back(0);
+                variable_layout = plan && std::any_of(plan->variation.begin(), plan->variation.end(),
+                    [](const auto& slot) { return slot.variable; });
+                const bool zip = format == L"zip";
+                const bool rar = format == L"rar" || format == L"rar4" || format == L"rar5";
+                if (!variable_layout || ranges.empty() ||
+                    (!zip && !rar && format != L"7z") ||
+                    std::any_of(ranges.begin(), ranges.end(), [](const auto& range) { return !range.has_end; }))
+                    return;
+                reads.emplace();
+                if (zip) {
+                    zip_disk_starts.reserve(ranges.size());
+                } else if (rar) {
+                    rar_variable_prefix.reserve(ranges.size() + 1);
+                    rar_variable_prefix.push_back(0);
+                }
                 for (std::size_t i = 0; i < ranges.size(); ++i) {
-                    const auto& r = ranges[i];
-                    starts.push_back(r.has_end && r.end - r.start <= UINT64_MAX - starts.back()
-                        ? starts.back() + r.end - r.start : UINT64_MAX);
-                    variable.push_back(variable.back() + plan->variation[i].variable);
-                    if (reads && plan->variation[i].variable) {
-                        reads->uncertain_ranges.emplace_back(starts[i], starts[i + 1]);
+                    const auto begin = total_size;
+                    const auto length = ranges[i].end - ranges[i].start;
+                    total_size += (std::min)(length, UINT64_MAX - total_size);
+                    const auto variable = plan->variation[i].variable;
+                    if (zip) zip_disk_starts.push_back(begin);
+                    if (rar) rar_variable_prefix.push_back(rar_variable_prefix.back() + variable);
+                    if (variable) {
+                        reads->uncertain_ranges.emplace_back(begin, total_size);
                         reads->variable_slots.push_back(i);
                     }
                 }
-                if (reads && !reads->uncertain_ranges.empty())
+                if (!reads->uncertain_ranges.empty())
                     reads->observed = std::make_unique<std::atomic<bool>[]>(reads->uncertain_ranges.size());
             }
             bool fixed_member_crc(const std::wstring& format) const {
@@ -215,7 +224,7 @@ namespace sunpack::sevenzip
                 }
             }
             MemberVolumeMatch member_match(IInArchive* archive, UInt32 index, const std::wstring& format) const {
-                if (starts.empty()) return MemberVolumeMatch::Fixed;
+                if (!variable_layout) return MemberVolumeMatch::Fixed;
                 if (!reads) return MemberVolumeMatch::Possible;
                 PROPVARIANT prop{};
                 if (format == L"rar4" || format == L"rar5") {
@@ -223,15 +232,19 @@ namespace sunpack::sevenzip
                         return MemberVolumeMatch::Possible;
                     const auto disks = prop_u64(prop);
                     const auto first = static_cast<UInt32>(disks), last = static_cast<UInt32>(disks >> 32);
-                    if (first > last || last >= variable.size() - 1) return MemberVolumeMatch::Possible;
-                    return variable[last + 1] != variable[first] ? MemberVolumeMatch::Covered : MemberVolumeMatch::Fixed;
+                    const auto after = std::size_t{last} + 1;
+                    if (first > last || after >= rar_variable_prefix.size())
+                        return MemberVolumeMatch::Possible;
+                    return rar_variable_prefix[after] != rar_variable_prefix[first]
+                        ? MemberVolumeMatch::Covered : MemberVolumeMatch::Fixed;
                 }
                 if (!get_item_property(archive, index, kpidSunpackProofOffset, prop)) return MemberVolumeMatch::Possible;
                 auto begin = prop_u64(prop);
                 if (format == L"zip" && get_item_property(archive, index, kpidVolumeIndex, prop)) {
                     const auto disk = prop_u32(prop);
-                    if (disk >= starts.size() - 1 || begin > UINT64_MAX - starts[disk]) return MemberVolumeMatch::Possible;
-                    begin += starts[disk];
+                    if (disk >= zip_disk_starts.size() || begin > UINT64_MAX - zip_disk_starts[disk])
+                        return MemberVolumeMatch::Possible;
+                    begin += zip_disk_starts[disk];
                 }
                 if (get_item_property(archive, index, kpidSunpackProofPackedSize, prop))
                     return span_match(begin, prop_u64(prop));
@@ -254,14 +267,11 @@ namespace sunpack::sevenzip
                 return MemberVolumeMatch::Possible;
             }
             MemberVolumeMatch span_match(UInt64 begin, UInt64 size) const {
-                if (starts.empty()) return MemberVolumeMatch::Fixed;
-                if (!reads || !size || starts.back() == UINT64_MAX ||
-                    begin >= starts.back() || size > starts.back() - begin)
+                if (!variable_layout) return MemberVolumeMatch::Fixed;
+                if (!reads || !size || total_size == UINT64_MAX || begin >= total_size || size > total_size - begin)
                     return MemberVolumeMatch::Possible;
-                const auto end = begin + size;
-                const auto first = std::upper_bound(starts.begin(), starts.end(), begin) - starts.begin() - 1;
-                const auto after = std::lower_bound(starts.begin(), starts.end(), end) - starts.begin();
-                return variable[after] != variable[first] ? MemberVolumeMatch::Covered : MemberVolumeMatch::Fixed;
+                return reads->first_overlapping_range(begin, size) != reads->uncertain_ranges.end()
+                    ? MemberVolumeMatch::Covered : MemberVolumeMatch::Fixed;
             }
         };
 
@@ -844,7 +854,7 @@ namespace sunpack::sevenzip
                 return result;
             }
 
-            auto *raw_open_callback = new OpenCallback(password, input.handler_callback_path(format.Data4[5] == 0x01, mode),
+            auto *raw_open_callback = new OpenCallback(password, input.take_handler_callback_path(format.Data4[5] == 0x01, mode),
                 part_paths, canonical_names, InputPrefetchConfig{false}, native_job_cancel_token(), input_ranges,
                 volumes.observer(), !final_read_only);
             CMyComPtr<IArchiveOpenCallback> open_callback(raw_open_callback);
@@ -1147,7 +1157,6 @@ namespace sunpack::sevenzip
             bool open_incomplete = false;
         };
         std::vector<BatchOutcome> outcomes(parallel.size());
-        std::vector<std::optional<PasswordTestResult>> unresolved(parallel.size());
         enum class CandidateProof : unsigned char { Untested, Rejected, Unresolved, Weak };
         std::vector<CandidateProof> proofs(count, CandidateProof::Untested);
         const auto record = [&](std::size_t lane, std::size_t index, PasswordTestResult current, bool open_incomplete) {
@@ -1161,9 +1170,9 @@ namespace sunpack::sevenzip
                 // Decrypting another header can expose a different usable
                 // member. Preserve this candidate and continue the method.
                 proofs[index] = CandidateProof::Unresolved;
-                if (!unresolved[lane]) {
+                if (!outcomes[lane].result) {
                     current.matched_index = static_cast<int>(index);
-                    unresolved[lane] = std::move(current);
+                    outcomes[lane].result = std::move(current);
                 }
                 return false;
             }
@@ -1172,6 +1181,7 @@ namespace sunpack::sevenzip
                 current.matched_index = static_cast<int>(index);
                 auto old = earliest.load(std::memory_order_relaxed);
                 while (index < old && !earliest.compare_exchange_weak(old, index, std::memory_order_relaxed)) {}
+                // A terminal result makes every lane's unresolved fallback irrelevant.
                 outcomes[lane] = {std::move(current), open_incomplete};
                 return true;
             }
@@ -1218,25 +1228,26 @@ namespace sunpack::sevenzip
             return last;
         }
         const auto stop = earliest.load(std::memory_order_relaxed);
-        for (auto& [outcome, open_incomplete] : outcomes) {
-            if (!outcome || static_cast<std::size_t>(outcome->matched_index) != stop) continue;
-            if (outcome->status == PasswordTestStatus::Ok) {
-                outcome->matched_index = static_cast<int>(global_index(outcome->matched_index));
-                volumes.attach(*outcome, open_incomplete);
-                return std::move(*outcome);
+        if (stop == count) {
+            for (auto& outcome : outcomes)
+                if (outcome.result && (last.matched_index == -1 || outcome.result->matched_index < last.matched_index))
+                    last = std::move(*outcome.result);
+        } else {
+            for (auto& [outcome, open_incomplete] : outcomes) {
+                if (!outcome || static_cast<std::size_t>(outcome->matched_index) != stop) continue;
+                if (outcome->status == PasswordTestStatus::Ok) {
+                    outcome->matched_index = static_cast<int>(global_index(outcome->matched_index));
+                    volumes.attach(*outcome, open_incomplete);
+                    return std::move(*outcome);
+                }
+                if (outcome->operation_result == kSunpackZipLocalHeaderConflict) {
+                    outcome->matched_index = -1;
+                    volumes.attach(*outcome, open_incomplete);
+                    return std::move(*outcome);
+                }
+                last = std::move(*outcome);
+                break;
             }
-            if (outcome->operation_result == kSunpackZipLocalHeaderConflict) {
-                outcome->matched_index = -1;
-                volumes.attach(*outcome, open_incomplete);
-                return std::move(*outcome);
-            }
-            last = std::move(*outcome);
-            break;
-        }
-        if (last.matched_index == -1) {
-            for (auto& outcome : unresolved)
-                if (outcome && (last.matched_index == -1 || outcome->matched_index < last.matched_index))
-                    last = std::move(*outcome);
         }
         const auto retained = [&](std::size_t index) {
             return proofs[index] != CandidateProof::Rejected && (index >= stop || proofs[index] != CandidateProof::Untested);

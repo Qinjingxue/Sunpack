@@ -525,7 +525,9 @@ namespace sunpack::sevenzip
 
         std::filesystem::path allocate_name(std::filesystem::path requested, bool initially_empty, bool is_directory)
         {
-            auto key = normalized_output_path_key(requested);
+            // The components were sanitized before allocation, and the
+            // resolved parent uses native separators. Only case varies here.
+            auto key = lower_text(requested.native());
             // Keep the common empty-output case to one hash-set insertion.
             if (initially_empty)
             {
@@ -551,7 +553,7 @@ namespace sunpack::sevenzip
             for (;;)
             {
                 auto candidate = parent / (stem + L"(" + std::to_wstring(next++) + L")" + extension);
-                auto candidate_key = normalized_output_path_key(candidate);
+                auto candidate_key = lower_text(candidate.native());
                 if (available(candidate, candidate_key))
                 {
                     used_.insert(std::move(candidate_key));
@@ -705,7 +707,7 @@ namespace sunpack::sevenzip
 
             std::wstring password,
 
-            std::wstring output_dir,
+            const std::wstring &output_dir,
 
             ExtractProgressCallback progress,
 
@@ -771,7 +773,6 @@ namespace sunpack::sevenzip
                 , pipeline_timing
 #endif
             );
-            async_job_->sync_storage_at_publication = true;
         }
 
         ~ExtractToDiskCallback() { finalize_output(); }
@@ -929,7 +930,7 @@ namespace sunpack::sevenzip
 
             current_index_ = index;
 
-            current_trace_active_ = false;
+            current_trace_index_ = kNoTrace;
 
             current_async_file_.reset();
 
@@ -1040,7 +1041,6 @@ namespace sunpack::sevenzip
 
             auto &item = output_trace_.items.emplace_back();
             current_trace_index_ = output_trace_.items.size() - 1;
-            current_trace_active_ = true;
             item.index = index;
             item.is_dir = is_dir;
             item.encrypted = encrypted;
@@ -1189,7 +1189,7 @@ namespace sunpack::sevenzip
                 operation_result_ = opRes;
             }
 
-            if (current_trace_active_)
+            if (current_trace_index_ != kNoTrace)
             {
                 auto &item = output_trace_.items[current_trace_index_];
                 item.operation_result = opRes;
@@ -1534,7 +1534,7 @@ namespace sunpack::sevenzip
                 try
                 {
                     ensure_no_reparse_ancestors(directory.target);
-                    const HANDLE handle = CreateFileW(win32_extended_path(directory.target.native()).c_str(),
+                    const HANDLE handle = CreateFileW(directory.target.c_str(),
                         FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                         nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
                     if (handle != INVALID_HANDLE_VALUE)
@@ -1694,7 +1694,7 @@ namespace sunpack::sevenzip
         void mark_current_item_failure(HRESULT hr)
         {
             output_trace_.last_hresult = static_cast<int>(hr);
-            if (current_trace_active_) output_trace_.items[current_trace_index_].failed = true;
+            if (current_trace_index_ != kNoTrace) output_trace_.items[current_trace_index_].failed = true;
         }
 
         // The callback methods already hold state_mutex_.
@@ -1764,13 +1764,12 @@ namespace sunpack::sevenzip
         UInt32 files_written_ = 0;
 
 
-        std::size_t current_trace_index_ = 0;
+        static constexpr auto kNoTrace = (std::numeric_limits<std::size_t>::max)();
+        std::size_t current_trace_index_ = kNoTrace;
 
         bool failed_item_had_data_ = false;
 
         Int32 operation_result_ = kOpOk;
-
-        bool current_trace_active_ = false;
 
         bool output_error_ = false;
 
