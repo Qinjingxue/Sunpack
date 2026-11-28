@@ -139,14 +139,11 @@ Json describe_setting(const std::string& pointer,const std::string& module,const
         {"block",block},{"blockLabel",block_label},{"module",module},{"primary",primary},
         {"description",meta.contains("description")?local(meta["description"],locale):meta.empty()?tr("unknownDescription",language):std::string()},
         {"editor",meta.value("editor",std::string())},{"options",Json::array()},{"known",!meta.empty()}};
-    if(meta.value("editor",std::string())=="view_list") {
-        result["viewMethods"]=mapped_views;
-        auto& description=result["description"].get_ref<std::string&>();
-        for(const auto& method:mapped_views) {
-            description.append(&method==mapped_views?" ":", ").append(method);
-        }
-    }
-    if(pointer=="/cli/language") {
+    if(result["editor"]=="view_list") {
+        auto& options=result["options"];
+        options.push_back({{"value","plain"},{"label","plain"}});
+        for(const auto& method:mapped_views) options.push_back({{"value",method},{"label",method}});
+    } else if(pointer=="/cli/language") {
         for(const auto& choice:locales)
             result["options"].push_back({{"value",choice.code},{"label",choice.label}});
     } else if(meta.contains("options")) {

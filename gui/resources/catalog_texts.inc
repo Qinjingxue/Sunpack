@@ -1239,6 +1239,13 @@ constexpr Message ui_messages[] = {
         "システム設定に従う",
         "시스템 설정 사용",
     }},
+    {"tagEditSave", {
+        "更新",
+        "Update",
+        "更新",
+        "更新",
+        "갱신",
+    }},
     {"tagInputPlaceholder", {
         "输入后按 Enter 添加",
         "Type a tag and press Enter",
@@ -1463,6 +1470,13 @@ constexpr Message ui_messages[] = {
         "上記の範囲内の値を入力してください。",
         "위에 설명된 범위 내의 값을 입력하세요.",
     }},
+    {"viewDepth", {
+        "层数",
+        "Layers",
+        "層數",
+        "層数",
+        "복원 단계 수",
+    }},
     {"watchHint", {
         "监控目录中的直接文件。",
         "Monitors files directly inside each folder.",
@@ -1628,14 +1642,14 @@ constexpr Message setting_messages[] = {
         "완전한 결과만 허용",
     }},
     {"fields/filesystem/read_views/description", {
-        "添加 plain 读取原文件，或使用 方法:层数 选择恰好还原到指定层数的视图。可用方法：",
-        "Add plain to read the original file, or method:depth to select exactly that many restoration layers. Available methods:",
-        "加入 plain 讀取原檔，或使用 方法:層數 選擇恰好還原至指定層數的視圖。可用方法：",
-        "元ファイルには plain を、指定した層数の復元には メソッド:層数 を追加します。使用可能なメソッド：",
-        "원본 파일은 plain을 추가하고 정확한 복원 깊이는 방법:깊이로 지정하세요. 사용 가능한 방법:",
+        "选择对应的伪装方法添加后生效，层数代表处理多少层的伪装，选择过多方法可能大幅拖慢处理速度",
+        "Select and add the disguise method to enable it. Layers specify how many layers of disguise to process. Selecting too many methods can significantly slow processing.",
+        "選擇對應的偽裝方法新增後生效，層數代表處理多少層的偽裝，選擇過多方法可能大幅拖慢處理速度",
+        "対応する偽装方式を選択して追加すると有効になります。層数は処理する偽装の層の数です。方式を選びすぎると処理が大幅に遅くなることがあります。",
+        "해당 위장 방법을 선택하여 추가하면 적용됩니다. 복원 단계 수는 처리할 위장 계층의 수입니다. 방법을 너무 많이 선택하면 처리 속도가 크게 느려질 수 있습니다.",
     }},
     {"fields/filesystem/read_views/label", {
-        "文件读取视图", "File read views", "檔案讀取視圖", "ファイル読み取りビュー", "파일 읽기 보기",
+        "读取视图", "Read views", "讀取視圖", "読み取りビュー", "읽기 보기",
     }},
     {"fields/filesystem/scan_filters/@blacklist/enabled/label", {
         "黑名单",

@@ -654,15 +654,60 @@ void tag_config(Application& app,const fs::path& dir) {
     const auto filters=parse_json(source)["filesystem"]["scan_filters"];
     assert(source.find(filters[0].dump())!=std::string::npos);
     assert(source.find(filters[1].dump())!=std::string::npos);
-    const std::string view_id="/filesystem/read_views", view_input="tag-input-"+view_id;
+    search_config(app,L"");
+}
+
+void read_view_config(Application& app,const fs::path& dir) {
+    const std::string view_id="/filesystem/read_views", method="view-method-"+view_id;
+    const std::string depth="view-depth-"+view_id, add="view-add-"+view_id;
+    auto views=[&]{return read_json(dir/"sunpack_config.json")[Json::json_pointer(view_id)];};
     search_setting(app,view_id);
-    edit_text(app,view_input,L"apate:0");
-    assert(ui_debug_key(app.window(),VK_RETURN)==0);
-    pump([&]{return state(app.page(),"saveErrors").contains(view_id);},"Reject zero read-view depth");
-    edit_text(app,view_input,L"apate:2");
-    assert(ui_debug_key(app.window(),VK_RETURN)==0);
+    auto* root=window(app).Root().get();
+    const auto* combo=dynamic_cast<ui::ComboBoxWidget*>(root->FindById(method));
+    assert(combo && combo->SelectedIndex()==0 && combo->SelectedText()==L"plain");
+    assert(root->FindById(depth) && !root->FindById(depth)->enabled);
+    auto check_apate_input=[&](const wchar_t* expected_depth) {
+        const auto* selected=dynamic_cast<ui::ComboBoxWidget*>(root->FindById(method));
+        const auto* input=dynamic_cast<ui::TextInputWidget*>(root->FindById(depth));
+        assert(selected && selected->SelectedText()==L"apate");
+        assert(input && input->enabled && input->Text()==expected_depth);
+    };
+    select_option(app,method,1);
+    assert(views()==Json::array({"plain"}));
+    click(app,add.c_str());
     finish_input(app);
-    assert(read_json(config_path)[Json::json_pointer(view_id)]==Json::array({"plain","apate:2"}));
+    assert(views()==Json::array({"plain","apate:1"}));
+    check_apate_input(L"");
+
+    edit_text(app,depth,L"0");
+    click(app,add.c_str());
+    pump([&]{return state(app.page(),"saveErrors").contains(view_id);},"Reject zero read-view depth");
+    edit_text(app,depth,L"4294967295");
+    click(app,add.c_str());
+    finish_input(app);
+    assert(views()==Json::array({"plain","apate:1","apate:4294967295"}));
+    check_apate_input(L"4294967295");
+    click(app,add.c_str());
+    finish_input(app);
+    assert(views()==Json::array({"plain","apate:1","apate:4294967295"}));
+    check_apate_input(L"4294967295");
+
+    const auto tags=root->FindById("tags-"+view_id);
+    assert(tags);
+    assert(ui_debug_mouse_down(app.window(),tags->rect.left+10,tags->rect.top+13)==0);
+    assert(ui_debug_mouse_up(app.window(),tags->rect.left+10,tags->rect.top+13)==0);
+    focus(app,method);
+    select_option(app,method,1);
+    edit_text(app,depth,L"2");
+    click(app,add.c_str());
+    finish_input(app);
+    assert(views()==Json::array({"apate:2","apate:1","apate:4294967295"}));
+    check_apate_input(L"2");
+
+    select_option(app,method,0);
+    click(app,add.c_str());
+    finish_input(app);
+    assert(views()==Json::array({"apate:2","apate:1","apate:4294967295","plain"}));
     search_config(app,L"");
 }
 
@@ -1212,6 +1257,7 @@ void acceptance_contracts(Application& app,const fs::path& dir) {
     roots_and_passwords(app,dir);
     config_edits(app,dir);
     tag_config(app,dir);
+    read_view_config(app,dir);
     root_heading_layout(app);
     range_config(app,dir/"sunpack_config.json");
 }
@@ -1301,6 +1347,9 @@ int wmain(int argc,wchar_t** argv) {
         assert(IsWindowVisible(hwnd) && state(app.page(),"errors").empty());
         if(mode==L"--history") {
             task_history(app,dir);
+        } else if(mode==L"--read-views") {
+            navigate(app,"tabConfig","config");
+            read_view_config(app,dir);
         } else {
             acceptance_contracts(app,dir);
         }

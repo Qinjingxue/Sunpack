@@ -111,10 +111,11 @@ export default {
     configSearchText(f,add) {
       let t=this.texts,d=this.drafts[f.id]||f;
       add(f.label,'field-title-'+f.id);add(f.description,'field-description-'+f.id);add(f.categoryLabel);
-      f.options.forEach((o,i)=>add(o.label,i===d.choice?'select-'+f.id:''));
+      let view=f.editor==='view_list',choice=view?this.tagModes[f.id]||0:d.choice;
+      f.options.forEach((o,i)=>add(o.label,i===choice?(view?'view-method-':'select-')+f.id:''));
       if(this.isRuleList(f)) {
         if(f.editor==='rule_list') add(t.regexMode,'tag-regex-label-'+f.id);
-        add(this.tagInputs[f.id],'tag-input-'+f.id);
+        add(this.tagInputs[f.id],(view?'view-depth-':'tag-input-')+f.id);
         this.tagValues(f).forEach((v,j)=>add(this.entryLabel(typeof v==='string'?v:v.value),'tags-'+f.id,j));
       } else if(f.editor==='text') add(d.text,'input-'+f.id);
       else if(f.editor==='recursive'&&d.choice===2) add(d.text,'rounds-'+f.id);
@@ -742,6 +743,7 @@ export default {
     isDirectoryValue(value) { return typeof value==='string'&&/^(?:[a-zA-Z]:[\\/]|[\\/]{2}|\.{1,2}(?:[\\/]|$)|~[\\/])/.test(value); },
     entryLabel(value) { return value.split(String.fromCharCode(13)).join('␍').split(String.fromCharCode(10)).join('↵'); },
     isRuleList(f) { return f.editor==='rule_list'||f.editor==='view_list'; },
+    viewMethod(f) { return f.options[this.tagModes[f.id]||0].value; },
     tagValues(f) { f=this.configField(f.id)||f; return this.drafts[f.id]?JSON.parse(this.drafts[f.id].text):f.items; },
     changeTagInput(f,value) { this.tagInputs=Object.assign({},this.tagInputs,{[f.id]:value}); if(this.configQuery) this.send('refreshSearch'); },
     saveTags(f,values) {
@@ -749,44 +751,62 @@ export default {
       this.changeField(f,JSON.stringify(values));
       this.send('syncTags',{id:f.id}); this.commitField(f);
     },
-    changeTagMode(f,value) { this.tagModes=Object.assign({},this.tagModes,{[f.id]:value}); },
-    cancelTagEdit(f) {
-      let edits=Object.assign({},this.tagEdits),inputs=Object.assign({},this.tagInputs),modes=Object.assign({},this.tagModes);
-      delete edits[f.id]; delete inputs[f.id]; delete modes[f.id];
-      this.tagEdits=edits; this.tagInputs=inputs; this.tagModes=modes;
+    changeTagMode(f,value) {
+      this.tagModes=Object.assign({},this.tagModes,{[f.id]:value});
+      if(f.editor==='view_list'&&this.configQuery) this.send('refreshSearch');
+    },
+    finishTagEdit(f,keepInput=false) {
+      if(this.tagEdits[f.id]) {
+        let edits=Object.assign({},this.tagEdits);
+        delete edits[f.id]; this.tagEdits=edits;
+      }
+      if(!keepInput) {
+        let inputs=Object.assign({},this.tagInputs),modes=Object.assign({},this.tagModes);
+        delete inputs[f.id]; delete modes[f.id];
+        this.tagInputs=inputs; this.tagModes=modes;
+      }
     },
     tagMatches(item,p) { return typeof item==='string'?item===p.value:item.value===p.value&&item.regex===p.regex; },
     editTag(p) {
       let f=this.configField(p.id); if(!f||!this.isRuleList(f)) return;
       let values=this.tagValues(f); if(p.index<0||p.index>=values.length||!this.tagMatches(values[p.index],p)) return;
       this.tagEdits=Object.assign({},this.tagEdits,{[f.id]:{index:p.index,value:p.value,regex:p.regex}});
-      this.changeTagInput(f,p.value); this.changeTagMode(f,p.regex);
-      this.send('focusTag',{id:f.id});
+      let widget='tag-input-';
+      if(f.editor==='view_list') {
+        let [method,depth]=p.value.split(':');
+        this.changeTagMode(f,Math.max(0,f.options.findIndex(o=>o.value===method)));
+        this.changeTagInput(f,depth===undefined?'':String(Number(depth)));
+        widget=depth===undefined?'view-method-':'view-depth-';
+      } else {
+        this.changeTagInput(f,p.value); this.changeTagMode(f,p.regex);
+      }
+      this.send('focusTag',{widget:widget+f.id});
     },
     addTag(f) {
-      let value=this.tagInputs[f.id]||''; if(!value.length) return;
+      let value=this.tagInputs[f.id]||'';
       let values=this.tagValues(f).slice(),edit=this.tagEdits[f.id];
-      let entry={value:value,regex:!!this.tagModes[f.id]};
+      let entry;
       if(f.editor==='view_list') {
-        value=value.trim().toLowerCase();
-        let colon=value.indexOf(':'),method=value.slice(0,colon),depth=value.slice(colon+1);
-        if(value!=='plain'&&(colon<0||!f.viewMethods.includes(method)||!/^\+?[0-9]+$/.test(depth)||Number(depth)<1||Number(depth)>4294967295)) { this.setSaveError(f.id,'validation'); return; }
-        if(value!=='plain') value=method+':'+String(Number(depth));
-        if(values.some((v,i)=>v===value&&(!edit||i!==edit.index))) { this.cancelTagEdit(f); return; }
-        entry=value;
+        let method=this.viewMethod(f),depth=Number(value||'1');
+        if(method!=='plain'&&((value&&!/^[0-9]+$/.test(value))||depth<1||depth>4294967295)) { this.setSaveError(f.id,'validation'); return; }
+        entry=method==='plain'?method:method+':'+String(depth);
+        if(values.some((v,i)=>v===entry&&(!edit||i!==edit.index))) { this.finishTagEdit(f,true); return; }
+      } else {
+        if(!value.length) return;
+        entry={value:value,regex:!!this.tagModes[f.id]};
       }
       if(edit) {
         if(edit.index>=values.length||!this.tagMatches(values[edit.index],edit)) { this.setSaveError(f.id,'settingChanged'); return; }
         values[edit.index]=entry;
       } else values.push(entry);
-      this.saveTags(f,values); this.cancelTagEdit(f);
+      this.saveTags(f,values); this.finishTagEdit(f,f.editor==='view_list');
     },
     removeTag(p) {
       let f=this.configField(p.id); if(!f||!this.isRuleList(f)) return;
       let values=this.tagValues(f); if(p.index<0||p.index>=values.length||!this.tagMatches(values[p.index],p)) return;
       this.saveTags(f,values.filter((value,index)=>index!==p.index));
       let edit=this.tagEdits[f.id];
-      if(edit) { if(edit.index===p.index) this.cancelTagEdit(f); else if(edit.index>p.index) this.tagEdits=Object.assign({},this.tagEdits,{[f.id]:Object.assign({},edit,{index:edit.index-1})}); }
+      if(edit) { if(edit.index===p.index) this.finishTagEdit(f); else if(edit.index>p.index) this.tagEdits=Object.assign({},this.tagEdits,{[f.id]:Object.assign({},edit,{index:edit.index-1})}); }
     }
 
   }
@@ -931,6 +951,9 @@ export default {
   .tag-setting .setting-copy { width:190px; flex:0; flex-shrink:1; gap:8px; }
   .tag-setting .setting-copy input { width:100%; }
   .tag-setting .setting-copy .tag-regex-check { width:24px; height:24px; flex-shrink:0; }
+  .view-editor { gap:8px; }
+  .view-method { width:100%; }
+  .tag-setting .setting-copy .view-depth { width:auto; flex:1; min-width:0px; }
   .tag-region { height:112px; min-width:0px; padding:6px 18px 6px 6px; border:1px solid var(--card-border); border-radius:6px; }
   .history-entry { gap:0px; padding:0px 12px; border:1px solid var(--card-border); border-radius:8px; }
   .history-entry.light, .light .root-header { background:var(--card-bg); }
@@ -1067,7 +1090,19 @@ export default {
             <div v-for="f in g.fields" :key="f.key" :id="'field-'+f.id" class="setting-item">
             <div v-show="f.id!==g.fields[0].id" class="setting-divider"/>
             <div class="settings-row" :class="isRuleList(f)?'tag-setting':''">
-              <div class="setting-copy"><label :id="'field-title-'+f.id" :class="f.primary?'subheading':'setting-title'">{{ f.label }}</label><label :id="'field-description-'+f.id" v-show="f.description" class="setting-description">{{ f.description }}</label><input v-if="isRuleList(f)" :id="'tag-input-'+f.id" :value="tagInputs[f.id]||''" :placeholder="tagEdits[f.id]?'':texts.tagInputPlaceholder" @input="v=>changeTagInput(f,v)" @submit="addTag(f)"/><div v-if="f.editor==='rule_list'" class="row"><input type="checkbox" class="tag-regex-check" :id="'tag-regex-'+f.id" :checked="!!tagModes[f.id]" @change="v=>changeTagMode(f,v)"/><label :id="'tag-regex-label-'+f.id" @click="changeTagMode(f,!tagModes[f.id])">{{ texts.regexMode }}</label></div></div>
+              <div class="setting-copy">
+                <label :id="'field-title-'+f.id" :class="f.primary?'subheading':'setting-title'">{{ f.label }}</label>
+                <label :id="'field-description-'+f.id" v-show="f.description" class="setting-description">{{ f.description }}</label>
+                <input v-if="f.editor==='rule_list'" :id="'tag-input-'+f.id" :value="tagInputs[f.id]||''" :placeholder="tagEdits[f.id]?'':texts.tagInputPlaceholder" @input="v=>changeTagInput(f,v)" @submit="addTag(f)"/>
+                <div v-if="f.editor==='rule_list'" class="row"><input type="checkbox" class="tag-regex-check" :id="'tag-regex-'+f.id" :checked="!!tagModes[f.id]" @change="v=>changeTagMode(f,v)"/><label :id="'tag-regex-label-'+f.id" @click="changeTagMode(f,!tagModes[f.id])">{{ texts.regexMode }}</label></div>
+                <div v-if="f.editor==='view_list'" :id="'view-editor-'+f.id" class="view-editor">
+                  <select :id="'view-method-'+f.id" class="view-method" :value="tagModes[f.id]||0" @change="v=>changeTagMode(f,v)"/>
+                  <div class="row">
+                    <input :id="'view-depth-'+f.id" class="view-depth" :placeholder="texts.viewDepth" :value="tagInputs[f.id]||''" :enabled="viewMethod(f)!=='plain'" @input="v=>changeTagInput(f,v)"/>
+                    <button :id="'view-add-'+f.id" @click="addTag(f)">{{ tagEdits[f.id]?texts.tagEditSave:texts.add }}</button>
+                  </div>
+                </div>
+              </div>
               <ScrollView v-if="isRuleList(f)" :id="'tag-scroll-'+f.id" class="tag-region"><div :id="'tags-host-'+f.id"/></ScrollView>
               <div v-if="!isRange(f) &amp;&amp; !isRuleList(f)" class="setting-control" :class="f.editor==='choice'||f.editor==='recursive'?'choice-control':f.editor==='text'?(f.type==='number'?'number-control':'wide-control'):''">
                 <div v-if="f.editor==='toggle'" :id="'toggle-host-'+f.id" class="toggle-host"/>

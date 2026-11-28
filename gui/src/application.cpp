@@ -510,6 +510,7 @@ void Application::apply_pending() {
                 auto host=(editor=="toggle"?"toggle-host-":rule_editor(editor)?"tags-host-":"choice-")+it->first;
                 ui_page_on_widget_mount(page_,host.c_str(),nullptr,nullptr);
                 ui_page_on_widget_unmount(page_,host.c_str(),nullptr,nullptr);
+                if(editor=="view_list") ui_page_on_widget_mount(page_,("view-editor-"+it->first).c_str(),nullptr,nullptr);
                 it=controls_.erase(it); continue;
             }
             if(it->second->editor=="toggle") { ++it; continue; }
@@ -614,12 +615,28 @@ void Application::bind_controls(const Json& fields) {
         binding->text=tags?std::string():field["text"].get<std::string>();
         const auto& original=field["original"].get_ref<const std::string&>();
         if(binding->original!=original) binding->original=std::string(original);
-        binding->options=editor=="choice" || editor=="recursive"?field["options"]:Json();
+        binding->options=editor=="choice" || editor=="recursive" || editor=="view_list"?field["options"]:Json();
         binding->boolean=field["boolean"].get<bool>();
         binding->choice=field["choice"].get<int>();
         // Existing hooks already reference this binding, including after a
         // virtual row unmounts and later comes back into view.
         if(same_editor) continue;
+        if(editor=="view_list") {
+            ui_page_on_widget_mount(page_,("view-editor-"+id).c_str(),[](UiPage page,UiWidget parent,void* context){
+                auto* binding=static_cast<ControlBinding*>(context);
+                auto host=ui::GetContext().handles.Lookup(parent);
+                ui_widget_destroy(parent);
+                if(!host) return;
+                auto* method=dynamic_cast<ui::ComboBoxWidget*>(host->FindById("view-method-"+binding->id));
+                auto* depth=dynamic_cast<ui::TextInputWidget*>(host->FindById("view-depth-"+binding->id));
+                if(!method || !depth || !method->Items().empty()) return;
+                std::vector<std::wstring> labels;
+                for(const auto& option:binding->options) labels.push_back(wide(option["label"].get_ref<const std::string&>()));
+                method->SetItems(std::move(labels));
+                method->SetSelectedIndex(page_value(page,"tagModes").value(binding->id,0));
+                depth->inputFilter=[](wchar_t ch){return ch>=L'0' && ch<=L'9';};
+            },binding.get());
+        }
         auto host=(editor=="toggle"?"toggle-host-":tags?"tags-host-":"choice-")+id;
         ui_page_on_widget_mount(page_,host.c_str(),[](UiPage,UiWidget parent,void* context){
             auto* binding=static_cast<ControlBinding*>(context); auto* self=binding->owner;
@@ -765,7 +782,7 @@ void Application::handle_command(Json command) {
         return;
     }
     if(op=="focusTag") {
-        auto widget=widget_handle(window_,"tag-input-"+p.at("id").get<std::string>());
+        auto widget=widget_handle(window_,p.at("widget").get<std::string>());
         if(widget) ui_window_focus_widget(window_,widget);
         return;
     }
