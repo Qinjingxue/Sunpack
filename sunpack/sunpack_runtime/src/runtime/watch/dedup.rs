@@ -2,7 +2,7 @@
 use super::dedup_hash::StreamHash;
 use crate::core::config::{WatchDeduplication, WatchDeduplicationScope};
 use crate::io::archive_state::{ArchiveInput, OpenMode, VolumeCompleteness};
-use crate::io::view::ConfiguredViews;
+use crate::io::view::{ConfiguredViews, Span};
 use crate::io::reader::{physical_file_generation_from_metadata, PhysicalFileGeneration};
 use crate::collections::{trim_map, SmallOrderedSet};
 use crate::path_keys::{path_ancestors, path_key};
@@ -143,6 +143,8 @@ enum Delta<'a> {
     Journals(Vec<(String, String, u64)>),
     Ready,
     Pending,
+    // Old mapped indexes can contain different identities for the same reverse run.
+    BeginMapped(u8, u8, ConfiguredViews),
 }
 
 /// Hashing is deliberately outside Index's lock and the scheduler thread.
@@ -301,7 +303,9 @@ impl Index {
                 let delta: Delta = wal::decode(&reader.payload)?;
                 match delta {
                     Delta::Begin(saved, saved_scope, views) if !begun && saved == mode_tag(mode)
-                        && saved_scope == scope_tag(scope) && views == index.views => begun = true,
+                        && saved_scope == scope_tag(scope) && views == index.views && !views.has_mapped_views() => begun = true,
+                    Delta::BeginMapped(saved, saved_scope, views) if !begun && saved == mode_tag(mode)
+                        && saved_scope == scope_tag(scope) && views == index.views && views.has_mapped_views() => begun = true,
                     Delta::Put(record) if begun => { index.insert(record.into_owned()); },
                     Delta::Remove(ids) if begun => { for id in ids { index.remove(id); } },
                     Delta::Journals(stamps) if begun => { index.apply_journals(&stamps); },
@@ -374,7 +378,14 @@ impl Index {
         if let Some(folder) = self.path.parent() { fs::create_dir_all(folder)?; }
         let mut file = File::create(&self.path)?;
         file.write_all(&wal::file_header(Kind::DedupWal))?; self.file = Some(file);
-        self.append(&Delta::Begin(mode_tag(self.mode), scope_tag(self.scope), self.views.clone()))
+        self.append(&self.begin_record())
+    }
+    fn begin_record(&self) -> Delta<'static> {
+        let mode = mode_tag(self.mode);
+        let scope = scope_tag(self.scope);
+        let views = self.views.clone();
+        if views.has_mapped_views() { Delta::BeginMapped(mode, scope, views) }
+        else { Delta::Begin(mode, scope, views) }
     }
     fn prepare(&mut self, epoch: u64, mut record: Record, baseline: bool) -> Option<Prepared> {
         // Removing a scope with no resident entries can retire its journal
@@ -693,9 +704,10 @@ impl Index {
         if self.edits < self.records.len().saturating_mul(2).saturating_add(1024) || self.file.as_ref().map_or(0, |f| f.metadata().map_or(0, |m| m.len())) < 4 * 1024 * 1024 { return Ok(()); }
         let temp = self.path.with_extension("tmp");
         let mut file = File::create(&temp)?; file.write_all(&wal::file_header(Kind::DedupWal))?;
+        let begin = self.begin_record();
         let mut seq = 0;
         let mut write = |d: &Delta<'_>| -> io::Result<()> { seq += 1; wal::append_frame(&mut file, &mut self.buffer, seq, |out| rmp_serde::encode::write(out, d).map_err(wal::invalid)) };
-        write(&Delta::Begin(mode_tag(self.mode), scope_tag(self.scope), self.views.clone()))?;
+        write(&begin)?;
         write(&Delta::Journals(self.journals.iter().map(|(scope, (volume, id))| (scope.clone(), volume.clone(), *id)).collect()))?;
         for r in self.records.values() { write(&Delta::Put(Cow::Borrowed(r)))?; }
         if self.ready { write(&Delta::Ready)?; }
@@ -718,7 +730,7 @@ fn remove_bucket<K: std::hash::Hash + Eq>(map: &mut HashMap<K, RecordIds>, key: 
     if map.get_mut(key).is_some_and(|ids| ids.remove(&id)) { map.remove(key); }
 }
 fn describe(owner: &str, scope: &str, inputs: &[&ArchiveInput]) -> io::Result<Option<Record>> {
-    let mut identities = Vec::new();
+    let mut identities = Vec::<Identity>::new();
     let mut sources: Vec<Source> = Vec::new();
     let mut range_sources = Vec::new();
     let mut physical = HashMap::<String, u32>::new();
@@ -771,18 +783,30 @@ fn describe(owner: &str, scope: &str, inputs: &[&ArchiveInput]) -> io::Result<Op
             let end = match end { Some(end) => end, None if whole => size, None => return Ok(false) };
             let Some(len) = end.checked_sub(start) else { return Ok(false); };
             if len == 0 || end > size { return Ok(false); }
-            // Physical segmentation is not content identity. Adjacent extents
-            // of the same opened source can share one read and identity range.
-            if !reversed && range_sources.last().copied().unwrap_or(0) == source
-                && identities.last().is_some_and(|last: &Identity| !last.reversed && last.start + last.len == start) {
-                identities.last_mut().unwrap().len += len;
-            } else {
-                if source != 0 && range_sources.is_empty() {
-                    range_sources.resize(identities.len(), 0);
+            // Adjacent runs from the same source share one identity and read.
+            if range_sources.last().copied().unwrap_or(0) == source {
+                if let Some(last) = identities.last_mut() {
+                    let last_end = last.start + last.len;
+                    if !reversed && !last.reversed && last_end == start {
+                        last.len += len;
+                        return Ok(true);
+                    }
+                    if physical_size.is_some() || last.reversed {
+                        let mut run = Span { start: last.start, end: last_end, reverse: last.reversed };
+                        if run.join(&Span { start, end, reverse: reversed }) {
+                            last.start = run.start;
+                            last.len = run.end - run.start;
+                            last.reversed = run.reverse;
+                            return Ok(true);
+                        }
+                    }
                 }
-                if !range_sources.is_empty() { range_sources.push(source); }
-                identities.push(Identity { volume, file, start, len, reversed });
             }
+            if source != 0 && range_sources.is_empty() {
+                range_sources.resize(identities.len(), 0);
+            }
+            if !range_sources.is_empty() { range_sources.push(source); }
+            identities.push(Identity { volume, file, start, len, reversed: reversed && len > 1 });
             Ok(true)
         };
         if input.mode == OpenMode::File {
@@ -796,7 +820,9 @@ fn describe(owner: &str, scope: &str, inputs: &[&ArchiveInput]) -> io::Result<Op
                     if end <= p.extent.start || end > length { return Ok(None); }
                     let mut valid = true;
                     view.visit(p.extent.start, end, |span| {
-                        valid &= push(&p.extent.path, span.start, Some(span.end), false, span.reverse, Some(view.physical_size))?;
+                        if valid {
+                            valid = push(&p.extent.path, span.start, Some(span.end), false, span.reverse, Some(view.physical_size))?;
+                        }
                         Ok(())
                     })?;
                     if !valid { return Ok(None); }

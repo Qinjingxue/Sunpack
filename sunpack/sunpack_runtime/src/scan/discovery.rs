@@ -97,6 +97,7 @@ pub(crate) struct NativeCandidateTable {
 }
 
 pub(crate) struct ReadScope {
+    pub root: Box<str>,
     pub raw: NativeDirectorySnapshot,
     pub selected: NativeDirectorySnapshot,
     pub aliases: Option<Box<SplitAliases>>,
@@ -108,7 +109,7 @@ pub(crate) struct SplitAliases {
 }
 
 impl ReadScope {
-    pub(crate) fn new(raw: &NativeDirectorySnapshot, filtered: &NativeDirectorySnapshot, targets: Option<&FileTargets>) -> Self {
+    pub(crate) fn new(root: &str, raw: &NativeDirectorySnapshot, filtered: &NativeDirectorySnapshot, targets: Option<&FileTargets>) -> Self {
         let mut aliases = None;
         let selected = match targets {
             None => filtered.clone(),
@@ -132,7 +133,7 @@ impl ReadScope {
                 filtered.view(rows)
             }
         };
-        Self { raw: raw.clone(), selected, aliases }
+        Self { root: root.into(), raw: raw.clone(), selected, aliases }
     }
 }
 

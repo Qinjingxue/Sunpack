@@ -449,6 +449,41 @@ fn byte_stream_identity_ignores_carrier_and_split_boundaries_but_tracks_every_so
     assert!(!index.owners.contains_key(path_key(&carrier.entry_path).as_str()));
     assert_eq!(index.records.len(), 1);
 }
+
+#[test]
+fn mapped_file_id_survives_different_reverse_run_boundaries_and_reload() {
+    use crate::io::archive_state::{InputExtent, InputPart};
+    use crate::io::view::{ReadView, ViewMethod};
+    let dir = Sandbox::new();
+    let folder = dir.0.join("index");
+    let open = || Index::open(&folder, WatchDeduplication::FileId, WatchDeduplicationScope::Root,
+        ConfiguredViews::parse([Some("apate:1")].into_iter()).unwrap()).unwrap();
+    let carrier = dir.file("carrier", b"ABCDEF");
+    let mapped = |name: &str, spans| {
+        let path = dir.0.join(name).to_string_lossy().into_owned();
+        if path != carrier.entry_path { fs::hard_link(&carrier.entry_path, &path).unwrap(); }
+        let mut input = ArchiveInput::file(path.clone(), "zip".into(), name.into());
+        input.mode = OpenMode::FileRange;
+        input.parts = Box::new([InputPart::range(InputExtent { path, start: 0, end: Some(6),
+            view: Some(Arc::new(ReadView { method: ViewMethod::Apate, depth: 1, physical_size: 6, spans })),
+        })]);
+        input
+    };
+    let mut index = open();
+    index.reconcile_journals(&[("scope".into(), "test-volume".into(), 1)]).unwrap();
+    let whole = mapped("carrier", vec![Span { start: 0, end: 6, reverse: true }]);
+    let split = mapped("split", vec![Span { start: 5, end: 6, reverse: false },
+        Span { start: 0, end: 5, reverse: true }]);
+    let forward = mapped("forward", vec![Span { start: 0, end: 6, reverse: false }]);
+    assert!(!admit(&mut index, &whole, true));
+    index.finish_rebuild().unwrap();
+    drop(index);
+
+    let mut index = open();
+    assert!(admit(&mut index, &split, false));
+    assert!(!admit(&mut index, &forward, false));
+}
+
 #[test]
 fn recursion_scope_removes_whole_cross_level_input_and_persists_removal() {
     use crate::io::archive_state::{InputExtent, InputPart};

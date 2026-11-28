@@ -851,10 +851,7 @@ fn competing_zip_directories(
     let mut alternatives = HashMap::<usize, Vec<attempts::VolumeAttempts>>::new();
     for tails in domains {
         let terminal = rows[tails[0]].anchor.as_ref()?;
-        let directory_id: Option<Arc<str>> = distinguish.then(|| directory_identity(terminal).unwrap_or_else(|| {
-            format!("{}|{}|{}", rows[tails[0]].path_key, terminal.view.as_ref().map_or(0, |v| v.depth),
-                terminal.zip_eocd_offset.unwrap_or(terminal.size))
-        }).into());
+        let directory_id = std::cell::OnceCell::<Option<Arc<str>>>::new();
         let mut scoped: Vec<_> = shared.iter().chain(&tails).map(|&i| rows[i].clone()).collect();
         let indexes = (0..scoped.len()).collect::<Vec<_>>();
         let mut interiors = HashMap::<_, Vec<_>>::new();
@@ -871,8 +868,25 @@ fn competing_zip_directories(
                     excluded.extend(local.iter().cloned());
                     plan.excluded_heads = excluded.into_boxed_slice();
                 }
-                plan.directory_id.clone_from(&directory_id);
-                let key = (path, head.structure_offset, head.view.clone(), validation.proposal.style, directory_id.clone());
+                // Hash a directory only if it has an admitted layout.
+                // When it spans disks, keep the full identity of its local view.
+                let id = directory_id.get_or_init(|| {
+                    distinguish.then(|| {
+                        directory_identity(terminal).unwrap_or_else(|| {
+                            use crate::io::view::ViewMethod;
+                            // Preserve directory IDs already stored in Watch checkpoints.
+                            let view = match &terminal.view {
+                                None => "0".to_owned(),
+                                Some(v) if v.method == ViewMethod::Apate => v.depth.to_string(),
+                                Some(v) => format!("{}:{}", v.method, v.depth),
+                            };
+                            format!("{}|{}|{}", rows[tails[0]].path_key, view,
+                                terminal.zip_eocd_offset.unwrap_or(terminal.size))
+                        }).into()
+                    })
+                });
+                plan.directory_id.clone_from(id);
+                let key = (path, head.structure_offset, head.view.clone(), validation.proposal.style, id.clone());
                 let index = *heads.entry(key).or_insert(output.len());
                 if index < output.len() {
                     alternatives.entry(index).or_insert_with(|| vec![output[index].attempts.take().unwrap()])

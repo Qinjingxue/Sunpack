@@ -609,7 +609,7 @@ namespace sunpack::sevenzip
     struct NormalizedInputRange
     {
 
-        std::wstring path;
+        std::size_t path_index = 0;
 
         UInt64 start = 0;
 
@@ -633,6 +633,7 @@ namespace sunpack::sevenzip
             : trace_(trace)
         {
             ranges_.reserve(paths.size());
+            paths_.reserve(paths.size());
             for (const auto &path : paths)
             {
                 std::error_code error;
@@ -643,7 +644,8 @@ namespace sunpack::sevenzip
                     record_input_error(trace_, path, open_hresult_);
                     continue;
                 }
-                ranges_.push_back({path, 0, length, total_size_});
+                ranges_.push_back({paths_.size(), 0, length, total_size_});
+                paths_.push_back(path);
                 total_size_ += length;
             }
             initialize(prefetch_config);
@@ -670,7 +672,7 @@ namespace sunpack::sevenzip
               physical_volume_(physical_volume)
         {
             ranges_.reserve(count);
-            const std::wstring* sized_path = nullptr;
+            paths_.reserve(count);
             UInt64 file_size = 0;
 
             for (std::size_t index = 0; index < count; ++index)
@@ -683,7 +685,7 @@ namespace sunpack::sevenzip
                     continue;
                 }
 
-                if (!sized_path || *sized_path != input.path)
+                if (paths_.empty() || paths_.back() != input.path)
                 {
                     std::error_code error;
 #ifdef SUP7Z_DEBUG
@@ -696,18 +698,23 @@ namespace sunpack::sevenzip
                         record_input_error(trace_, input.path, open_hresult_);
                         continue;
                     }
-                    sized_path = &input.path;
                     file_size = size;
+                    paths_.push_back(input.path);
                 }
 
+                const auto path_index = paths_.size() - 1;
                 if (input.view) {
                     const HRESULT hr = visit_view_range(input, file_size, [&](UInt64 at, UInt64 length, bool reverse) {
                         if (UINT64_MAX - total_size_ < length) return false;
-                        ranges_.push_back({input.path, at, length, total_size_, reverse});
+                        ranges_.push_back({path_index, at, length, total_size_, reverse});
                         total_size_ += length;
                         return true;
                     });
-                    if (FAILED(hr)) { open_hresult_ = hr; break; }
+                    if (FAILED(hr)) {
+                        open_hresult_ = hr;
+                        record_input_error(trace_, input.path, hr);
+                        break;
+                    }
                     continue;
                 }
                 const UInt64 start = std::min<UInt64>(input.start, file_size);
@@ -728,7 +735,7 @@ namespace sunpack::sevenzip
                     continue;
                 }
 
-                ranges_.push_back({input.path, start, length, total_size_, false});
+                ranges_.push_back({path_index, start, length, total_size_, false});
 
                 total_size_ += length;
             }
@@ -750,7 +757,8 @@ namespace sunpack::sevenzip
         HRESULT STDMETHODCALLTYPE Read(void *data, UInt32 size, UInt32 *processedSize) SUP7Z_NOEXCEPT override
         {
             if (probe_reads_) probe_reads_->observe_logical_read(position_, size);
-            else if (attempt_replay_) attempt_replay_->observe_volume_read(position_, size, !physical_volume_ || ranges_.empty() ? nullptr : &ranges_.front().path);
+            else if (attempt_replay_) attempt_replay_->observe_volume_read(position_, size,
+                !physical_volume_ || ranges_.empty() ? nullptr : &paths_[ranges_.front().path_index]);
 
 
             if (processedSize)
@@ -794,6 +802,7 @@ namespace sunpack::sevenzip
                 }
 
                 const auto *range = &ranges_[index];
+                const auto &path = paths_[range->path_index];
 
                 const UInt64 offset_in_range = position_ - range->virtual_offset;
 
@@ -804,7 +813,7 @@ namespace sunpack::sevenzip
                 const HRESULT open_result = ensure_cached_handle(index);
                 if (open_result != S_OK)
                 {
-                    record_input_error(trace_, range->path, open_result, position_, source_offset, want);
+                    record_input_error(trace_, path, open_result, position_, source_offset, want);
                     return publish_named_volume_error(volume_error_, open_result);
                 }
 
@@ -824,7 +833,7 @@ namespace sunpack::sevenzip
 
                         close_cached_handle();
 
-                        record_input_error(trace_, range->path, hr, position_, source_offset, want);
+                        record_input_error(trace_, path, hr, position_, source_offset, want);
 
                         return publish_named_volume_error(volume_error_, hr);
                     }
@@ -854,7 +863,7 @@ namespace sunpack::sevenzip
 
                     const HRESULT hr = HRESULT_FROM_WIN32(error);
 
-                    record_input_error(trace_, range->path, hr, position_, source_offset, want);
+                    record_input_error(trace_, path, hr, position_, source_offset, want);
 
                     return publish_named_volume_error(volume_error_, hr);
                 }
@@ -865,7 +874,7 @@ namespace sunpack::sevenzip
                     if (read != want)
                     {
                         const HRESULT hr = HRESULT_FROM_WIN32(ERROR_HANDLE_EOF);
-                        record_input_error(trace_, range->path, hr, position_, source_offset, want);
+                        record_input_error(trace_, path, hr, position_, source_offset, want);
                         return publish_named_volume_error(volume_error_, hr);
                     }
                     std::reverse(out + total_read, out + total_read + read);
@@ -941,7 +950,8 @@ namespace sunpack::sevenzip
         {
             if (ranges_.empty() && open_hresult_ == S_OK) open_hresult_ = E_FAIL;
 
-            if (is_open() && total_size_ && prefetch_config.enabled)
+            if (is_open() && total_size_ && prefetch_config.enabled &&
+                std::any_of(ranges_.begin(), ranges_.end(), [](const auto& range) { return !range.reversed; }))
             {
                 prefetch_ = std::make_unique<OverlappedPrefetcher>(prefetch_config, total_size_,
                     [this](UInt64 offset, PrefetchSource &source)
@@ -951,7 +961,7 @@ namespace sunpack::sevenzip
                         const auto &range = ranges_[index];
                         if (range.reversed) return false;
                         const UInt64 displacement = offset - range.virtual_offset;
-                        source = PrefetchSource{&range.path, range.start + displacement, range.length - displacement};
+                        source = PrefetchSource{&paths_[range.path_index], range.start + displacement, range.length - displacement};
                         return true;
                     }, trace_);
             }
@@ -987,8 +997,11 @@ namespace sunpack::sevenzip
 
         HRESULT ensure_cached_handle(std::size_t index)
         {
+            const auto path_index = ranges_[index].path_index;
+            const auto &path = paths_[path_index];
             if (cached_handle_ != INVALID_HANDLE_VALUE &&
-                (cached_index_ == index || ranges_[cached_index_].path == ranges_[index].path))
+                (ranges_[cached_index_].path_index == path_index ||
+                 paths_[ranges_[cached_index_].path_index] == path))
             {
                 cached_index_ = index;
                 return S_OK;
@@ -999,7 +1012,7 @@ namespace sunpack::sevenzip
 #ifdef SUP7Z_DEBUG
             ++observed_range_handle_opens;
 #endif
-            cached_handle_ = CreateFileW(win32_extended_path(ranges_[index].path).c_str(), GENERIC_READ,
+            cached_handle_ = CreateFileW(win32_extended_path(path).c_str(), GENERIC_READ,
                                          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                          nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
 
@@ -1034,6 +1047,8 @@ namespace sunpack::sevenzip
 
 
         std::vector<NormalizedInputRange> ranges_;
+        // Slices of the same file share path storage and the prefetcher's handle key.
+        std::vector<std::wstring> paths_;
 
         UInt64 total_size_ = 0;
 

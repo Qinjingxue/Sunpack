@@ -352,6 +352,15 @@ void check_open_archive_stream_ownership()
                                           ranges, nullptr, ArchiveOpenMode::SfxWithVolumes);
         check(mapped.opened && mapped.stream->Read(bytes, sizeof(bytes), &read) == S_OK &&
               read == 1 && bytes[0] == 'a', "a mapped SFX head ends before its named continuation");
+
+        auto stale = std::make_shared<ReadView>(*view);
+        stale->physical_size = 2;
+        ranges.front().view = stale;
+        ExtractInputTrace trace;
+        auto rejected = open_archive_stream(head, {}, &trace, names, InputPrefetchConfig{false},
+                                            ranges, nullptr, ArchiveOpenMode::SfxWithVolumes);
+        check(!rejected.opened && FAILED(static_cast<HRESULT>(trace.read_hresult)),
+              "an invalidated view records an input-open error");
     }
     {
         auto input = open_archive_stream(head, parts, nullptr, names, InputPrefetchConfig{false},
@@ -646,16 +655,18 @@ void check_prefetch_virtual_inputs()
               "range prefetch respects embedded payload offsets and clipped range ends");
         auto view = std::make_shared<ReadView>();
         view->physical_size = 257;
-        view->spans.push_back({0, 257, true});
+        view->spans = {{182, 257, true}, {107, 182, false}, {0, 107, false}};
         a.view = view;
         CMyComPtr<IInStream> mapped(new MultiRangeInStream({a, b}, nullptr, {true, 64}));
         for (unsigned offset = 0; offset < sizeof(bytes); offset += 17) {
             const UInt32 size = (std::min)(17u, static_cast<unsigned>(sizeof(bytes) - offset));
             correct &= mapped->Read(bytes + offset, size, &read) == S_OK && read == size;
         }
-        check(correct && std::equal(bytes, bytes + 248, std::make_reverse_iterator(payload + 254))
+        check(correct && std::equal(bytes, bytes + 72, std::make_reverse_iterator(payload + 254))
+              && !std::memcmp(bytes + 72, payload + 107, 75)
+              && !std::memcmp(bytes + 147, payload, 101)
               && !std::memcmp(bytes + 248, payload + 264, 243),
-              "reversed ranges preserve logical order across partial reads and the next volume");
+              "reordered spans preserve logical order across partial reads and the next volume");
     }
     {
         ExtractInputTrace trace;

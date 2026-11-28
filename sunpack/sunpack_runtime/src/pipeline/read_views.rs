@@ -520,9 +520,15 @@ fn verify_unchanged(session: &NativeArchiveSession) -> io::Result<()> {
     Ok(())
 }
 
-fn read_guard(scope: &ReadScope, rows: &[usize]) -> Option<NativeReadScope> {
-    let path = &scope.raw.table.paths[*rows.first()?];
-    NativeReadScope::new(Path::new(path).parent()?).ok()
+fn read_guard(scope: &ReadScope, rows: &[usize], origin: Origin) -> Option<NativeReadScope> {
+    let first = *rows.first()?;
+    let root = if origin == Origin::Watch {
+        // Scope-local Watch buckets can share a source tree with other jobs.
+        Path::new(&scope.raw.table.paths[first]).parent()?
+    } else {
+        Path::new(scope.root.as_ref())
+    };
+    NativeReadScope::new(root).ok()
 }
 
 // Only fractional recursive thresholds need a root inventory before either scanner
@@ -541,8 +547,8 @@ impl RecursiveViews {
             .rows()
             .filter(|&r| could_derive(&scope.raw, r, request.config.filesystem.read_views.probes()))
             .collect();
-        let guard = read_guard(scope, &rows);
         Self(cheap_fast_probe_pool().install(|| {
+            let guard = read_guard(scope, &rows, request.origin);
             rows.into_par_iter()
                 .filter_map(|row| {
                     request
@@ -740,12 +746,14 @@ pub(super) fn discover<'a>(
                 && (!deep_filter || admitted_stems.contains(&catalog_stem(&raw.table.paths[row])))
     };
     let prepared = inventory.is_some();
-    let guard = if prepared && all {
-        None
-    } else {
-        read_guard(read_scope, &rows)
-    };
     let results = pool.install(|| {
+        // Keep the promotion guard on the probe pool. The waiting caller
+        // can run cleanup on its own Rayon pool.
+        let guard = if prepared && all {
+            None
+        } else {
+            read_guard(read_scope, &rows, request.origin)
+        };
         let fresh = rows
             .par_iter()
             .copied()
@@ -782,7 +790,6 @@ pub(super) fn discover<'a>(
             });
         fresh.chain(cached).collect::<Vec<_>>()
     });
-    drop(guard);
     if results.is_empty() {
         return Ok(false);
     }

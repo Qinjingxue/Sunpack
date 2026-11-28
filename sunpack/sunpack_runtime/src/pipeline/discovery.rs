@@ -397,7 +397,7 @@ pub(super) fn discover(
         if !shared_roots.contains_key(scope.key()) {
             result.scan_errors.extend(filtered.scan_errors());
         }
-        let table = directory_table(&filtered, &raw, None, candidates, &mut verified, request)?;
+        let table = directory_table(&scope.root, &filtered, &raw, None, candidates, &mut verified, request)?;
         tables.push(table);
         if retain_task_context {
             retry_scopes.push(Arc::new(RetryScope {
@@ -427,7 +427,7 @@ pub(super) fn discover(
         if !shared_roots.contains_key(scope.key()) {
             result.scan_errors.extend(filtered.scan_errors());
         }
-        let mut table = configured_table(&raw,&filtered,Some(&targets),request,request.config.embedded_scan.enabled);
+        let mut table = configured_table(&scope.root, &raw, &filtered, Some(&targets), request, request.config.embedded_scan.enabled);
         match probe_relations(&mut table, &filtered, &raw, Some(&targets), candidates, &mut verified, request) {
             Ok(()) => tables.push(table),
             Err(error) if request.watch_catalog.is_some() && !crate::io::cancellation::is_cancellation(&error) => {
@@ -443,7 +443,7 @@ pub(super) fn discover(
                 let mut successful = NativeCandidateTable::default();
                 for (path, target) in targets.into_singles() {
                     request.cancel.check_io()?;
-                    match directory_table(&filtered, &raw, Some(target), candidates, &mut verified, request) {
+                    match directory_table(&scope.root, &filtered, &raw, Some(target), candidates, &mut verified, request) {
                         Ok(mut single) => successful.extend(&mut single),
                         Err(error) if crate::io::cancellation::is_cancellation(&error) => return Err(error),
                         Err(error) => result.errors.push(watch_discovery_error(path.into(), error)),
@@ -648,7 +648,7 @@ impl OutputDiscovery {
     pub(super) fn discover_many(outputs: Vec<Self>, candidates: &CandidateSet, request: &Request) -> io::Result<Vec<Discovered>> {
         let mut verified = HashMap::new();
         let mut tables = outputs.iter().map(|output|
-            directory_table(&output.filtered, &output.raw, None, candidates, &mut verified, request)
+            directory_table(&output.root, &output.filtered, &output.raw, None, candidates, &mut verified, request)
         ).collect::<io::Result<Vec<_>>>()?;
         let mut results = Vec::with_capacity(outputs.len());
         Discovered::project_into(&mut tables, candidates, &verified, request, true, |scoped| results.push(scoped))?;
@@ -774,7 +774,7 @@ pub(super) fn retry_volume(
         seed.into_owned(),
         filesystem_logical_name(&original.entry_path),
     )]);
-    let mut table = directory_table(&filtered, &raw, Some(targets), candidates, &mut verified, request)?;
+    let mut table = directory_table(&context.scope.root, &filtered, &raw, Some(targets), candidates, &mut verified, request)?;
     let has_views = !table.read_scopes.is_empty();
     let original_key = path_key(&original.entry_path);
     let head_identity = |head: Option<&InputExtent>| {
@@ -853,7 +853,7 @@ pub(super) fn find_watch_volume(
     };
     let mut verified = HashMap::new();
     let targets = FileTargets::new(vec![(path.to_string(), filesystem_logical_name(&path))]);
-    let mut table = directory_table(&filtered, &raw, Some(targets), candidates, &mut verified, request)?;
+    let mut table = directory_table(&scope.root, &filtered, &raw, Some(targets), candidates, &mut verified, request)?;
     let mut discovered = Discovered::default();
     // Reuse the complete projection, including embedded members and carriers.
     // This is a dependency lookup for an already admitted source; it neither
@@ -893,6 +893,7 @@ fn watch_discovery_error(path: PathBuf, error: io::Error) -> InputError {
 }
 
 fn configured_table(
+    root: &str,
     raw: &NativeDirectorySnapshot,
     filtered: &NativeDirectorySnapshot,
     targets: Option<&FileTargets>,
@@ -917,12 +918,13 @@ fn configured_table(
         NativeCandidateTable::default()
     };
     if mapped {
-        table.read_scopes.push(crate::scan::discovery::ReadScope::new(raw, filtered, targets));
+        table.read_scopes.push(crate::scan::discovery::ReadScope::new(root, raw, filtered, targets));
     }
     table
 }
 
 fn directory_table(
+    root: &str,
     filtered: &NativeDirectorySnapshot,
     raw: &NativeDirectorySnapshot,
     targets: Option<FileTargets>,
@@ -930,7 +932,7 @@ fn directory_table(
     verified: &mut VerifiedPasswords,
     request: &Request,
 ) -> io::Result<NativeCandidateTable> {
-    let mut table = configured_table(raw,filtered,targets.as_ref(),request,false);
+    let mut table = configured_table(root, raw, filtered, targets.as_ref(), request, false);
     probe_relations(&mut table, filtered, raw, targets.as_ref(), candidates, verified, request)?;
     Ok(table)
 }

@@ -147,7 +147,7 @@ fn verify_seven_zip_mapping(validation: &ProposalValidation) -> std::io::Result<
         let begin = start.max(logical);
         let finish = end.min(stop);
         if begin < finish {
-            let reader = crate::io::reader::ManagedReader::open(&part.0)?.with_view(anchor.view.as_ref())?.probe_reader();
+            let reader = anchor.open()?.probe_reader();
             update_relation_crc(&reader, base + begin - logical, finish - begin, &mut crc)?;
             consumed += finish - begin;
         }

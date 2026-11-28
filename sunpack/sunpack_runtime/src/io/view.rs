@@ -13,25 +13,29 @@ pub(crate) struct Span {
 }
 
 impl Span {
-    fn append_to(mut self, runs: &mut Vec<Self>) {
+    pub(crate) fn join(&mut self, next: &Self) -> bool {
         let single = self.end - self.start == 1;
-        if let Some(last) = runs.last_mut() {
-            let last_single = last.end - last.start == 1;
-            if last.end == self.start && (!last.reverse || last_single) && (!self.reverse || single)
-            {
-                last.end = self.end;
-                last.reverse = false;
-                return;
-            }
-            if self.end == last.start && (last.reverse || last_single) && (self.reverse || single) {
-                last.start = self.start;
-                last.reverse = true;
-                return;
-            }
-        }
-        if single {
+        let next_single = next.end - next.start == 1;
+        if self.end == next.start && (!self.reverse || single) && (!next.reverse || next_single) {
+            self.end = next.end;
             self.reverse = false;
+            return true;
         }
+        if next.end == self.start && (self.reverse || single) && (next.reverse || next_single) {
+            self.start = next.start;
+            self.reverse = true;
+            return true;
+        }
+        false
+    }
+
+    fn normalize(&mut self) {
+        self.reverse &= self.end - self.start > 1;
+    }
+
+    fn append_to(mut self, runs: &mut Vec<Self>) {
+        if runs.last_mut().is_some_and(|last| last.join(&self)) { return; }
+        self.normalize();
         runs.push(self);
     }
 }
@@ -181,7 +185,7 @@ impl ReadView {
         let mut run = None;
         self.visit(start, start.checked_add(len)?, |mut span| {
             if span.end - span.start == len {
-                span.reverse &= len > 1;
+                span.normalize();
                 run = Some(span);
             }
             Ok(())
@@ -196,7 +200,7 @@ impl ReadView {
         }
         let mut cursor = start;
         let mapped = self.visit(start, end, |span| {
-            if span.reverse || span.start != cursor {
+            if span.reverse && span.end - span.start > 1 || span.start != cursor {
                 return Err(io::ErrorKind::InvalidData.into());
             }
             cursor = span.end;
@@ -495,27 +499,35 @@ impl ConfiguredViews {
 
     fn derive(&self, physical: &ManagedReader, boundaries: &mut MaskBoundaries, rejected: u32, evidence: Option<ProbeBytes>)
         -> io::Result<Vec<Arc<ReadView>>> {
-        let mut result = Vec::new();
+        let mut result = Vec::<Arc<ReadView>>::new();
         let physical_size = physical.len();
         for group in self.methods.chunk_by(|a, b| a.0 == b.0) {
             let method = group[0].0;
             if rejected & method.rejection() != 0 { continue; }
             let mut first = evidence.and_then(|bytes| bytes.for_method(method.probe()));
             let mut wanted = group.iter().map(|&(_, depth)| depth).peekable();
-            let mut current: Option<Arc<ReadView>> = None;
+            let mut intermediate = None;
             let mut size = physical_size;
             let mut record_boundary = self.plain;
             for depth in 1..=group.last().unwrap().1 {
                 if size < method.probe().minimum { break; }
                 super::cancellation::Cancellation::check_current_io()?;
-                let Some(layer) = method.layer(physical, current.as_deref(), size, first.take())? else { break; };
+                let parent = intermediate.as_ref().or_else(|| {
+                    result.last().map(Arc::as_ref).filter(|view| view.method == method && view.depth == depth - 1)
+                });
+                let Some(layer) = method.layer(physical, parent, size, first.take())? else { break; };
                 if record_boundary {
-                    if let Some(end) = layer.prefix_end { boundaries.record(current.as_deref(), end); }
+                    if let Some(end) = layer.prefix_end { boundaries.record(parent, end); }
                 }
-                let view = Arc::new(ReadView { method, depth, physical_size, spans: layer.spans });
+                let view = ReadView { method, depth, physical_size, spans: layer.spans };
                 record_boundary = wanted.peek() == Some(&depth);
-                if record_boundary { result.push(view.clone()); wanted.next(); }
-                current = Some(view);
+                if record_boundary {
+                    wanted.next();
+                    result.push(Arc::new(view));
+                    intermediate = None;
+                } else {
+                    intermediate = Some(view);
+                }
                 size = layer.size;
             }
         }

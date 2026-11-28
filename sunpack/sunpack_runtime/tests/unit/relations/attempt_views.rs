@@ -45,3 +45,37 @@ fn zip_disk_matching_counts_equivalent_views_only_once() {
     assert_eq!(plan.layouts.len(), 1);
     assert_eq!(plan.domains[plan.layouts[0].slots[1].domain].choices.len(), 2);
 }
+
+#[test]
+fn raw_zip_disk_bound_counts_distinct_physical_extents() {
+    let row = |anchor: VolumeAnchor| RelationInput {
+        path: anchor.path.clone(),
+        path_key: anchor.path.clone(),
+        size: Some(anchor.size),
+        relation_member_eligible: true,
+        anchor_cell: None,
+        anchor: Some(Arc::new(anchor)),
+    };
+    let middle = VolumeAnchor { path: "middle".into(), size: 4, ..Default::default() };
+    let rows = [
+        row(VolumeAnchor { path: "head".into(), format: "zip", size: 1,
+            internal_volume_number: Some(1), flags: ZIP_SPLIT_START, ..Default::default() }),
+        row(VolumeAnchor { path: "tail".into(), format: "zip", size: 4,
+            flags: TERMINAL, zip_directory: Some(Arc::new(crate::formats::zip::RelationDirectory {
+                disk: 0, cd_disk: 0, offset: 13, size: 2, entries: 1, disk_entries: 1, end: 4,
+            })), ..Default::default() }),
+        row(middle.clone()),
+        row(VolumeAnchor { size: 5, ..middle.clone() }),
+        row(VolumeAnchor { view: Some(Arc::new(ReadView {
+            method: ViewMethod::Apate, depth: 1, physical_size: 8,
+            spans: vec![Span { start: 0, end: 4, reverse: false }],
+        })), ..middle }),
+    ];
+    let facts = rows.iter().enumerate().map(|(i, row)| {
+        (i, super::super::structural::StructuralFacts::from_row(row, "zip"))
+    }).collect();
+    let view = BucketView { rows: &rows, indexes: &[], facts: &facts,
+        features: &HashMap::new(), format: "zip", loose_numeric_allowed: false };
+    assert_eq!(raw_zip_disk_bound(&view, &[0, 1, 2, 3], [&0].into_iter()), Some(4));
+    assert_eq!(raw_zip_disk_bound(&view, &[0, 1, 2, 4], [&0].into_iter()), Some(3));
+}

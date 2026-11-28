@@ -5,7 +5,7 @@ use super::filename::NameProfile;
 use super::*;
 use crate::collections::SmallOrderedSet;
 use crate::io::archive_state::{
-    TailTotal, VolumeAttemptPlan, VolumeDomain, VolumeLayout, VolumeSlot,
+    PhysicalRanges, TailTotal, VolumeAttemptPlan, VolumeDomain, VolumeLayout, VolumeSlot,
 };
 use std::collections::BTreeMap;
 use std::hash::{BuildHasher, Hash, Hasher};
@@ -430,15 +430,19 @@ fn raw_zip_disk_bound<'a>(view: &BucketView<'_>, indexes: &[usize], heads: impl 
         if a.has_unresolved_carrier_extent() { 1 } else { a.payload_size() }
     }).min()?;
     let mut available = before.saturating_sub(head_min);
-    let mut unique = HashMap::new();
+    let mut unique = HashSet::new();
+    let mut lengths = Vec::new();
     for &i in indexes {
         let Some(a) = &view.rows[i].anchor else { continue };
         if view.facts[&i].exact_slot != Some(1) && !a.has_any(TERMINAL) {
-            let size = unique.entry((&view.rows[i].path_key, a.view.as_deref())).or_insert(a.size);
-            *size = (*size).min(a.size);
+            // Raw continuation sources consume the whole admitted slice. Use
+            // the same identity as projection, including bounded prefixes.
+            let runs = PhysicalRanges::new(a.view.as_deref(), 0, Some(a.size));
+            if unique.insert((&view.rows[i].path, runs)) {
+                lengths.push(a.size);
+            }
         }
     }
-    let mut lengths: Vec<_> = unique.into_values().collect();
     lengths.sort_unstable();
     let count = lengths.iter().take_while(|&&size| {
         if size > available { return false; }
@@ -1047,7 +1051,7 @@ impl VolumeAttempts {
             if variants {
                 // A file-level transform may move the same ordered runs to a
                 // different logical offset. They still represent one disk.
-                let runs = crate::io::archive_state::PhysicalRanges::new(
+                let runs = PhysicalRanges::new(
                     source.view.as_deref(), source.start, Some(source.end),
                 );
                 let key = (&source.path, runs, total);
