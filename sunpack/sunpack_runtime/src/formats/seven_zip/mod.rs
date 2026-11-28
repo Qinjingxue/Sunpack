@@ -62,11 +62,11 @@ impl RelationNextHeader {
 }
 
 pub(crate) fn relation_header_crc(
-    path: &str,
+    reader: &crate::io::reader::ManagedReader,
     offset: u64,
     header: RelationNextHeader,
 ) -> std::io::Result<Option<bool>> {
-    let reader = crate::io::reader::ManagedReader::open(path)?.probe_reader();
+    let reader = reader.probe_reader();
     if offset
         .checked_add(header.size)
         .is_none_or(|end| end > reader.len())

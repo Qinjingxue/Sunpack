@@ -148,11 +148,20 @@ struct ExtractArchiveResult {
 
 using ExtractProgressCallback = std::function<void(const ExtractProgressEvent&)>;
 
+struct ReadSpan {
+    unsigned long long start = 0, end = 0;
+    bool reverse = false;
+};
+struct ReadView {
+    unsigned long long physical_size = 0;
+    std::vector<ReadSpan> spans;
+};
 struct ExtractInputRange {
     std::wstring path;
     unsigned long long start = 0;
     unsigned long long end = 0;
     bool has_end = false;
+    std::shared_ptr<const ReadView> view;
 };
 
 struct VolumeAttemptPlan;

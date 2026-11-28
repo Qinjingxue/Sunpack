@@ -15,6 +15,7 @@ fn logical_input(format: &str, bytes: &[u8], split: usize, mode: OpenMode) -> (A
         carrier.extend_from_slice(b"unrelated tail");
         let path = temp_file("logical_password_opaque", &carrier);
         let mut part = InputPart::range(InputExtent {
+            view: None,
             path: path.to_string_lossy().into_owned(), start, end: Some(end),
         });
         part.volume_number = Some(index as u32 + 1);
@@ -42,6 +43,7 @@ fn enc_quick_proof_uses_the_analyzed_carrier_offset_with_known_or_unknown_end() 
     input.mode = OpenMode::FileRange;
     for extent_end in [Some(end), None] {
         input.parts = vec![InputPart::range(InputExtent {
+            view: None,
             path: path_string.clone(), start, end: extent_end,
         })].into_boxed_slice();
         let result = verify(&mut context::Preparation::default(), &input,
@@ -164,7 +166,7 @@ fn certain_zip_directory_supplies_proof_after_descriptor_sized_plain_head() {
                 .copy_from_slice(&((head.len() + central) as u32).to_le_bytes());
         }
         let paths = [temp_file("zip_cd_head", &head), temp_file("zip_cd_right", &tail)];
-        let sources: Vec<_> = paths.iter().map(|path| InputExtent { path: path.to_string_lossy().into_owned(),
+        let sources: Vec<_> = paths.iter().map(|path| InputExtent { view: None, path: path.to_string_lossy().into_owned(),
             start: 0, end: Some(std::fs::metadata(path).unwrap().len()) }).collect();
         let plan = Arc::new(VolumeAttemptPlan {
             sources: sources.clone().into_boxed_slice(),

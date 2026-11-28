@@ -54,6 +54,7 @@ impl Serialize for ScanItem<'_> {
         let entry = self.entry;
         let (show_parts, completeness) = entry.scan_layout.volumes(entry);
         let mut item = serializer.serialize_map(None)?;
+        if !entry.scan_layout.views.is_empty() {item.serialize_entry("views",&entry.scan_layout.views)?;}
         if show_parts {
             item.serialize_entry("all_parts", &entry.source_paths)?;
         }
@@ -70,7 +71,11 @@ impl Serialize for ScanItem<'_> {
         if !entry.format.is_empty() {
             item.serialize_entry("format", &entry.format)?;
         }
-        item.serialize_entry("input_id", &format_args!("{}|{}|{}", self.key, entry.format, entry.offset))?;
+        item.serialize_entry("input_id", &crate::io::archive_state::logical_input_id(
+            self.key, &entry.format, entry.offset, entry.scan_layout.head_view.as_ref(),
+            entry.scan_layout.zip_directory_id.as_deref(),
+            entry.end_offset.filter(|_| entry.scan_layout.distinguish_end),
+        ))?;
         item.serialize_entry("main_path", &entry.path)?;
         if entry.scan_layout.range {
             item.serialize_entry("offset", &entry.offset)?;
@@ -79,7 +84,11 @@ impl Serialize for ScanItem<'_> {
             item.serialize_entry("password_used", &entry.password)?;
         }
         if let Some(plan) = entry.volume_attempts.as_deref() {
-            item.serialize_entry("volume_attempts", plan)?;
+            if entry.scan_layout.views.is_empty() {
+                item.serialize_entry("volume_attempts", plan)?;
+            } else {
+                item.serialize_entry("volume_attempts", &crate::io::archive_state::AttemptReport(plan))?;
+            }
         }
         if let Some(value) = completeness {
             item.serialize_entry("volume_completeness", value)?;

@@ -57,7 +57,7 @@ fn measure_watch_dedup_index() {
     };
     let baseline = std::env::var("SUNPACK_DEDUP_BENCH_PHASE").unwrap() == "baseline";
     let folder = PathBuf::from(std::env::var_os("SUNPACK_DEDUP_BENCH_INDEX").unwrap());
-    let mut index = Index::open(&folder, mode, WatchDeduplicationScope::Root).unwrap();
+    let mut index = Index::open(&folder, mode, WatchDeduplicationScope::Root, Default::default()).unwrap();
     index
         .reconcile_journals(&[("benchmark-scope".into(), "benchmark-volume".into(), 1)])
         .unwrap();

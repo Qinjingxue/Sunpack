@@ -45,7 +45,9 @@ fn standalone_xz_and_zstd_detect_open_ends() {
             size: data.len() as u64,
             ..VolumeAnchor::default()
         };
-        probe_standalone_stream(&data[..data.len().min(512)], &mut anchor, |offset, count| {
+        let prefix = &data[..data.len().min(512)];
+        let kind = crate::formats::StreamFormat::from_header(prefix).unwrap();
+        probe_standalone_stream(kind, prefix, &mut anchor, |offset, count| {
             let offset = offset as usize;
             Ok(data[offset..offset + count].to_vec())
         });
@@ -93,7 +95,9 @@ fn standalone_gzip_and_bzip2_prove_incomplete_extents() {
             size: data.len() as u64,
             ..VolumeAnchor::default()
         };
-        probe_standalone_stream(&data[..data.len().min(512)], &mut anchor, |offset, count| {
+        let prefix = &data[..data.len().min(512)];
+        let kind = crate::formats::StreamFormat::from_header(prefix).unwrap();
+        probe_standalone_stream(kind, prefix, &mut anchor, |offset, count| {
             let offset = offset as usize;
             extra_bytes += count;
             Ok(data[offset..offset + count].to_vec())

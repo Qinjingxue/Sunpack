@@ -28,6 +28,7 @@ impl RangeSpec {
     fn for_extent(
         reader: ManagedReader, range: &InputExtent, virtual_start: u64, limit: Option<u64>,
     ) -> std::io::Result<Self> {
+        let reader = reader.with_view(range.view.as_ref())?;
         let file_len = reader.len();
         let start = range.start;
         if start > file_len {
@@ -322,9 +323,9 @@ pub(crate) fn parse_volumes<'a>(
         let number = item
             .volume_number
             .ok_or_else(|| std::io::Error::other("volume_number is required"))?;
-        let InputExtent { path, start, end } = &item.extent;
+        let InputExtent { path, start, end, view } = &item.extent;
         let (start, end) = (*start, *end);
-        let reader = readers.open(path, parts.len() > 1)?;
+        let reader = readers.open(path, parts.len() > 1)?.with_view(view.as_ref())?;
         if start > end.unwrap_or(reader.len()).min(reader.len()) {
             return Err(std::io::Error::other("volume range is outside file length"));
         }

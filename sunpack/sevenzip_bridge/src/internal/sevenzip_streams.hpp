@@ -584,6 +584,28 @@ namespace sunpack::sevenzip
         std::unique_ptr<OverlappedPrefetcher> prefetch_;
     };
 
+    // A decoder rejection may be reused only for ranges the stream can actually open.
+    template<class Emit>
+    HRESULT visit_view_range(const ExtractInputRange& input, UInt64 file_size, Emit emit)
+    {
+        if (input.view->physical_size != file_size) return E_FAIL;
+        UInt64 base = 0;
+        for (const auto& span : input.view->spans) {
+            if (span.start >= span.end || span.end > file_size ||
+                span.end - span.start > file_size - base) return E_INVALIDARG;
+            const UInt64 next = base + (span.end - span.start);
+            const UInt64 left = std::max<UInt64>(base, input.start);
+            const UInt64 right = input.has_end ? std::min<UInt64>(next, input.end) : next;
+            if (left < right) {
+                const UInt64 at = span.reverse ? span.end - (right - base) : span.start + (left - base);
+                if (!emit(at, right - left, span.reverse)) return E_INVALIDARG;
+            }
+            base = next;
+        }
+        return input.start <= base && (!input.has_end || (input.start <= input.end && input.end <= base))
+            ? S_OK : E_INVALIDARG;
+    }
+
     struct NormalizedInputRange
     {
 
@@ -594,6 +616,8 @@ namespace sunpack::sevenzip
         UInt64 length = 0;
 
         UInt64 virtual_offset = 0;
+
+        bool reversed = false;
     };
 
     class MultiRangeInStream final : public CMyUnknownImp, public IInStream
@@ -629,8 +653,10 @@ namespace sunpack::sevenzip
             const std::vector<ExtractInputRange> &ranges,
             ExtractInputTrace *trace = nullptr,
             InputPrefetchConfig prefetch_config = InputPrefetchConfig{false, 512 * 1024},
-            VolumeReadUncertainty *probe_reads = nullptr)
-            : MultiRangeInStream(ranges.data(), ranges.size(), trace, prefetch_config, false, probe_reads, {}) {}
+            VolumeReadUncertainty *probe_reads = nullptr,
+            ArchiveOpenMode mode = ArchiveOpenMode::NativeVolumes)
+            : MultiRangeInStream(ranges.data(), mode == ArchiveOpenMode::SfxWithVolumes && !ranges.empty()
+                ? 1 : ranges.size(), trace, prefetch_config, false, probe_reads, {}) {}
 
         MultiRangeInStream(const ExtractInputRange &range, InputPrefetchConfig prefetch_config,
                            NamedVolumeError volume_error)
@@ -674,6 +700,16 @@ namespace sunpack::sevenzip
                     file_size = size;
                 }
 
+                if (input.view) {
+                    const HRESULT hr = visit_view_range(input, file_size, [&](UInt64 at, UInt64 length, bool reverse) {
+                        if (UINT64_MAX - total_size_ < length) return false;
+                        ranges_.push_back({input.path, at, length, total_size_, reverse});
+                        total_size_ += length;
+                        return true;
+                    });
+                    if (FAILED(hr)) { open_hresult_ = hr; break; }
+                    continue;
+                }
                 const UInt64 start = std::min<UInt64>(input.start, file_size);
 
                 const UInt64 end = input.has_end ? std::min<UInt64>(input.end, file_size) : file_size;
@@ -692,7 +728,7 @@ namespace sunpack::sevenzip
                     continue;
                 }
 
-                ranges_.push_back({input.path, start, length, total_size_});
+                ranges_.push_back({input.path, start, length, total_size_, false});
 
                 total_size_ += length;
             }
@@ -764,7 +800,7 @@ namespace sunpack::sevenzip
                 const UInt64 remaining = range->length - offset_in_range;
 
                 const UInt32 want = static_cast<UInt32>(std::min<UInt64>(size - total_read, remaining));
-                const UInt64 source_offset = range->start + offset_in_range;
+                const UInt64 source_offset = range->start + (range->reversed ? remaining - want : offset_in_range);
                 const HRESULT open_result = ensure_cached_handle(index);
                 if (open_result != S_OK)
                 {
@@ -823,13 +859,23 @@ namespace sunpack::sevenzip
                     return publish_named_volume_error(volume_error_, hr);
                 }
 
+                cached_handle_position_ += read;
+                if (range->reversed)
+                {
+                    if (read != want)
+                    {
+                        const HRESULT hr = HRESULT_FROM_WIN32(ERROR_HANDLE_EOF);
+                        record_input_error(trace_, range->path, hr, position_, source_offset, want);
+                        return publish_named_volume_error(volume_error_, hr);
+                    }
+                    std::reverse(out + total_read, out + total_read + read);
+                }
                 if (read == 0)
                 {
                     break;
                 }
                 total_read += read;
                 position_ += read;
-                cached_handle_position_ += read;
             }
 
 #ifdef SUP7Z_DEBUG
@@ -903,6 +949,7 @@ namespace sunpack::sevenzip
                         const std::size_t index = find_range_index(offset);
                         if (index >= ranges_.size()) return false;
                         const auto &range = ranges_[index];
+                        if (range.reversed) return false;
                         const UInt64 displacement = offset - range.virtual_offset;
                         source = PrefetchSource{&range.path, range.start + displacement, range.length - displacement};
                         return true;

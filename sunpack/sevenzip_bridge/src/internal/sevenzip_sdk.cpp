@@ -23,12 +23,6 @@ namespace sunpack::sevenzip
     // (CPP/7zip/Guid.txt via the interface headers), so they cannot drift from
     // the handler implementation they are matched against.
 
-    GUID format_guid(unsigned char format_id)
-    {
-
-        return {0x23170F69, 0x40C1, 0x278A, {0x10, 0x00, 0x00, 0x01, 0x10, format_id, 0x00, 0x00}};
-    }
-
     HRESULT create_in_archive(const GUID &format, IInArchive **archive)
     {
 

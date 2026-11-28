@@ -13,6 +13,11 @@
     "performance": "groups/performance"
   },
   "fields": {
+    "/filesystem/read_views": {
+      "label": "fields/filesystem/read_views/label",
+      "description": "fields/filesystem/read_views/description",
+      "editor": "view_list"
+    },
     "/filesystem/scan_filters/@size_range": {
       "label": "fields/filesystem/scan_filters/@size_range/label",
       "editor": "size_range"

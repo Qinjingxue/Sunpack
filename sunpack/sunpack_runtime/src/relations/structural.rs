@@ -115,11 +115,11 @@ pub(super) fn collect(
                 if row.anchor.as_ref().is_some_and(|a| {
                     a.pe_state != PeState::None && !a.sfx && !a.has_any(SFX_CHECKED)
                 }) {
-                    pending.insert(row.path_key.as_str(), i);
+                    pending.insert((row.path_key.as_str(), row.anchor.as_ref().and_then(|a|a.view.as_deref())), i);
                 } else if !pending.is_empty() {
                     // Slices of one physical path share a stem. Keep the last
                     // row's probe decision, including already resolved slices.
-                    pending.remove(row.path_key.as_str());
+                    pending.remove(&(row.path_key.as_str(), row.anchor.as_ref().and_then(|a|a.view.as_deref())));
                 }
             }
             pe_rows.extend(pending.drain().map(|(_, i)| i));
@@ -129,7 +129,7 @@ pub(super) fn collect(
     for i in pe_rows {
         // One managed context supplies PE headers, overlay, stub and archive
         // confirmation. Its existing caches/guard live only through this row.
-        let Ok(reader) = crate::io::reader::ManagedReader::open(&rows[i].path) else {
+        let Ok(reader) = rows[i].anchor.as_ref().unwrap().open() else {
             continue;
         };
         if rows[i]
@@ -148,7 +148,7 @@ pub(super) fn collect(
             anchor.pe_state = probe.state();
             anchor.pe_image_end = probe.image_end();
         }
-        if let Some(anchor) = promote_sfx_archive_anchor(&rows[i], &reader) {
+        if let Some(anchor) = rows[i].anchor.as_deref().and_then(|a| promote_sfx_archive_anchor(a, &reader)) {
             rows[i].anchor = Some(Arc::new(anchor));
         }
         if let Some(anchor) = rows[i].anchor_mut() {
@@ -274,7 +274,7 @@ pub(super) fn collect(
                 remember_tail_facts(&rows[i], rows[i].anchor.as_ref().unwrap());
             }
         }
-        refine_zip_members(rows, indexes);
+        refine_zip_members(rows, indexes, None, |_, _| {});
         refine_seven_zip_terminal(rows, indexes);
     }
     for indexes in index.rows_by_stem.values() {
@@ -306,7 +306,7 @@ pub(super) fn collect(
 /// head, and concurrent requests must never downgrade a more complete tail.
 fn remember_tail_facts(row: &RelationInput, anchor: &Arc<VolumeAnchor>) {
     let checks = SFX_CHECKED | RAR_END_CHECKED | ZIP_TAIL_CHECKED | ZIP_CARRIER_CHECKED;
-    if !anchor.error.is_empty()
+    if anchor.view.is_some() || !anchor.error.is_empty()
         || anchor.encrypted
         || anchor.needs_password
         || anchor.carrier_limit.is_some()
@@ -351,8 +351,23 @@ fn remember_tail_facts(row: &RelationInput, anchor: &Arc<VolumeAnchor>) {
     *cached = Some(CheapAnchor::Full(Arc::clone(anchor)));
 }
 
-fn refine_zip_members(rows: &mut [RelationInput], indexes: &[usize]) {
-    use crate::formats::zip::{relation_local_key, visit_relation_directory, RelationLocalFields};
+pub(super) type ZipLocalKeys<'a> = HashMap<
+    (&'a str, Option<&'a crate::io::view::ReadView>, u64),
+    Option<crate::formats::zip::RelationLocalKey>,
+>;
+
+pub(super) fn zip_local_key(
+    a: &VolumeAnchor, at: u64, cached: Option<&ZipLocalKeys<'_>>,
+) -> std::io::Result<Option<crate::formats::zip::RelationLocalKey>> {
+    if let Some(key) = cached.and_then(|c| c.get(&(a.path.as_str(), a.view.as_deref(), at))) {
+        return Ok(key.clone());
+    }
+    crate::formats::zip::relation_local_key(&a.path, a.view.as_ref(), at)
+}
+
+pub(super) fn refine_zip_members(rows: &mut [RelationInput], indexes: &[usize], cached: Option<&ZipLocalKeys<'_>>,
+    mut interior: impl FnMut(&Arc<VolumeAnchor>, u64)) {
+    use crate::formats::zip::{visit_relation_directory, RelationLocalFields};
     let terminals: Vec<_> = indexes
         .iter()
         .filter_map(|&i| {
@@ -368,8 +383,21 @@ fn refine_zip_members(rows: &mut [RelationInput], indexes: &[usize]) {
     if terminals.is_empty() {
         return;
     }
-    let unique_directory = terminals.len() == 1;
-    let mut local = HashMap::<Vec<u8>, HashMap<RelationLocalFields, Option<usize>>>::new();
+    // Root and embedded probes, or several views of a terminal disk, may
+    // reference the exact same directory bytes. Walk that directory once
+    // while retaining every disk view as a distinct source for payload reads.
+    let (first, dir) = terminals[0];
+    let directory_range = |i: usize| {
+        let a = rows[i].anchor.as_ref().unwrap();
+        let start = if dir.disk == dir.cd_disk { dir.end.saturating_sub(dir.size) } else { 0 };
+        crate::io::archive_state::PhysicalRanges::new(a.view.as_deref(), start, Some(dir.end))
+    };
+    let unique_directory = terminals.len() == 1 || {
+        let first_range = directory_range(first);
+        terminals.iter().skip(1).all(|&(i, d)| rows[i].path_key == rows[first].path_key
+            && d == dir && directory_range(i) == first_range)
+    };
+    let mut local = HashMap::<Vec<u8>, HashMap<RelationLocalFields, Vec<usize>>>::new();
     for &i in indexes.iter().filter(|_| unique_directory) {
         let Some(a) = rows[i].anchor.as_ref().filter(|a| {
             a.format == "zip"
@@ -379,14 +407,13 @@ fn refine_zip_members(rows: &mut [RelationInput], indexes: &[usize]) {
         }) else {
             continue;
         };
-        match relation_local_key(&a.path, a.structure_offset.unwrap_or(0)) {
+        match zip_local_key(a, a.structure_offset.unwrap_or(0), cached) {
             Ok(Some(mut key)) => {
                 local
                     .entry(std::mem::take(&mut key.name))
                     .or_default()
                     .entry(key.fields)
-                    .and_modify(|old| *old = None)
-                    .or_insert(Some(i));
+                    .or_default().push(i);
             }
             // An unreadable competitor cannot be ruled out of a unique match.
             Err(_) => return,
@@ -401,14 +428,16 @@ fn refine_zip_members(rows: &mut [RelationInput], indexes: &[usize]) {
     });
     let carrier = match (carriers.next(), carriers.next()) {
         (Some(i), None) if terminals.iter().any(|(_, d)| d.disk == 1 && d.cd_disk == 1) => {
-            crate::io::reader::ManagedReader::open(&rows[i].path)
+            rows[i].anchor.as_ref().unwrap().open()
                 .ok()
                 .map(|reader| (i, reader.probe_reader()))
         }
         _ => None,
     };
-    for (terminal, directory) in terminals {
+    for terminal_entry @ &(terminal, directory) in terminals.iter().take(if unique_directory { 1 } else { terminals.len() }) {
+        let copies = if unique_directory { terminals.as_slice() } else { std::slice::from_ref(terminal_entry) };
         let mut matches = HashMap::<usize, Option<(u32, u64)>>::new();
+        let mut first_local = None::<(u64, crate::formats::zip::RelationLocalKey)>;
         // Two-disk ZIPs may have no intermediate disk to establish split size.
         // Declared member ends minus the continuation on disk two locate the
         // first disk. Keep competing tails' results separate until selection.
@@ -419,8 +448,9 @@ fn refine_zip_members(rows: &mut [RelationInput], indexes: &[usize]) {
         let mut carrier_end = Some(0u64);
         let mut carrier_entries = 0u64;
         let mut all_first_disk = true;
+        let Ok(reader) = rows[terminal].anchor.as_ref().unwrap().open() else { continue };
         let complete =
-            visit_relation_directory(&rows[terminal].path, directory, |record, values| {
+            visit_relation_directory(&reader, directory, |record, values| {
                 all_first_disk &= values.disk == 0;
                 if values.disk == 0 {
                     if let Some((_, a, reader)) = &carrier {
@@ -449,9 +479,7 @@ fn refine_zip_members(rows: &mut [RelationInput], indexes: &[usize]) {
                 if record.flags & 0x2000 != 0 {
                     return;
                 }
-                let Some(candidates) = local.get(record.name) else {
-                    return;
-                };
+
                 let fields = RelationLocalFields::new(
                     record.method,
                     record.flags,
@@ -459,7 +487,12 @@ fn refine_zip_members(rows: &mut [RelationInput], indexes: &[usize]) {
                     values.compressed,
                     values.uncompressed,
                 );
-                let Some(&Some(i)) = candidates.get(&fields) else {
+                if values.disk == 0 && first_local.as_ref().is_none_or(|(at, _)| values.local_offset < *at) {
+                    first_local = Some((values.local_offset, crate::formats::zip::RelationLocalKey {
+                        name: record.name.to_vec(), fields,
+                    }));
+                }
+                let Some(candidates) = local.get(record.name).and_then(|records| records.get(&fields)) else {
                     return;
                 };
                 let Some(slot) = u32::try_from(values.disk)
@@ -468,29 +501,36 @@ fn refine_zip_members(rows: &mut [RelationInput], indexes: &[usize]) {
                 else {
                     return;
                 };
-                let anchor = rows[i].anchor.as_ref().unwrap();
-                let Some(base) = anchor
-                    .structure_offset
-                    .unwrap_or(0)
-                    .checked_sub(values.local_offset)
-                else {
-                    return;
-                };
-                if anchor
-                    .internal_volume_number
-                    .is_some_and(|known| known != slot)
-                {
+                // Several views can prove the same member of one physical disk.
+                // Identical member names on distinct files remain ambiguous.
+                if candidates.iter().skip(1).any(|&i| rows[i].path_key != rows[candidates[0]].path_key) {
                     return;
                 }
-                let identity = (slot, base);
-                matches
-                    .entry(i)
-                    .and_modify(|old| {
-                        if *old != Some(identity) {
-                            *old = None;
-                        }
-                    })
-                    .or_insert(Some(identity));
+                for &i in candidates {
+                    let anchor = rows[i].anchor.as_ref().unwrap();
+                    let Some(base) = anchor
+                        .structure_offset
+                        .unwrap_or(0)
+                        .checked_sub(values.local_offset)
+                    else {
+                        continue;
+                    };
+                    if anchor
+                        .internal_volume_number
+                        .is_some_and(|known| known != slot)
+                    {
+                        continue;
+                    }
+                    let identity = (slot, base);
+                    matches
+                        .entry(i)
+                        .and_modify(|old| {
+                            if *old != Some(identity) {
+                                *old = None;
+                            }
+                        })
+                        .or_insert(Some(identity));
+                }
             });
         if !matches!(complete, Ok(true)) {
             continue;
@@ -515,7 +555,7 @@ fn refine_zip_members(rows: &mut [RelationInput], indexes: &[usize]) {
                 })
         });
         if let Some((i, end, size)) = carrier_extent {
-            rows[terminal].anchor_mut().unwrap().zip_head_size = Some(size);
+            for &(i, _) in copies { rows[i].anchor_mut().unwrap().zip_head_size = Some(size); }
             if unique_directory {
                 rows[i].anchor_mut().unwrap().payload_end = Some(end);
             }
@@ -528,7 +568,7 @@ fn refine_zip_members(rows: &mut [RelationInput], indexes: &[usize]) {
                 .checked_sub(directory.size)
                 .and_then(|n| n.checked_sub(directory.offset))
             {
-                rows[terminal].anchor_mut().unwrap().structure_offset = Some(base);
+                for &(i, _) in copies { rows[i].anchor_mut().unwrap().structure_offset = Some(base); }
             }
         }
         if !unique_directory {
@@ -536,6 +576,18 @@ fn refine_zip_members(rows: &mut [RelationInput], indexes: &[usize]) {
         }
         for (i, slot) in matches {
             if let Some((slot, base)) = slot {
+                // A later local header may survive a changed disk prefix. Before
+                // promoting its inferred first disk, check the earlier record
+                // that the same central directory requires in this view.
+                let a = rows[i].anchor.as_ref().unwrap();
+                if slot == 1 && a.structure_offset.is_some_and(|at| at > base) {
+                    interior(a, base);
+                }
+                if slot == 1 && first_local.as_ref().is_some_and(|(offset, key)| base.checked_add(*offset).is_some_and(|at| Some(at) != a.structure_offset
+                    && matches!(zip_local_key(a, at, cached), Ok(actual) if actual.as_ref() != Some(key))))
+                {
+                    continue;
+                }
                 let a = rows[i].anchor_mut().unwrap();
                 a.internal_volume_number = Some(slot);
                 a.structure_offset = Some(base);
@@ -549,42 +601,37 @@ fn refine_zip_members(rows: &mut [RelationInput], indexes: &[usize]) {
 }
 
 fn refine_seven_zip_terminal(rows: &mut [RelationInput], indexes: &[usize]) {
-    let heads: Vec<_> = indexes
-        .iter()
-        .filter_map(|&i| {
-            rows[i]
-                .anchor
-                .as_ref()
-                .filter(|a| a.format == "7z" && a.multivolume && a.error.is_empty())
-                .and_then(|a| a.seven_zip_next_header.as_ref().map(|h| **h))
-        })
-        .collect();
-    if heads.len() != 1 || heads[0].size == 0 {
-        return;
-    }
-    let descriptor = heads[0];
-    let mut terminal = None;
+    let mut heads = indexes.iter().filter_map(|&i| {
+        let a = rows[i].anchor.as_ref()?;
+        (a.format == "7z" && a.multivolume && a.error.is_empty())
+            .then_some((&rows[i].path_key, a.structure_offset, **a.seven_zip_next_header.as_ref()?))
+    });
+    let Some((path, offset, descriptor)) = heads.next() else { return };
+    if descriptor.size == 0 || heads.any(|other| other != (path, offset, descriptor)) { return; }
+    let mut terminal_path = None;
+    let mut terminals = Vec::new();
     for &i in indexes {
         let Some(a) = rows[i].anchor.as_ref().filter(|a| {
             a.error.is_empty() && !a.standalone && a.format.is_empty() && a.size >= descriptor.size
         }) else {
             continue;
         };
+        let Ok(reader) = a.open() else {return};
         match crate::formats::seven_zip::relation_header_crc(
-            &a.path,
+            &reader,
             a.size - descriptor.size,
             descriptor,
         ) {
             Ok(Some(true)) => {
-                if terminal.replace(i).is_some() {
-                    return;
-                }
+                if terminal_path.is_some_and(|path| path != rows[i].path_key) { return; }
+                terminal_path = Some(rows[i].path_key.as_str());
+                terminals.push(i);
             }
             Err(_) => return,
             _ => {}
         }
     }
-    if let Some(i) = terminal {
+    for i in terminals {
         let a = rows[i].anchor_mut().unwrap();
         a.format = "7z";
         a.strong = true;

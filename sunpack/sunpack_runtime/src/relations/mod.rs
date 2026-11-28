@@ -190,6 +190,21 @@ impl<'a> RelationCandidateData<'a> {
 }
 
 impl NativeRelationGroup {
+    pub(crate) fn proven_zip_tails(&self) -> impl Iterator<Item = &str> {
+        let plan = match self {
+            Self::Proposal(v) if v.proposal.format == "zip" && v.status == ProposalStatus::Valid => v.attempts.as_ref(),
+            _ => None,
+        };
+        plan.into_iter().flat_map(|p| p.sources.iter().filter(|s| s.terminal).map(|s| s.path.as_str()))
+    }
+
+    pub(crate) fn excluded_heads(&self) -> &[Arc<VolumeAnchor>] {
+        match self {
+            Self::Proposal(v) => v.attempts.as_ref().map_or(&[], |plan| &plan.excluded_heads),
+            Self::Ordinary(..) => &[],
+        }
+    }
+
     pub(crate) fn unresolved_password_group(&self) -> bool {
         matches!(self, Self::Proposal(validation) if validation.status == ProposalStatus::NeedsPassword
             && validation.proposal.volumes.iter().all(|(_, number)| *number == 0))
@@ -262,13 +277,23 @@ impl NativeRelationGroup {
         }
     }
 
-    pub(crate) fn logical_size(&self) -> Option<u64> {
+    pub(crate) fn entry_size(&self) -> Option<u64> {
         match self {
             Self::Ordinary(row, _) => row.size,
-            Self::Proposal(validation) => {
-                proposal_logical_size(&validation.proposal, &validation.facts.anchors)
-            }
+            Self::Proposal(_) => self.entry_anchor().map(|a| a.size),
         }
+    }
+
+    pub(crate) fn project_standalone(anchor: Arc<VolumeAnchor>) -> RelationProjection {
+        let row = RelationInput {
+            path: anchor.path.clone(),
+            path_key: path_key(&anchor.path),
+            size: Some(anchor.size),
+            relation_member_eligible: false,
+            anchor: Some(anchor),
+            anchor_cell: None,
+        };
+        Self::Ordinary(Box::new(row), true).project()
     }
 
     pub(crate) fn project(&self) -> RelationProjection {
@@ -289,18 +314,18 @@ impl NativeRelationGroup {
                 Self::Proposal(validation) => validation.proposal.volumes.len() == 1,
             };
         let failure_reason = match self {
-            _ if zip_awaits_tail => Some("corrupt_archive"),
             Self::Proposal(validation) => project_proposal(validation, &mut input),
             Self::Ordinary(..) => {
                 if !data.relation_confirmed { input.analysis.origin = AnalysisOrigin::RelationsFallback; }
                 if let Some(anchor) = anchor {
                     let start = anchor.structure_offset.unwrap_or(0);
-                    if start > 0 && (anchor.sfx || data.needs_password) {
+                    if anchor.view.is_some() || start > 0 && (anchor.sfx || data.needs_password || anchor.has_any(EMBEDDED_VOLUME)) {
                         input.mode = OpenMode::FileRange;
                         input.parts = Box::new([InputPart::range(InputExtent {
+                            view: anchor.view.clone(),
                             path: data.entry_path.to_owned(),
                             start,
-                            end: anchor.expected_logical_size.filter(|end| *end > start),
+                            end: anchor.expected_logical_size.filter(|end| *end > start).map(|end| end.min(anchor.size)),
                         })]);
                     }
                     if data.format_hint == "zip" {
@@ -331,7 +356,7 @@ impl NativeRelationGroup {
             standalone: matches!(self, Self::Ordinary(..))
                 && anchor.is_some_and(|anchor| anchor.standalone),
             owned_paths: self.owned_paths().map(str::to_owned).collect(),
-            failure_reason,
+            failure_reason: if zip_awaits_tail { Some("corrupt_archive") } else { failure_reason },
         }
     }
 
@@ -389,6 +414,12 @@ impl NativeRelationGroup {
                 }
             }
         }
+    }
+
+    pub(crate) fn split_alias(&self) -> Option<String> {
+        let data = self.candidate_data();
+        if !data.is_split { return None; }
+        Path::new(data.logical_name().as_ref()).file_name().map(|name| case_key(&name.to_string_lossy()))
     }
 
     pub(crate) fn candidate_data(&self) -> RelationCandidateData<'_> {
@@ -513,12 +544,76 @@ pub(crate) fn resolve_embedded_volumes(
     snapshots: &[NativeDirectorySnapshot],
     anchors: Vec<Arc<VolumeAnchor>>,
     excluded: &HashSet<String>,
-    mut cache: RelationCache,
+    cache: RelationCache,
 ) -> Vec<NativeRelationGroup> {
+    // A mapped range needs its exact view identity even with just one source per file.
+    // Ordinary directories can reuse their one-anchor-per-file cache.
     let mut remaining = HashSet::new();
-    if anchors.iter().any(|a| !remaining.insert(CaseKey::new(&a.path))) {
-        return resolve_shared_carrier_volumes(snapshots, anchors, excluded, cache);
+    let shared = anchors.iter().any(|a| a.view.is_some()
+        || a.has_any(crate::analysis_native::volume_anchor::BOUNDED_SOURCE)
+        || !remaining.insert(CaseKey::new(&a.path)));
+    let mut groups = if shared {
+        drop(remaining);
+        resolve_shared_carrier_volumes(snapshots, anchors, excluded, cache)
+    } else {
+        resolve_single_anchor_volumes(snapshots, &anchors, excluded, cache, remaining)
+    };
+    // A lone encrypted file keeps its existing embedded boundary result.
+    // Only a real candidate proposal replaces those individual failures.
+    groups.retain(|group| group.unresolved_password_group()
+        || !group.entry_anchor().is_some_and(|a|
+            a.needs_password && !a.multivolume && a.rar5_encryption.is_some()));
+    // A failed NextHeader inside a carrier can also be damaged standalone
+    // data. Require actual peers for this speculative split identity.
+    // Index only nominated stems once, rather than rescan scopes per head.
+    let speculative = |group: &NativeRelationGroup| {
+        !group.relation_confirmed()
+            && group
+                .entry_anchor()
+                .is_some_and(|a| a.has_any(crate::analysis_native::volume_anchor::SEVEN_ZIP_CARRIER_INTERRUPTED))
+    };
+    let mut peers: HashMap<String, HashSet<String>> = groups
+        .iter()
+        .filter(|g| speculative(g))
+        .map(|g| (crate::scan::catalog::catalog_stem(g.entry_path()), HashSet::new()))
+        .collect();
+    if !peers.is_empty() {
+        for snapshot in snapshots {
+            for row in snapshot.rows() {
+                if !snapshot.table.relation_member_eligible(row) {
+                    continue;
+                }
+                let path = &snapshot.table.paths[row];
+                if let Some(paths) = peers.get_mut(&crate::scan::catalog::catalog_stem(path)) {
+                    // Only two distinct witnesses are needed. Retaining
+                    // every peer would duplicate a large bucket's paths.
+                    if paths.len() >= 2 {
+                        continue;
+                    }
+                    let key = path_key(path);
+                    if !excluded.contains(&key) {
+                        paths.insert(key);
+                    }
+                }
+            }
+        }
+        groups.retain(|g| {
+            !speculative(g)
+                || peers
+                    .get(&crate::scan::catalog::catalog_stem(g.entry_path()))
+                    .is_some_and(|p| p.len() > 1)
+        });
     }
+    groups
+}
+
+fn resolve_single_anchor_volumes<'a>(
+    snapshots: &'a [NativeDirectorySnapshot],
+    anchors: &[Arc<VolumeAnchor>],
+    excluded: &HashSet<String>,
+    mut cache: RelationCache,
+    mut remaining: HashSet<CaseKey<'a>>,
+) -> Vec<NativeRelationGroup> {
     cache
         .anchors
         .extend(anchors.iter().map(|a| (path_key(&a.path), Arc::clone(a))));
@@ -549,6 +644,43 @@ pub(crate) fn resolve_embedded_volumes(
         ));
     }
     output
+}
+
+/// Follow shared physical carriers from the requested paths, keeping each group once.
+pub(crate) fn retain_connected_groups(
+    groups: &mut Vec<NativeRelationGroup>, requested: &HashSet<String>,
+) -> HashSet<String> {
+    let mut by_path: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut keep = vec![false; groups.len()];
+    let mut work = Vec::new();
+    for (index, group) in groups.iter().enumerate() {
+        for path in group.related_paths() {
+            let key = path_key(path);
+            if requested.contains(&key) && !keep[index] {
+                keep[index] = true;
+                work.push(index);
+            }
+            by_path.entry(key).or_default().push(index);
+        }
+    }
+    let mut owned = HashSet::new();
+    while let Some(index) = work.pop() {
+        for path in groups[index].related_paths() {
+            let key = path_key(path);
+            if let Some(peers) = by_path.remove(&key) {
+                owned.insert(key);
+                for peer in peers {
+                    if !keep[peer] {
+                        keep[peer] = true;
+                        work.push(peer);
+                    }
+                }
+            }
+        }
+    }
+    let mut index = 0;
+    groups.retain(|_| { let retain = keep[index]; index += 1; retain });
+    owned
 }
 
 /// Resolve logical heads independently while retaining physical snapshot/cache
@@ -598,18 +730,23 @@ fn resolve_shared_carrier_volumes(
                         row.anchor = None;
                         for anchor in previous {
                             let mut slice = row.clone();
+                            slice.size = Some(anchor.size);
                             slice.anchor = Some((*anchor).clone());
                             rows.push(slice);
                         }
                         row.anchor = Some((*last).clone());
                     }
                 }
+                if let Some(anchor) = &row.anchor { row.size = Some(anchor.size); }
                 rows.push(row);
             }
             let name_index = BucketIndex::build(&rows, Some(&selected));
             // Proven logical slices may share a physical lease. Ordinary path
             // arbitration would erase a blocked sibling when another succeeds.
             for validation in resolve_candidate_validations(&mut rows, &name_index, Some(&cache), None) {
+                if matches!(validation.status, ProposalStatus::Reject | ProposalStatus::Unsupported) {
+                    continue;
+                }
                 let has_head = validation.proposal.volumes.iter().any(|(_, slot)| *slot == 1);
                 let selected = validation.proposal.volumes.iter()
                     .filter(|(_, slot)| *slot == 1 || !has_head && *slot == 0)
@@ -618,7 +755,9 @@ fn resolve_shared_carrier_volumes(
                         validation.facts.anchors.get(&key).is_some_and(|head|
                             by_path.get(&key).is_some_and(|anchors| anchors.iter().any(|anchor|
                                 anchor.format == validation.proposal.format
-                                    && anchor.structure_offset == head.structure_offset)))
+                                    && anchor.view == head.view && (anchor.structure_offset == head.structure_offset
+                                        || head.has_any(ZIP_DIRECTORY_MEMBER) && anchor.has_any(ZIP_LOCAL_HEADER)
+                                            && anchor.structure_offset >= head.structure_offset))))
                     });
                 if !selected {
                     continue;
@@ -627,9 +766,9 @@ fn resolve_shared_carrier_volumes(
                     let key = path_key(&part.0);
                     let anchor = validation.facts.anchors.get(&key);
                     (key, part.1, anchor.and_then(|a| a.structure_offset),
-                        anchor.and_then(|a| a.payload_end))
+                        anchor.and_then(|a| a.payload_end), anchor.and_then(|a| a.view.clone()))
                 }).collect();
-                if mappings.insert((validation.proposal.format, mapping)) {
+                if mappings.insert((validation.proposal.format, mapping, validation.attempts.as_ref().and_then(|p| p.directory_id.clone()))) {
                     proposals.push(validation);
                 }
             }
@@ -640,28 +779,62 @@ fn resolve_shared_carrier_volumes(
     // commits its selected extents; overlapping candidates do not erase heads.
     let mut covered = HashSet::new();
     let mut output = Vec::new();
+    let weak_zip = |a: &VolumeAnchor| a.view.is_some() && a.has_any(EMBEDDED_VOLUME)
+        && a.has_any(ZIP_LOCAL_HEADER) && !a.standalone;
+    let has_weak_zip = anchors.iter().any(|a| weak_zip(a));
+    let mut zip_disks = HashMap::<String, HashSet<_>>::new();
     for validation in proposals {
-        covered.extend(validation.proposal.volumes.iter().filter_map(|part| {
-            validation
-                .facts
-                .anchors
-                .get(&path_key(&part.0))
-                .map(|a| (path_key(&a.path), a.structure_offset))
-        }));
+        let zip = has_weak_zip && validation.proposal.format == "zip";
+        for (path, number) in &validation.proposal.volumes {
+            let key = path_key(path);
+            if let Some(a) = validation.facts.anchors.get(&key) {
+                if zip && validation.attempts.is_none() && (*number == 1 || a.has_any(TERMINAL)) {
+                    zip_disks.entry(key.clone()).or_default().insert((a.view.clone(), a.structure_offset.unwrap_or(0), a.extent_end()));
+                }
+                covered.insert((key, a.structure_offset, a.view.clone()));
+            }
+        }
         if let Some(plan) = &validation.attempts {
-            covered.extend(
-                plan.sources
-                    .iter()
-                    .map(|source| (path_key(&source.path), Some(source.start))),
-            );
+            covered.extend(plan.excluded_heads.iter().map(|a| (path_key(&a.path), a.structure_offset, a.view.clone())));
+            let entry = validation.proposal.entry_path();
+            for source in &plan.sources {
+                let key = path_key(&source.path);
+                if zip && (source.terminal || source.path == entry) {
+                    zip_disks.entry(key.clone()).or_default().insert((source.view.clone(), source.start, source.end));
+                }
+                covered.insert((key, Some(source.start), source.view.clone()));
+            }
         }
         output.push(NativeRelationGroup::Proposal(Box::new(validation)));
     }
+    let plain_paths: HashSet<_> = if has_weak_zip {
+        by_path.into_iter().filter(|(_, options)| options.iter().any(|a| a.view.is_none())).map(|(key, _)| key).collect()
+    } else { HashSet::new() };
     for mut anchor in anchors {
-        if covered.contains(&(path_key(&anchor.path), anchor.structure_offset)) {
+        let key = path_key(&anchor.path);
+        if covered.contains(&(key.clone(), anchor.structure_offset, anchor.view.clone())) {
             continue;
         }
-        let Some(number) = anchor.internal_volume_number.filter(|_| anchor.is_volume_entry()) else {
+        // A validated local record with no directory is also an admitted
+        // incomplete ZIP. Keep its unknown slot out of numbered assignments.
+        let local = weak_zip(&anchor) && anchor.structure_offset.is_some_and(|start| {
+                // A recognized ZIP disk can contain a later local member. Its
+                // missing marker must refer to the same physical header bytes.
+                if let Some(disks) = zip_disks.get(&key) {
+                    let end = start.saturating_add(30);
+                    let header = crate::io::archive_state::PhysicalRanges::new(anchor.view.as_deref(), start, Some(end));
+                    if disks.iter().any(|(v, lo, hi)| *lo <= start && end <= *hi
+                        && crate::io::archive_state::PhysicalRanges::new(v.as_deref(), start, Some(end)) == header) {
+                        return false;
+                    }
+                }
+                // Plain discovery already owns a local record whose entire
+                // remaining slice is an unchanged prefix of that plain input.
+                !anchor.view.as_ref().is_some_and(|v| v.unchanged(start, anchor.carrier_limit.unwrap_or(v.len()))
+                    && plain_paths.contains(&key))
+            });
+        let Some(number) = anchor.internal_volume_number.filter(|_| anchor.is_volume_entry())
+            .or_else(|| local.then_some(0)) else {
             continue;
         };
         let needs_password = anchor.needs_password || anchor.wrong_password;
@@ -853,7 +1026,7 @@ fn build_candidate_groups(
 fn anchor_is_relation_archive(anchor: &VolumeAnchor) -> bool {
     let offset = anchor.structure_offset.unwrap_or(0);
     let proven_sfx = offset > 0 && anchor.sfx && anchor.pe_state == PeState::Confirmed;
-    if !matches!(anchor.format, "rar" | "7z" | "zip")
+    if !crate::formats::supports_volume_relations(anchor.format)
         || !anchor.strong
         || !(anchor.standalone || anchor.needs_password || proven_sfx)
     {
@@ -862,13 +1035,10 @@ fn anchor_is_relation_archive(anchor: &VolumeAnchor) -> bool {
     offset == 0 || proven_sfx
 }
 
-fn promote_sfx_archive_anchor(
-    row: &RelationInput,
+pub(crate) fn promote_sfx_archive_anchor(
+    facts: &VolumeAnchor,
     reader: &crate::io::reader::ManagedReader,
 ) -> Option<VolumeAnchor> {
-    let Some(facts) = row.anchor.as_deref() else {
-        return None;
-    };
     if facts.pe_state != PeState::Confirmed {
         return None;
     }
@@ -881,7 +1051,7 @@ fn promote_sfx_archive_anchor(
     let overlay = inspect_pe_overlay_reader(reader, facts.size, image_end);
     if overlay
         .as_ref()
-        .is_some_and(|archive| !matches!(archive.format, "rar" | "7z" | "zip"))
+        .is_some_and(|archive| !crate::formats::supports_volume_relations(archive.format))
     {
         return None;
     }
@@ -918,11 +1088,12 @@ fn promote_sfx_archive_anchor(
     let archive_offset = overlay.offset;
 
     let mut anchor =
-        probe_volume_anchor_reader_at_offset(reader, &row.path, archive_offset, format)
+        probe_volume_anchor_reader_at_offset(reader, &facts.path, archive_offset, format)
             .ok()?;
     if anchor.format != format || !anchor.strong {
         return None;
     }
+    anchor.view.clone_from(&facts.view);
     anchor.pe_state = PeState::Confirmed;
     anchor.pe_image_end = Some(image_end);
     anchor.sfx = true;
@@ -993,10 +1164,15 @@ fn project_proposal(
     } else {
         OpenMode::NativeVolumes
     };
-    input.volume_attempts = validation
-        .attempts
-        .as_ref()
-        .map(|attempts| Arc::new(attempts.project(proposal, &style)));
+    input.analysis.zip_directory_id = validation.attempts.as_ref().and_then(|p| p.directory_id.clone());
+    let mut missing_disks = false;
+    input.volume_attempts = validation.attempts.as_ref().and_then(|attempts| {
+        let mut plan = attempts.project(proposal, &style);
+        if input.analysis.zip_spanned {
+            missing_disks = plan.prune_missing_zip_layouts();
+        }
+        (!plan.layouts.is_empty()).then(|| Arc::new(plan))
+    });
     // Keep the fixed composition for the Rust password probe. Ordered attempts
     // replace it in the worker request and are materialized only on success.
     input.parts = proposal
@@ -1009,11 +1185,12 @@ fn project_proposal(
             InputPart {
                 role: if *number == 0 { InputRole::Main } else if terminal { InputRole::Terminal } else if *number == 1 { InputRole::First } else { InputRole::Member },
                 extent: InputExtent {
+                    view: anchor.and_then(|a| a.view.clone()),
                     path: path.clone(),
                     start: anchor.and_then(|a| a.structure_offset).unwrap_or(0),
                     end: anchor.and_then(|a| {
                         let end = a.extent_end();
-                        (end < a.size).then_some(end)
+                        (end < a.size || a.view.is_some() || a.has_any(crate::analysis_native::volume_anchor::BOUNDED_SOURCE)).then_some(end)
                     }),
                 },
                 volume_number: (*number > 0).then_some(*number),
@@ -1046,12 +1223,14 @@ fn project_proposal(
             logical_start = logical_start.saturating_add(anchor.payload_size());
         }
     }
-    let incomplete = validation.status == ProposalStatus::Inconclusive
+    let incomplete = missing_disks || validation.status == ProposalStatus::Inconclusive
         || anchors
             .values()
             .any(|anchor| anchor.has_any(UNRESOLVED_VOLUME));
     input.analysis.volume_completeness = Some(
-        if input.volume_attempts.is_some() || validation.status == ProposalStatus::NeedsPassword {
+        if missing_disks {
+            VolumeCompleteness::Missing
+        } else if input.volume_attempts.is_some() || validation.status == ProposalStatus::NeedsPassword {
             VolumeCompleteness::Unknown
         } else if incomplete {
             VolumeCompleteness::Missing
@@ -1060,6 +1239,7 @@ fn project_proposal(
         },
     );
     let reason = match validation.status {
+        _ if missing_disks => Some("missing_volume"),
         ProposalStatus::Valid => None,
         ProposalStatus::NeedsPassword => Some(if anchors.values().any(|a| a.wrong_password) {
             "wrong_password"
@@ -1127,17 +1307,6 @@ fn canonical_volume_name(
         "zip_spanned" => format!("{base}.z{number:02}"),
         _ => format!("{base}.{number:03}"),
     }
-}
-
-fn proposal_logical_size(
-    proposal: &RelationProposal,
-    anchors: &HashMap<String, Arc<VolumeAnchor>>,
-) -> Option<u64> {
-    proposal.volumes.iter().try_fold(0u64, |total, (path, _)| {
-        anchors
-            .get(&path_key(path))
-            .map(|anchor| total.saturating_add(anchor.payload_size()))
-    })
 }
 
 /// Split family used for canonical volume names.  RAR volume names are
@@ -1632,12 +1801,8 @@ fn clean_logical_name(value: &str) -> String {
     let basename_start = name.len() - basename(name).len();
     while let Some((stem, suffix)) = name[basename_start..].rsplit_once('.') {
         if stem.is_empty()
-            || ![
-                "7z", "rar", "zip", "zipx", "tar", "gz", "gzip", "bz2", "bzip2", "xz", "zst",
-                "zstd", "lz4", "tgz", "tbz", "tbz2", "txz", "exe", "enc",
-            ]
-            .iter()
-            .any(|ext| suffix.eq_ignore_ascii_case(ext))
+            || !(crate::formats::StreamFormat::known_suffix(suffix)
+                || ["7z", "rar", "zip", "zipx", "exe"].iter().any(|ext| suffix.eq_ignore_ascii_case(ext)))
         {
             break;
         }

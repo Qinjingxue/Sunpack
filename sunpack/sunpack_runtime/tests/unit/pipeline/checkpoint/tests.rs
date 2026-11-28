@@ -127,10 +127,14 @@ fn partial_retry_requires_fixed_mapping_and_facts_but_complete_admits_alternativ
     input.mode = OpenMode::NativeVolumes;
     input.parts = vec![InputPart {
         role: crate::io::archive_state::InputRole::First,
-        extent: InputExtent { path: input.entry_path.clone(), start: 0, end: Some(7) },
+        extent: InputExtent { view: None, path: input.entry_path.clone(), start: 0, end: Some(7) },
         volume_number: Some(1),
         canonical_name: "archive.7z.001".into(),
     }].into_boxed_slice();
+    input.parts[0].extent.view = Some(Arc::new(crate::io::view::ReadView {
+        method: crate::io::view::ViewMethod::Apate, depth: 1, physical_size: 7,
+        spans: vec![crate::io::view::Span { start: 0, end: 7, reverse: true }],
+    }));
     let key = path_key(&input.entry_path);
     let mut generations = HashMap::from([
         (key.clone(), capture_file_generation(&source).unwrap()),
@@ -157,6 +161,19 @@ fn partial_retry_requires_fixed_mapping_and_facts_but_complete_admits_alternativ
         &serde_json::to_vec(&partial).unwrap(),
     ).unwrap();
     assert!(partial.valid_for(&input, &generations));
+    // An ordinary growing input keeps its key. Coexisting validated siblings
+    // with the same head must each recover their own output after restart.
+    let mut sibling = input.clone();
+    sibling.parts[0].extent.end = Some(5);
+    assert_eq!(CheckpointKey::for_input(&sibling).0, CheckpointKey::for_input(&input).0);
+    sibling.analysis.distinguish_end = true;
+    let saved = serde_json::to_vec(&sibling).unwrap();
+    sibling.parts[0].extent.end = Some(6);
+    assert_ne!(CheckpointKey::for_input(&sibling).0, CheckpointKey::for_input(&serde_json::from_slice(&saved).unwrap()).0);
+    let mut plain = input.clone();
+    plain.parts[0].extent.view = None;
+    assert!(!partial.valid_for(&plain, &generations));
+    assert!(!complete.valid_for(&plain, &generations));
     let mut interrupted = serde_json::to_value(&partial).unwrap();
     interrupted["failure"]["failure"] = serde_json::json!({
         "kind":"process_error", "message":"worker exited", "evidence":{"native_kind":"worker_lost"}
@@ -180,6 +197,7 @@ fn partial_retry_requires_fixed_mapping_and_facts_but_complete_admits_alternativ
     let alternative_path = source.with_extension("alternative");
     alternatives.volume_attempts = Some(Arc::new(VolumeAttemptPlan {
         sources: vec![input.parts[0].extent.clone(), InputExtent {
+            view: None,
             path: alternative_path.to_string_lossy().into_owned(),
             start: 0, end: Some(7),
         }].into_boxed_slice(),

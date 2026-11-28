@@ -920,6 +920,7 @@ pub(super) static MESSAGES: &[(&str, [&str; Language::ALL.len()])] = &[
         "検出方法：{source}",
         "검색 방법: {source}",
     ]),
+    ("cli.scan.views", ["Read views: {views}", "读取视图：{views}", "讀取視圖：{views}", "読み取りビュー：{views}", "읽기 뷰: {views}"]),
     ("cli.scan.volume_candidates", [
         "Volume candidates ({positions}): {candidates}",
         "第 {positions} 卷候选：{candidates}",

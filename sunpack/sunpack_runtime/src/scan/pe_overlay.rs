@@ -13,17 +13,7 @@ const SECTION_HEADER_SIZE: usize = 40;
 const MAX_PE_SECTIONS: usize = 96;
 const IMAGE_FILE_EXECUTABLE_IMAGE: u16 = 0x0002;
 
-const ARCHIVE_MAGICS: [(&[u8], &str); 9] = [
-    (b"7z\xbc\xaf\x27\x1c", "7z"),
-    (b"Rar!\x1a\x07\x01\x00", "rar"),
-    (b"Rar!\x1a\x07\x00", "rar"),
-    (b"PK\x03\x04", "zip"),
-    (b"\x1f\x8b\x08", "gzip"),
-    (b"BZh", "bzip2"),
-    (b"\xfd7zXZ\x00", "xz"),
-    (b"\x28\xb5\x2f\xfd", "zstd"),
-    (crate::formats::lz4::MAGIC, "lz4"),
-];
+use crate::formats::signatures::{LZ4_SKIP_SUFFIX, OVERLAY_MAGICS as ARCHIVE_MAGICS};
 
 /// PE structure facts only; SFX classification belongs to Relations.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -218,7 +208,7 @@ fn find_archive_magic(sample: &[u8]) -> Option<(&'static str, usize)> {
             best = Some((*archive_format, index));
         }
     }
-    if let Some(offset) = memchr::memmem::find_iter(sample, b"\x2a\x4d\x18")
+    if let Some(offset) = memchr::memmem::find_iter(sample, LZ4_SKIP_SUFFIX)
         .filter_map(|offset| offset.checked_sub(1))
         .find(|offset| (0x50..=0x5f).contains(&sample[*offset]))
     {

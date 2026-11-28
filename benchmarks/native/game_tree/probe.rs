@@ -24,7 +24,7 @@ fn scan() -> Result<(), Box<dyn std::error::Error>> {
 
     let before = process_memory()?;
     let start = Instant::now();
-    let options = scan_options(&request.config)?;
+    let options = scan_options(&request.config, request.deep)?;
     let candidates = CandidateSet::new(Arc::from([]), None, &RecentPasswords::default(), None);
     let mut file_count = 0;
     let mut file_bytes = 0;

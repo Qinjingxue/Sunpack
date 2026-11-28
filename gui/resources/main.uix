@@ -113,9 +113,9 @@ export default {
       add(f.label,'field-title-'+f.id);add(f.description,'field-description-'+f.id);add(f.categoryLabel);
       f.options.forEach((o,i)=>add(o.label,i===d.choice?'select-'+f.id:''));
       if(this.isRuleList(f)) {
-        add(t.regexMode,'tag-regex-label-'+f.id);
+        if(f.editor==='rule_list') add(t.regexMode,'tag-regex-label-'+f.id);
         add(this.tagInputs[f.id],'tag-input-'+f.id);
-        this.tagValues(f).forEach((v,j)=>add(this.entryLabel(v.value),'tags-'+f.id,j));
+        this.tagValues(f).forEach((v,j)=>add(this.entryLabel(typeof v==='string'?v:v.value),'tags-'+f.id,j));
       } else if(f.editor==='text') add(d.text,'input-'+f.id);
       else if(f.editor==='recursive'&&d.choice===2) add(d.text,'rounds-'+f.id);
       else if(f.editor==='readonly') add(t.readOnly,'readonly-label-'+f.id);
@@ -741,7 +741,7 @@ export default {
     },
     isDirectoryValue(value) { return typeof value==='string'&&/^(?:[a-zA-Z]:[\\/]|[\\/]{2}|\.{1,2}(?:[\\/]|$)|~[\\/])/.test(value); },
     entryLabel(value) { return value.split(String.fromCharCode(13)).join('␍').split(String.fromCharCode(10)).join('↵'); },
-    isRuleList(f) { return f.editor==='rule_list'; },
+    isRuleList(f) { return f.editor==='rule_list'||f.editor==='view_list'; },
     tagValues(f) { f=this.configField(f.id)||f; return this.drafts[f.id]?JSON.parse(this.drafts[f.id].text):f.items; },
     changeTagInput(f,value) { this.tagInputs=Object.assign({},this.tagInputs,{[f.id]:value}); if(this.configQuery) this.send('refreshSearch'); },
     saveTags(f,values) {
@@ -755,7 +755,7 @@ export default {
       delete edits[f.id]; delete inputs[f.id]; delete modes[f.id];
       this.tagEdits=edits; this.tagInputs=inputs; this.tagModes=modes;
     },
-    tagMatches(item,p) { return item.value===p.value&&item.regex===p.regex; },
+    tagMatches(item,p) { return typeof item==='string'?item===p.value:item.value===p.value&&item.regex===p.regex; },
     editTag(p) {
       let f=this.configField(p.id); if(!f||!this.isRuleList(f)) return;
       let values=this.tagValues(f); if(p.index<0||p.index>=values.length||!this.tagMatches(values[p.index],p)) return;
@@ -767,6 +767,14 @@ export default {
       let value=this.tagInputs[f.id]||''; if(!value.length) return;
       let values=this.tagValues(f).slice(),edit=this.tagEdits[f.id];
       let entry={value:value,regex:!!this.tagModes[f.id]};
+      if(f.editor==='view_list') {
+        value=value.trim().toLowerCase();
+        let colon=value.indexOf(':'),method=value.slice(0,colon),depth=value.slice(colon+1);
+        if(value!=='plain'&&(colon<0||!f.viewMethods.includes(method)||!/^\+?[0-9]+$/.test(depth)||Number(depth)<1||Number(depth)>4294967295)) { this.setSaveError(f.id,'validation'); return; }
+        if(value!=='plain') value=method+':'+String(Number(depth));
+        if(values.some((v,i)=>v===value&&(!edit||i!==edit.index))) { this.cancelTagEdit(f); return; }
+        entry=value;
+      }
       if(edit) {
         if(edit.index>=values.length||!this.tagMatches(values[edit.index],edit)) { this.setSaveError(f.id,'settingChanged'); return; }
         values[edit.index]=entry;

@@ -90,7 +90,10 @@ namespace sunpack::sevenzip
 
     inline constexpr Int32 kOpWrongPassword = NArchive::NExtract::NOperationResult::kWrongPassword;
 
-    GUID format_guid(unsigned char format_id);
+    constexpr GUID format_guid(unsigned char format_id) noexcept
+    {
+        return {0x23170F69, 0x40C1, 0x278A, {0x10, 0x00, 0x00, 0x01, 0x10, format_id, 0x00, 0x00}};
+    }
 
     std::wstring win32_extended_path(const std::wstring &path);
 

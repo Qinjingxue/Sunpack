@@ -21,12 +21,14 @@ impl StreamHash {
         path: &Path,
         offset: u64,
         len: u64,
+        reversed: bool,
         validate_generation: impl FnOnce(&PhysicalFileGeneration) -> io::Result<()>,
     ) -> io::Result<()> {
         crate::io::iocp::read_range_ordered(
             path,
             offset,
             len,
+            reversed,
             validate_generation,
             |bytes| {
                 #[cfg(test)]

@@ -10,6 +10,10 @@ use crate::io::archive_state::{
 use std::collections::BTreeMap;
 use std::hash::{BuildHasher, Hash, Hasher};
 
+#[cfg(test)]
+#[path = "../../tests/unit/relations/attempt_views.rs"]
+mod view_tests;
+
 #[derive(Debug)]
 pub(super) struct VolumeAttempts {
     pub sources: Vec<AttemptSource>,
@@ -17,6 +21,10 @@ pub(super) struct VolumeAttempts {
     // variants append ranges for those same paths without adding group members.
     base_source_count: usize,
     pub layouts: Vec<AttemptLayout>,
+    // Co-located ZIP heads matched by the same directory but eliminated by
+    // slot geometry. Discovery uses this proof to retire old missing plans.
+    pub excluded_heads: Box<[Arc<VolumeAnchor>]>,
+    pub directory_id: Option<Arc<str>>,
     pub head_size_from_total: Option<u64>,
     pub minimum_size: Option<u64>,
     pub tail_totals: Vec<(usize, u64)>,
@@ -70,11 +78,66 @@ impl VolumeAttempts {
         &self.sources[..self.base_source_count]
     }
 
+    // Several terminal directories can validate the same logical head. Retain
+    // each directory's layouts as alternatives of one input, so a damaged
+    // earlier tail cannot retire a later one. Domains stay local to a layout.
+    pub(super) fn join_zip_directories(plans: Vec<Self>) -> Self {
+        let totals: Vec<HashMap<_, _>> = plans.iter().map(|p| p.tail_totals.iter().copied().collect()).collect();
+        let mut sources = Vec::new();
+        let mut indexes = HashMap::new();
+        let mut tail_totals = Vec::new();
+        let mut intern = |p: usize, i: usize| {
+            let s = &plans[p].sources[i];
+            let total = totals[p].get(&i).copied();
+            *indexes.entry((s.key_with_end(s.end), total)).or_insert_with(|| {
+                let index = sources.len();
+                sources.push(s.clone());
+                if let Some(total) = total { tail_totals.push((index, total)); }
+                index
+            })
+        };
+        let mut base = HashSet::new();
+        for (p, plan) in plans.iter().enumerate() {
+            for (i, s) in plan.base_sources().iter().enumerate() {
+                if base.insert(&s.path) { intern(p, i); }
+            }
+        }
+        let mut domains = Domains::default();
+        let mut layouts = Layouts::default();
+        for (p, plan) in plans.iter().enumerate() {
+            let remap: Vec<_> = (0..plan.sources.len()).map(|i| intern(p, i)).collect();
+            let mut mapped = HashMap::new();
+            for layout in &plan.layouts {
+                let slots = layout.slots.iter().map(|(n, choices)| {
+                    let domain = mapped.entry(Arc::as_ptr(choices)).or_insert_with(|| {
+                        let mut indexes: Vec<_> = choices.iter().map(|&i| remap[i]).collect();
+                        if indexes.len() > 1 {
+                            let mut seen = HashSet::new();
+                            indexes.retain(|&i| seen.insert(i));
+                        }
+                        domains.intern(indexes)
+                    });
+                    (*n, Arc::clone(domain))
+                }).collect();
+                layouts.push(slots, layout.minimum_slots);
+            }
+        }
+        Self { directory_id: plans[0].directory_id.clone(), sources, base_source_count: base.len(), layouts: layouts.rows, tail_totals,
+            minimum_size: plans.iter().map(|p| p.minimum_size).min().flatten(),
+            head_size_from_total: plans[0].head_size_from_total,
+            excluded_heads: plans.into_iter().flat_map(|p| p.excluded_heads.into_vec()).collect() }
+    }
+
     // PKZIP disk offsets are relative to each disk, not to the concatenated
     // archive. Reuse the unique mapping's geometry and represent each possible
     // common disk size with ordinary range/domain layouts (no second protocol).
     fn with_spanned_carrier(mut self, head: &VolumeAnchor) -> Self {
-        if !head.has_unresolved_carrier_extent() {
+        let fixed_head_size = (!head.has_unresolved_carrier_extent()).then(|| head.payload_size());
+        let distinct_base_paths = self.base_source_count == self.sources.len();
+        if fixed_head_size.is_some() && (distinct_base_paths || !self.layouts.iter().any(|layout| {
+            let slots = &layout.slots;
+            slots.len() > 2 && slots[1..slots.len() - 1].iter().any(|(_, choices)| choices.len() > 1)
+        })) {
             return self;
         }
         let original = std::mem::take(&mut self.layouts);
@@ -92,7 +155,6 @@ impl VolumeAttempts {
         let mut sources_by_extent = None;
         let mut variants = Vec::new();
         let mut disk_domains = HashMap::new();
-        let distinct_base_paths = self.base_source_count == self.sources.len();
         for AttemptLayout { slots: layout, minimum_slots } in original {
             let mut interiors = HashMap::new();
             let mut sizes = None::<HashSet<u64>>;
@@ -104,7 +166,7 @@ impl VolumeAttempts {
                 };
                 let interior = !choices.iter().any(|i| self.sources[*i].terminal);
                 entry.insert(interior);
-                if !interior {
+                if !interior || fixed_head_size.is_some() {
                     continue;
                 }
                 let available: HashSet<_> = choices
@@ -120,21 +182,17 @@ impl VolumeAttempts {
                     sizes = Some(available);
                 }
             }
-            let from_tail = sizes.is_none();
-            let mut sizes: Vec<_> = sizes
-                .unwrap_or_else(|| {
-                    layout
-                        .last()
-                        .into_iter()
-                        .flat_map(|(_, choices)| choices.iter())
-                        .filter_map(|i| self.sources[*i].head_size)
-                        .collect()
-                })
-                .into_iter()
-                .collect();
+            let from_tail = sizes.is_none() && fixed_head_size.is_none();
+            let mut sizes: Vec<_> = match (fixed_head_size, sizes) {
+                (Some(size), _) => vec![size],
+                (_, Some(common)) => common.into_iter().collect(),
+                _ => layout.last().into_iter().flat_map(|(_, choices)| choices.iter())
+                    .filter_map(|i| self.sources[*i].head_size).collect(),
+            };
             sizes.sort_unstable();
+            sizes.dedup();
             for size in sizes {
-                let Some(end) = validate::spanned_carrier_end(head, std::iter::once(size)) else {
+                let Some(end) = head.structure_offset.unwrap_or(0).checked_add(size).filter(|_| size > 0) else {
                     continue;
                 };
                 let mut trimmed = Vec::with_capacity(layout.len());
@@ -143,6 +201,11 @@ impl VolumeAttempts {
                         let mut replacements = Vec::new();
                         for &i in choices.iter() {
                             let source = &self.sources[i];
+                            // A known head can rank equal-sized disks without changing its range.
+                            if fixed_head_size.is_some() {
+                                if source.end - source.start == size { replacements.push(i); }
+                                continue;
+                            }
                             if end > source.end {
                                 continue;
                             }
@@ -185,7 +248,7 @@ impl VolumeAttempts {
                                     } else {
                                         source.head_size
                                     };
-                                    if let Some(size) = size {
+                                    if let Some(size) = size.filter(|n| fixed_head_size.is_none_or(|head| head == *n)) {
                                         by_size.entry(size).or_default().push(i);
                                     }
                                 }
@@ -241,6 +304,7 @@ impl Domains {
 
 #[derive(Debug, Clone)]
 pub(super) struct AttemptSource {
+    pub view: Option<Arc<crate::io::view::ReadView>>,
     pub path: String,
     pub start: u64,
     pub end: u64,
@@ -249,12 +313,13 @@ pub(super) struct AttemptSource {
     pub head_size: Option<u64>,
 }
 impl AttemptSource {
-    fn key_with_end(&self, end: u64) -> (&str, u64, u64, Option<u64>, bool, Option<u64>) {
-        (&self.path, self.start, end, self.proven_end, self.terminal, self.head_size)
+    fn key_with_end(&self, end: u64) -> (Option<&crate::io::view::ReadView>, &str, u64, u64, Option<u64>, bool, Option<u64>) {
+        (self.view.as_deref(), &self.path, self.start, end, self.proven_end, self.terminal, self.head_size)
     }
 
     fn new(path: &str, anchor: &VolumeAnchor) -> Self {
         Self {
+            view: anchor.view.clone(),
             path: path.into(),
             start: anchor.structure_offset.unwrap_or(0),
             end: anchor
@@ -286,6 +351,148 @@ fn head_geometry(head: &VolumeAnchor, format: &str) -> (Option<u64>, Option<u64>
     (minimum.filter(|_| trim), minimum, trim)
 }
 
+fn group_head_views(view: &BucketView<'_>, heads: &mut Vec<(usize, usize)>, raw_zip: bool) -> HashMap<usize, Vec<usize>> {
+    // Group only heads at the same logical position with compatible structure.
+    let mut equivalent = HashMap::new();
+    let mut aliases = HashMap::<usize, Vec<usize>>::new();
+    if heads.len() > 1 {
+        let mut repeated = HashSet::new();
+        let mut paths = HashSet::new();
+        let mut rar_ends = HashMap::new();
+        let mut zip_markers = HashSet::new();
+        for &(i, _) in heads.iter() {
+            let a = view.rows[i].anchor.as_ref().unwrap();
+            if a.format == "rar" {
+                if let Some(end) = a.proven_extent_end() {
+                    rar_ends.entry((&view.rows[i].path_key, a.structure_offset)).and_modify(|value| {
+                        if *value != Some(end) { *value = None; }
+                    }).or_insert(Some(end));
+                }
+            }
+            if a.has_any(ZIP_SPLIT_START) {
+                zip_markers.insert((&view.rows[i].path_key, a.structure_offset));
+            }
+            if !paths.insert(&view.rows[i].path_key) { repeated.insert(&view.rows[i].path_key); }
+        }
+        heads.retain(|&(i, _)| {
+            let a = view.rows[i].anchor.as_ref().unwrap();
+            if !repeated.contains(&view.rows[i].path_key) || (a.has_unresolved_carrier_extent() && a.format == "rar") {
+                return true;
+            }
+            let mut rar_prefix = None;
+            let mut zip_local = None;
+            if a.format == "rar" {
+                // In a header-preserving mask, RAR can accept both the exact
+                // disk and one with trailing disguise bytes. Compare only the
+                // prefix; the rest must map to identical physical positions.
+                let start = a.structure_offset.unwrap_or(0);
+                let end = a.proven_extent_end().or_else(|| rar_ends
+                    .get(&(&view.rows[i].path_key, a.structure_offset)).copied().flatten()).unwrap_or(a.size);
+                if end <= start || end > a.size { return true; }
+                let prefix_end = start.saturating_add(512).min(end);
+                let Ok(bytes) = a.open().and_then(|r| r.read_direct_at(start, (prefix_end - start) as usize)) else { return true };
+                let suffix = crate::io::archive_state::PhysicalRanges::new(a.view.as_deref(), prefix_end, Some(end));
+                rar_prefix = Some((bytes, suffix));
+            } else if zip_markers.contains(&(&view.rows[i].path_key, a.structure_offset)) {
+                // The split signature proves the role, the first local record
+                // separates different ZIP families at this disk coordinate.
+                let Some(at) = a.structure_offset.unwrap_or(0).checked_add(4) else { return true };
+                let Ok(Some(key)) = crate::formats::zip::relation_local_key(&a.path, a.view.as_ref(), at) else { return true };
+                zip_local = Some(key);
+            } else if a.proven_extent_end().is_some() || !(raw_zip
+                || a.has_any(ZIP_DIRECTORY_MEMBER) || a.seven_zip_next_header.is_some()) {
+                return true;
+            }
+            let descriptor = a.seven_zip_next_header.as_ref().map(|h| (h.offset, h.size, h.crc));
+            let key = (&view.rows[i].path_key, a.structure_offset, a.has_unresolved_carrier_extent(), descriptor, rar_prefix, zip_local);
+            match equivalent.entry(key) {
+                std::collections::hash_map::Entry::Vacant(entry) => { entry.insert(i); true }
+                std::collections::hash_map::Entry::Occupied(entry) => {
+                    aliases.entry(*entry.get()).or_default().push(i);
+                    false
+                }
+            }
+        });
+    }
+    aliases
+}
+
+// The directory fixes the bytes preceding its disk. Even the shortest
+// distinct raw chunks must fit within that prefix.
+fn raw_zip_disk_bound<'a>(view: &BucketView<'_>, indexes: &[usize], heads: impl Iterator<Item = &'a usize>) -> Option<u32> {
+    let before = indexes.iter().filter_map(|i| {
+        let a = view.rows[*i].anchor.as_ref()?;
+        if !a.has_any(TERMINAL) { return None; }
+        zip_total(a)?.checked_sub(a.payload_size())
+    }).max()?;
+    let head_min = heads.map(|i| {
+        let a = view.rows[*i].anchor.as_ref().unwrap();
+        if a.has_unresolved_carrier_extent() { 1 } else { a.payload_size() }
+    }).min()?;
+    let mut available = before.saturating_sub(head_min);
+    let mut unique = HashMap::new();
+    for &i in indexes {
+        let Some(a) = &view.rows[i].anchor else { continue };
+        if view.facts[&i].exact_slot != Some(1) && !a.has_any(TERMINAL) {
+            let size = unique.entry((&view.rows[i].path_key, a.view.as_deref())).or_insert(a.size);
+            *size = (*size).min(a.size);
+        }
+    }
+    let mut lengths: Vec<_> = unique.into_values().collect();
+    lengths.sort_unstable();
+    let count = lengths.iter().take_while(|&&size| {
+        if size > available { return false; }
+        available -= size;
+        true
+    }).count();
+    u32::try_from(count).ok()?.checked_add(2)
+}
+
+// The directory fixes the prefix sum. Propagate this constraint into each
+// slot before password analysis can expand its possible logical offsets.
+fn prune_raw_zip_lengths(
+    view: &BucketView<'_>, slots: &mut BTreeMap<u32, Arc<Vec<usize>>>, domains: &mut Domains,
+) -> bool {
+    let last = *slots.last_key_value().unwrap().0;
+    let lengths = |number, index: usize| -> Option<(i128, i128)> {
+        let a = view.rows[index].anchor.as_ref()?;
+        if number == last {
+            let preceding = i128::from(zip_total(a)?.checked_sub(a.payload_size())?);
+            return Some((-preceding, -preceding));
+        }
+        let bytes = if number == 1 { a.size.checked_sub(a.structure_offset.unwrap_or(0))? } else { a.size };
+        Some((if number == 1 && a.has_unresolved_carrier_extent() { 1 } else { bytes.into() }, bytes.into()))
+    };
+    let mut bounds = HashMap::new();
+    let mut total = (0i128, 0i128);
+    for (&number, choices) in slots.iter() {
+        let key = (Arc::as_ptr(choices), number == 1, number == last);
+        let (lo, hi) = *bounds.entry(key).or_insert_with(|| {
+            choices.iter().filter_map(|&i| lengths(number, i)).fold(
+                (i128::MAX, i128::MIN), |(lo, hi), (a, b)| (lo.min(a), hi.max(b)))
+        });
+        if lo > hi { return false; }
+        total.0 += lo;
+        total.1 += hi;
+    }
+    if total.0 > 0 || total.1 < 0 { return false; }
+    let mut pruned = HashMap::new();
+    for (&number, choices) in slots.iter_mut() {
+        let key = (Arc::as_ptr(choices), number == 1, number == last);
+        let filtered = pruned.entry(key).or_insert_with(|| {
+            let (lo, hi) = bounds[&key];
+            let allowed = |i| lengths(number, i).is_some_and(|(a,b)| {
+                total.0 - lo + a <= 0 && total.1 - hi + b >= 0
+            });
+            if choices.iter().all(|&i| allowed(i)) { Arc::clone(choices) }
+            else { domains.intern(choices.iter().copied().filter(|&i| allowed(i)).collect()) }
+        });
+        if filtered.is_empty() { return false; }
+        *choices = Arc::clone(filtered);
+    }
+    true
+}
+
 pub(super) fn build(
     view: &BucketView<'_>,
     logical: Option<&str>,
@@ -312,6 +519,7 @@ pub(super) fn build(
     let mut head_position = indexes.len();
     indexes.push(heads[0].0);
     let spanned = view.spanned();
+    let aliases = group_head_views(view, &mut heads, raw_zip_minimum.is_some());
     let mut output = Vec::new();
     let mut shared_facts = None;
     for (head, position) in heads {
@@ -322,6 +530,7 @@ pub(super) fn build(
         }
         head_position = position;
         indexes[position] = head;
+        let raw_upper = std::cell::OnceCell::new();
         let profile = NameProfile::new(indexes.iter().filter_map(|i| view.features.get(i)));
         let mut fixed = BTreeMap::<u32, Vec<usize>>::new();
         for &i in &indexes {
@@ -331,9 +540,8 @@ pub(super) fn build(
                 }
             }
         }
-        if !fixed.contains_key(&1) {
-            continue;
-        }
+        let Some(first_choices) = fixed.get_mut(&1) else { continue };
+        if let Some(views) = aliases.get(&head) { first_choices.extend_from_slice(views); }
         let structural = VolumeAssignment {
             slots: fixed.iter().map(|(&n, choices)| (n, choices[0])).collect(),
             unresolved: indexes
@@ -405,6 +613,11 @@ pub(super) fn build(
             )
             .ok()
             .and_then(|n| n.checked_add(1));
+            let upper = if unnamed_tail && raw_zip_minimum.is_some() {
+                let bound = raw_upper.get_or_init(|| raw_zip_disk_bound(view, &indexes,
+                    std::iter::once(&head).chain(aliases.get(&head).into_iter().flatten())));
+                upper.map(|n| bound.map_or(n, |bound| n.min(bound)))
+            } else { upper };
             // Unnumbered same-stem members may be unrelated. Their count bounds
             // the end; it never proves that all of them must be consumed.
             let variable = unnamed_tail
@@ -567,7 +780,7 @@ pub(super) fn build(
                                     .min()
                             }).unwrap_or(usize::MAX);
                             width(a).cmp(&width(b))
-                        }).then_with(|| view.rows[a].path_key.cmp(&view.rows[b].path_key))
+                        }).then_with(|| view.rows[a].path_key.cmp(&view.rows[b].path_key)).then_with(|| a.cmp(&b))
                     });
                     ordered.dedup();
                     let ordered = domains.intern(ordered);
@@ -583,6 +796,14 @@ pub(super) fn build(
                 } else {
                     0
                 };
+                // In a raw ZIP the directory offset fixes the bytes preceding
+                // its disk. Competing views can expose identical local records
+                // while adding bytes that no layout of the remaining disks fits.
+                if raw_zip_minimum.is_some() && minimum == 0 && contiguous
+                    && candidate_terminal == slots.last_key_value().map(|(&n, _)| n)
+                {
+                    if !prune_raw_zip_lengths(view, &mut slots, &mut domains) { continue; }
+                }
                 if channel.is_some()
                     && (view.format == "7z" || (view.format == "zip" && !spanned))
                     && !contiguous
@@ -708,9 +929,11 @@ pub(super) fn build(
                 std::cmp::Reverse(layout.len()),
             )
         });
-        let mut sources: Vec<usize> = domains
-            .0
-            .iter()
+        // Intermediate domains can lose all their layouts during geometry
+        // filtering. Publish only sources reachable from a surviving slot.
+        let mut live_domains = HashSet::new();
+        let mut sources: Vec<usize> = layouts.iter().flat_map(|layout| &layout.slots)
+            .filter_map(|(_, domain)| live_domains.insert(Arc::as_ptr(domain)).then_some(domain))
             .flat_map(|c| c.iter().copied())
             .collect::<HashSet<_>>()
             .into_iter()
@@ -730,23 +953,14 @@ pub(super) fn build(
             ..Default::default()
         };
         let facts = shared_facts.get_or_insert_with(|| proposal_facts(view, &[]));
-        // The physical facts map cannot represent two slices at one path.
-        // Its head entry must match this layout's fixed logical head; all peer
-        // slice geometry stays in the row-indexed source/domain plan below.
-        let mut facts = Arc::clone(facts);
         let head_anchor = view.rows[head].anchor.as_ref().unwrap();
-        if facts.anchors.get(&view.rows[head].path_key)
-            .is_none_or(|anchor| anchor.structure_offset != head_anchor.structure_offset)
-        {
-            Arc::make_mut(&mut facts).anchors.insert(view.rows[head].path_key.clone(), head_anchor.clone());
-        }
         let head_logical;
         let logical = if let Some(logical) = logical { logical } else {
             head_logical = super::filename::logical_name(view.rows[head].name(),
                 &view.features[&head], view.format);
             &head_logical
         };
-        let mut proposal = materialize(view, assignment, logical, None, Some(&facts)).unwrap();
+        let mut proposal = materialize(view, assignment, logical, None, Some(facts)).unwrap();
         // The head identity is confirmed; its volume composition remains a plan.
         // No speculative bytes are parsed again here.
         proposal.status = ProposalStatus::Valid;
@@ -765,7 +979,9 @@ pub(super) fn build(
         };
         let mut remapped = HashMap::new();
         proposal.attempts = Some(VolumeAttempts {
+            directory_id: None,
             head_size_from_total,
+            excluded_heads: Box::default(),
             tail_totals,
             minimum_size: raw_zip_minimum.or(minimum_size),
             base_source_count,
@@ -775,12 +991,12 @@ pub(super) fn build(
                     let anchor = view.rows[*i].anchor.as_ref().unwrap();
                     let mut source = AttemptSource::new(&view.rows[*i].path, anchor);
                     if raw_zip_minimum.is_some() {
-                        if *i == head && trim_head {
+                        if view.facts[i].exact_slot == Some(1) && trim_head {
                             // A nested ZIP may begin inside the first chunk.
                             // The selected tail and continuations give the
                             // outer head's end, up to the physical file limit.
                             source.end = anchor.size;
-                        } else if *i != head && !source.terminal {
+                        } else if view.facts[i].exact_slot != Some(1) && !source.terminal {
                             // A member header inside a raw continuation does
                             // not change the start of that volume.
                             source.start = 0;
@@ -816,6 +1032,34 @@ pub(super) fn build(
 impl VolumeAttempts {
     pub(super) fn project(&self, proposal: &RelationProposal, style: &str) -> VolumeAttemptPlan {
         let zip_spanned = proposal.style == "zip_spanned";
+        // Root and embedded facts may normalize to the same disk extent.
+        // Intern after carrier geometry so the verifier and the worker see one
+        // source per byte sequence and cannot consume its duplicate as a disk.
+        let mut sources = Vec::with_capacity(self.sources.len());
+        let mut remap = Vec::new();
+        let mut tail_totals = Vec::new();
+        let mut indexed = HashMap::new();
+        let totals: HashMap<_, _> = self.tail_totals.iter().copied().collect();
+        let variants = self.sources.len() != self.base_source_count;
+        for (i, source) in self.sources.iter().enumerate() {
+            let total = totals.get(&i).copied();
+            let next = sources.len();
+            if variants {
+                // A file-level transform may move the same ordered runs to a
+                // different logical offset. They still represent one disk.
+                let runs = crate::io::archive_state::PhysicalRanges::new(
+                    source.view.as_deref(), source.start, Some(source.end),
+                );
+                let key = (&source.path, runs, total);
+                let index = *indexed.entry(key).or_insert(next);
+                remap.push(index);
+                if index != next { continue; }
+            }
+            if let Some(total) = total { tail_totals.push(TailTotal { source: next, total }); }
+            sources.push(InputExtent { path: source.path.clone(), view: source.view.clone(),
+                start: source.start, end: Some(source.end) });
+        }
+        let collapsed = sources.len() < self.sources.len();
         let mut domains = Vec::new();
         let mut domain_indexes = HashMap::new();
         let layouts = self
@@ -829,9 +1073,11 @@ impl VolumeAttempts {
                             .entry(Arc::as_ptr(choices))
                             .or_insert_with(|| {
                                 let index = domains.len();
-                                domains.push(VolumeDomain {
-                                    choices: Arc::clone(choices),
-                                });
+                                let mapped = if collapsed {
+                                    let mut seen = HashSet::new();
+                                    Arc::new(choices.iter().map(|&i| remap[i]).filter(|i| seen.insert(*i)).collect())
+                                } else { Arc::clone(choices) };
+                                domains.push(VolumeDomain { choices: mapped });
                                 (index, zip_spanned && choices.iter().all(|&i| self.sources[i].terminal))
                             });
                         VolumeSlot {
@@ -856,26 +1102,12 @@ impl VolumeAttempts {
             .collect::<Vec<_>>()
             .into_boxed_slice();
         VolumeAttemptPlan {
-            sources: self
-                .sources
-                .iter()
-                .map(|extent| InputExtent {
-                    path: extent.path.clone(),
-                    start: extent.start,
-                    end: Some(extent.end),
-                })
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
+            sources: sources.into_boxed_slice(),
             domains: domains.into_boxed_slice(),
             layouts,
             head_size_from_total: self.head_size_from_total,
             minimum_size: self.minimum_size,
-            tail_totals: self
-                .tail_totals
-                .iter()
-                .map(|&(source, total)| TailTotal { source, total })
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
+            tail_totals: tail_totals.into_boxed_slice(),
         }
     }
 }

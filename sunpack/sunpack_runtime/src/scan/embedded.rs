@@ -1,3 +1,5 @@
+use crate::formats::StreamFormat;
+use crate::formats::signatures::{validate_archive_candidate, Signature, StreamValidation, SIGNATURE_IDS};
 use crate::analysis_native::volume_anchor::{
     probe_volume_anchor_reader_at_offset, upgrade_relation_rar_end_reader, VolumeAnchor,
     ZipEocdSearch, FIRST,
@@ -13,8 +15,8 @@ use crate::io::reader::{
 use crate::io::ScanBatch;
 use crate::scan::compression_stream::{
     bzip2_header_block_limit, bzip2_prefix_valid, gzip_fixed_header_flags, parse_xz_footer,
-    resolve_xz_stream_start, validate_bzip2_structure, validate_gzip_structure,
-    validate_xz_header, validate_zstd_structure, ValidationError, ValidationResult,
+    resolve_xz_stream_start, validate_bzip2_structure,
+    validate_xz_header, ValidationError, ValidationResult,
 };
 use aho_corasick::{packed, AhoCorasick};
 use crc32fast::hash as crc32;
@@ -31,36 +33,10 @@ use rayon::prelude::*;
 mod hit_storage;
 use hit_storage::{Builder as HitBuilder, HitBuffer, HitView};
 
-const ZIP_LOCAL: &[u8] = b"PK\x03\x04";
-const ZIP_EOCD: &[u8] = b"PK\x05\x06";
-const SEVEN_ZIP: &[u8] = b"7z\xbc\xaf\x27\x1c";
-const RAR4: &[u8] = b"Rar!\x1a\x07\x00";
-const RAR5: &[u8] = b"Rar!\x1a\x07\x01\x00";
-const GZIP: &[u8] = b"\x1f\x8b\x08";
-const BZIP2: &[u8] = b"BZh";
-const XZ: &[u8] = b"\xfd7zXZ\x00";
-const ZSTD: &[u8] = b"\x28\xb5\x2f\xfd";
-const TAR_USTAR: &[u8] = b"ustar";
+use crate::formats::signatures::{PATTERNS, SEVEN_ZIP, TAR_USTAR, XZ, ZIP_EOCD, ZIP_LOCAL};
+#[cfg(test)]
+use crate::formats::signatures::{GZIP, ZSTD};
 const XZ_FOOTER_MAGIC: &[u8] = b"YZ";
-
-type PatternSpec = (&'static [u8], &'static str, &'static str);
-
-const PATTERNS: [PatternSpec; 14] = [
-    (ZIP_LOCAL, "zip_local", "zip"),
-    (ZIP_EOCD, "zip_eocd", "zip_eocd"),
-    (SEVEN_ZIP, "7z", "7z"),
-    (RAR4, "rar4", "rar4"),
-    (RAR5, "rar5", "rar5"),
-    (GZIP, "gzip", "gzip"),
-    (BZIP2, "bzip2", "bzip2"),
-    (XZ, "xz", "xz"),
-    (ZSTD, "zstd", "zstd"),
-    (TAR_USTAR, "tar_ustar", "tar"),
-    (crate::formats::lz4::MAGIC, "lz4", "lz4"),
-    (b"\x2a\x4d\x18", "lz4_skippable", "lz4_skippable"),
-    (b"PK\x06\x06", "zip64_eocd", "zip64_eocd"),
-    (sunpack_enc::MAGIC, "enc", "enc"),
-];
 
 #[cfg(target_arch = "x86_64")]
 const SIMD_PREFIX_TABLES: [[u8; 32]; 6] = simd_prefix_tables();
@@ -73,8 +49,7 @@ const fn simd_prefix_tables() -> [[u8; 32]; 6] {
     let mut index = 0;
     while index < PATTERNS.len() {
         let magic = PATTERNS[index].0;
-        assert!(magic.len() >= 3);
-        assert!(magic[0] != XZ_FOOTER_MAGIC[0]);
+        if magic.len() < 3 { return [[0; 32]; 6]; }
         let mut bucket = next_bucket;
         let mut prior = 0;
         while prior < index {
@@ -145,6 +120,10 @@ pub(crate) struct EmbeddedCandidate {
 }
 
 impl EmbeddedCandidate {
+    pub(crate) fn bounded_archive(format: &'static str, offset: u64, end: u64) -> Self {
+        candidate(format, offset, Some(end), CandidateKind::Archive)
+    }
+
     pub(crate) fn is_logical_archive(&self) -> bool {
         matches!(
             self.kind,
@@ -175,7 +154,15 @@ const HIT_OFFSET_MASK: u64 = (1 << HIT_OFFSET_BITS) - 1;
 // TAR's root may precede its ustar marker by 257 bytes. Keep that lookbehind
 // and the scan overlap representable without narrowing absolute u64 offsets.
 const HIT_LOOKBEHIND: u64 = 257;
-const _: () = assert!(PATTERNS.len() < 16);
+// The dense hit spool uses four-bit tags. Reserve the footer and, only once the
+// catalog outgrows its direct tags, a shared tag for additional root signatures.
+// Recover the exact format from the probe reader only for those hits.
+const PACKED_PATTERNS: &[crate::formats::signatures::PatternSpec] =
+    PATTERNS.split_at(if PATTERNS.len() > 15 { 15 } else { PATTERNS.len() }).0;
+const FOOTER_TAG: u8 = PACKED_PATTERNS.len() as u8;
+const EXTENDED_TAG: usize = 14;
+const HAS_EXTENDED: bool = PATTERNS.len() > 15;
+
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(transparent)]
@@ -211,13 +198,13 @@ impl RawHit {
     }
 
     fn hit_name(&self) -> &'static str {
-        PATTERNS
+        PACKED_PATTERNS
             .get(self.pattern as usize)
             .map_or("xz_footer", |pattern| pattern.1)
     }
 
     fn kind(&self) -> &'static str {
-        PATTERNS
+        PACKED_PATTERNS
             .get(self.pattern as usize)
             .map_or("xz_footer", |pattern| pattern.2)
     }
@@ -229,6 +216,7 @@ pub(crate) struct NativeScanResult {
     candidates: Vec<EmbeddedCandidate>,
     #[cfg(test)]
     raw_hit_count: usize,
+    pub(crate) empty_middle: Option<(PhysicalFileGeneration, std::ops::Range<u64>)>,
     zip_eocd_absent: bool,
     unique_zip_eocd: Option<Arc<ZipEocdSearch>>,
 }
@@ -239,6 +227,22 @@ pub(crate) struct RarInputResolution {
     pub failure_reason: Option<&'static str>,
 }
 
+impl RarInputResolution {
+    pub(crate) fn from_anchor(anchor: &VolumeAnchor, password: Option<Arc<str>>) -> Self {
+        let end_offset = anchor.expected_logical_size;
+        let failure_reason = end_offset.is_none().then(|| {
+            if password.is_some() || anchor.has_any(crate::analysis_native::volume_anchor::RAR_PASSWORD_MATCHED_INCOMPLETE) {
+                "embedded_truncated"
+            } else if anchor.wrong_password {
+                "embedded_wrong_password"
+            } else {
+                "embedded_password_required"
+            }
+        });
+        Self { end_offset, password, failure_reason }
+    }
+}
+
 pub(crate) struct ResolvedEmbeddedScan {
     pub(crate) scan: std::sync::Arc<NativeScanResult>,
     pub(crate) resolutions: HashMap<u64, RarInputResolution>,
@@ -247,7 +251,7 @@ pub(crate) struct ResolvedEmbeddedScan {
 impl NativeScanResult {
     /// A physical source may contain several independent volume inputs. ZIP
     /// local records without a volume proof still nominate only one hypothesis.
-    pub(crate) fn relation_anchors(&self) -> Vec<VolumeAnchor> {
+    pub(crate) fn relation_anchors(&self, path: &str, view: Option<&Arc<crate::io::view::ReadView>>) -> Vec<VolumeAnchor> {
         let mut zip_hypothesis = false;
         // Candidates are in physical order. Advance one shared boundary cursor
         // instead of rescanning every candidate for each logical volume head.
@@ -300,6 +304,8 @@ impl NativeScanResult {
                         anchor.zip_eocd_search.clone_from(&self.unique_zip_eocd);
                     }
                 }
+                anchor.path = path.to_owned();
+                anchor.view = view.cloned();
                 Some(anchor)
             })
             .collect()
@@ -330,6 +336,13 @@ pub(crate) fn scan_embedded_path(
     parallel_files: usize,
 ) -> io::Result<NativeScanResult> {
     scan_embedded_path_with_generation(path, parallel_files, None)
+}
+
+/// Pin the IOCP read and its negative evidence to the same generation.
+pub(crate) fn scan_physical_for_views(path: &str, parallel_files: usize) -> io::Result<NativeScanResult> {
+    let reader = ManagedReader::open(path)?;
+    let generation = reader.physical_generation().cloned();
+    scan_embedded_view(reader, parallel_files, generation.as_ref(), None)
 }
 
 /// Scope-local carrier evidence, usable only while this path names the scanned file.
@@ -376,6 +389,44 @@ fn scan_embedded_path_with_generation(
     if generation.is_some() && reader.physical_generation() != generation {
         return Err(io::Error::other("file changed before embedded scan"));
     }
+    scan_embedded_view(reader, parallel_files, generation, None)
+}
+
+pub(crate) fn scan_view_root(reader: &ManagedReader, head: &[u8], relation: Option<&mut VolumeAnchor>) -> io::Result<NativeScanResult> {
+    let size = reader.len();
+    let item = if head.starts_with(ZIP_LOCAL) || head.starts_with(ZIP_EOCD) {
+        validate_root_zip(reader, relation)?
+    } else {
+        let kind = PATTERNS.iter()
+            .find(|(magic, _, kind)| !matches!(*kind, "tar" | "lz4_skippable") && head.starts_with(magic))
+            .map(|(_, _, kind)| *kind)
+            .or_else(|| crate::formats::lz4::leading(head).then_some("lz4"));
+        match kind {
+            Some(kind) => bounded_candidate(reader, kind, 0, size)?,
+            None if head.get(257..262) == Some(TAR_USTAR) || crate::formats::tar::possible_legacy_header(head, size) =>
+                bounded_candidate(reader, "tar", 0, size)?,
+            None => None,
+        }
+    };
+    Ok(NativeScanResult { file_size: size, candidates: item.into_iter().collect(), ..Default::default() })
+}
+
+// A known input boundary also admits footer-indexed formats without a full signature scan.
+pub(crate) fn bounded_candidate(
+    reader: &ManagedReader, kind: &str, offset: u64, end: u64,
+) -> io::Result<Option<EmbeddedCandidate>> {
+    let mut suffix = FailedSuffixEvidence::default();
+    validate_candidate(reader, end, kind, offset, &mut suffix)
+}
+
+pub(crate) fn scan_embedded_view(reader: ManagedReader, parallel_files: usize,
+    generation: Option<&PhysicalFileGeneration>, shared_empty: Option<&mut std::ops::Range<u64>>,
+) -> io::Result<NativeScanResult> {
+    if reader.read_view().is_some() {
+        // A mapped view needs just one sequential buffer per producer.
+        return scan_embedded_archives_native_with_iocp(reader, MAX_DISCOVERY_IOCP_CHUNK_SIZE,
+            DEFAULT_IOCP_BUFFERS, 1, generation, shared_empty);
+    }
     let parallel_files = parallel_files.clamp(1, 8);
     let workers = (DEFAULT_IOCP_WORKERS / parallel_files).max(1);
     // scan_file owns buffer_count read slots and buffer_count + workers jobs.
@@ -386,7 +437,7 @@ fn scan_embedded_path_with_generation(
         // Reserve room for the additional producers' readers and validators.
         DISCOVERY_IOCP_BYTE_BUDGET / (parallel_files * slots)
     };
-    scan_embedded_archives_native_with_iocp(reader, chunk_bytes, DEFAULT_IOCP_BUFFERS, workers, generation)
+    scan_embedded_archives_native_with_iocp(reader, chunk_bytes, DEFAULT_IOCP_BUFFERS, workers, generation, None)
 }
 
 fn embedded_matcher() -> &'static AhoCorasick {
@@ -398,7 +449,15 @@ fn embedded_matcher() -> &'static AhoCorasick {
 
 fn embedded_packed_matcher() -> Option<&'static packed::Searcher> {
     EMBEDDED_PACKED_MATCHER
-        .get_or_init(|| packed::Searcher::new(PATTERNS.iter().map(|(magic, _, _)| *magic)))
+        .get_or_init(|| {
+            // Non-overlapping packed matches can recover crossing signatures. A
+            // contained signature also needs its own hit; Aho supplies both.
+            if PATTERNS.iter().enumerate().any(|(i, a)| PATTERNS.iter().enumerate()
+                .any(|(j, b)| i != j && memmem::find(a.0, b.0).is_some())) {
+                return None;
+            }
+            packed::Searcher::new(PATTERNS.iter().map(|(magic, _, _)| *magic))
+        })
         .as_ref()
 }
 
@@ -408,6 +467,7 @@ fn scan_embedded_archives_native_with_iocp(
     iocp_buffers: usize,
     iocp_workers: usize,
     generation: Option<&PhysicalFileGeneration>,
+    shared_empty: Option<&mut std::ops::Range<u64>>,
 ) -> io::Result<NativeScanResult> {
     let cancellation = crate::io::cancellation::Cancellation::current();
     cancellation.check_io()?;
@@ -438,6 +498,10 @@ fn scan_embedded_archives_native_with_iocp(
     // Zero is absent. A definite single signature stores its offset plus one.
     // Multiple or untracked signatures keep the legacy relation tail search.
     let physical_zip_eocd = AtomicU64::new(0);
+    // IOCP jobs finish out of order. Only hit-bearing chunks update these
+    // bounds. The interval around the midpoint is empty regardless of order.
+    let clean_start = AtomicU64::new(0);
+    let clean_end = AtomicU64::new(file_size);
     let leading_legacy_tar = AtomicBool::new(false);
     let scan = |sample: &[u8], carry: usize, base: u64| {
         if base == 0 && crate::formats::tar::possible_legacy_header(sample, file_size) {
@@ -465,23 +529,19 @@ fn scan_embedded_archives_native_with_iocp(
                 physical_zip_eocd.store(u64::MAX, Ordering::Relaxed);
             }
         }
-        ScanBatch {
+        let no_signatures = batch.results.is_empty() && first == u64::MAX;
+        (ScanBatch {
             results: (!batch.results.is_empty()).then(|| {
                 hit_storage::prepare(batch.results, base + sample.len() as u64 == file_size)
             }),
             #[cfg(test)]
             discarded_results: batch.discarded_results,
-        }
+        }, no_signatures)
     };
     let (_output, full_buffer) = {
         #[cfg(windows)]
         {
-            let path = reader.iocp_path().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "IOCP embedded scanning requires a single regular file",
-                )
-            })?;
+            let path = reader.iocp_path();
             // A single read cannot overlap other reads. Use the open reader
             // and skip the second file handle, completion port and job queue.
             if file_size <= chunk_bytes as u64 {
@@ -489,12 +549,12 @@ fn scan_embedded_archives_native_with_iocp(
                 if generation.is_some() && data.len() as u64 != file_size {
                     return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short embedded scan read"));
                 }
-                let hits = scan(&data, 0, 0);
+                let (hits, _) = scan(&data, 0, 0);
                 let reuse = data.len() as u64 == file_size
                     && (generation.is_some()
                         || (hits.results.is_none() && !leading_legacy_tar.load(Ordering::Relaxed))
                         || reader.physical_generation().is_some_and(|expected| {
-                            capture_file_generation(path).is_ok_and(|current| &current == expected)
+                            path.is_some_and(|path| capture_file_generation(path).is_ok_and(|current| &current == expected)) || reader.read_view().is_some()
                         }));
                 collect(hits.results)?;
                 (iocp::IocpScanOutput {
@@ -503,7 +563,7 @@ fn scan_embedded_archives_native_with_iocp(
                     #[cfg(test)]
                     read_operations: u64::from(file_size != 0),
                 }, reuse.then_some(data))
-            } else {
+            } else if let Some(path) = path {
                 (iocp::scan_file(
                     path,
                     file_size,
@@ -513,7 +573,12 @@ fn scan_embedded_archives_native_with_iocp(
                     embedded_overlap(),
                     generation,
                     |sample, carry, base| {
-                        let batch = scan(sample, carry, base);
+                        let (batch, empty) = scan(sample, carry, base);
+                        if !empty && generation.is_some() {
+                            let stop = base + sample.len() as u64;
+                            if base <= file_size / 2 { clean_start.fetch_max(stop, Ordering::Relaxed); }
+                            if stop >= file_size / 2 { clean_end.fetch_min(base, Ordering::Relaxed); }
+                        }
                         ScanBatch {
                             // Empty read jobs send only a pointer-sized None.
                             // Keep encoded metadata off the IOCP channel's hot
@@ -525,6 +590,61 @@ fn scan_embedded_archives_native_with_iocp(
                     },
                     |batch| collect(batch.map(|batch| *batch)),
                 )?, None)
+            } else {
+                let overlap = embedded_overlap();
+                let mut buffer = crate::io::resource_error::zeroed_bytes(chunk_bytes + overlap)?;
+                let mut offset = 0;
+                let mut carry = 0;
+                #[cfg(test)]
+                let mut discarded_results = 0;
+                #[cfg(test)]
+                let mut read_operations = 0;
+                // One interval of negative signature evidence per open file.
+                // Only equal logical/physical coordinates (including overlap)
+                // may reuse it. Hits and changed seams keep normal validation.
+                let previous = shared_empty.as_deref().cloned().unwrap_or(0..0);
+                let mut best = previous.clone();
+                let mut run = 0..0;
+                let mut reload_carry = false;
+                while offset < file_size {
+                    cancellation.check_io()?;
+                    let len = (file_size - offset).min(chunk_bytes as u64) as usize;
+                    let stop = offset + len as u64;
+                    let base = offset - carry as u64;
+                    // Physical and mapped producers may have different chunk sizes.
+                    // A rejected signature can depend on surrounding header bytes
+                    // (the largest in-buffer check is one 512-byte TAR header).
+                    let validation_end = stop.saturating_add(512);
+                    let reusable = shared_empty.is_some() && offset != 0 && validation_end <= file_size
+                        && reader.read_view().is_some_and(|v| v.unchanged(base.saturating_sub(512), validation_end));
+                    if reusable && previous.start <= base && stop <= previous.end {
+                        reload_carry = true;
+                    } else {
+                        let end = carry + len;
+                        let (at, from) = if reload_carry { (base, 0) } else { (offset, carry) };
+                        if reader.read_direct_into_at(at, &mut buffer[from..end])? != end - from {
+                            return Err(io::ErrorKind::UnexpectedEof.into());
+                        }
+                        let (batch, empty) = scan(&buffer[..end], carry, base);
+                        #[cfg(test)]
+                        { discarded_results += batch.discarded_results; read_operations += 1; }
+                        collect(batch.results)?;
+                        if reusable && empty {
+                            if run.end != offset { run.start = base; }
+                            run.end = stop;
+                            if run.end - run.start > best.end - best.start { best = run.clone(); }
+                        } else { run = 0..0; }
+                        carry = overlap.min(end);
+                        buffer.copy_within(end - carry..end, 0);
+                        reload_carry = false;
+                    }
+                    offset = stop;
+                }
+                if let Some(saved) = shared_empty { *saved = best; }
+                (iocp::IocpScanOutput {
+                    #[cfg(test)] discarded_results,
+                    #[cfg(test)] read_operations,
+                }, None)
             }
         }
         #[cfg(not(windows))]
@@ -613,6 +733,11 @@ fn scan_embedded_archives_native_with_iocp(
     let physical_zip_eocd = physical_zip_eocd.load(Ordering::Relaxed);
     Ok(NativeScanResult {
         file_size,
+        empty_middle: generation.filter(|_| reader.iocp_path().is_some() && file_size > chunk_bytes as u64)
+            .and_then(|g| {
+                let interval = clean_start.into_inner()..clean_end.into_inner();
+                (!interval.is_empty()).then(|| (g.clone(), interval))
+            }),
         candidates,
         #[cfg(test)]
         raw_hit_count,
@@ -645,11 +770,11 @@ fn validate_raw_hits(
     leading_legacy_tar: bool,
 ) -> io::Result<Vec<EmbeddedCandidate>> {
     let cancellation = crate::io::cancellation::Cancellation::current();
-    let mut suffixes: [FailedSuffixEvidence; 5] = std::array::from_fn(|_| Default::default());
+    let mut suffixes: [FailedSuffixEvidence; StreamFormat::COUNT] = std::array::from_fn(|_| Default::default());
     // A V7 TAR can have no byte signature. A complete leading walk owns its
     // members, while hits after its validated end remain independent peers.
     let leading_tar = if leading_legacy_tar {
-        validate_tar(reader, file_size, 0, &mut suffixes[3])?
+        validate_tar(reader, file_size, 0, &mut suffixes[StreamFormat::Tar as usize])?
     } else {
         None
     };
@@ -664,7 +789,7 @@ fn validate_raw_hits(
     let mut zip64_records = BTreeMap::new();
     let use_windows = raw_hits.len() + xz_footer_hits.len() >= 128;
     let mut windowed = None;
-    let mut zip64_hits = raw_hits.iter_mask(1 << 12);
+    let mut zip64_hits = raw_hits.iter_mask(1 << Signature::Zip64Eocd as u8);
     if leading_end != 0 {
         zip64_hits.seek_ge(leading_end);
     }
@@ -689,21 +814,21 @@ fn validate_raw_hits(
             }
         }
     }
-    let mut eocds = raw_hits.iter_mask(1 << 1);
+    let mut eocds = raw_hits.iter_mask(1 << Signature::ZipEocd as u8);
     if leading_end != 0 {
         eocds.seek_ge(leading_end);
     }
     let mut candidates = match (eocds.next(), eocds.next()) {
         (None, _) => Vec::new(),
-        (Some(hit), None) => validate_zip_eocd(reader, file_size, hit.offset(), &zip64_records, None)?
+        (Some(hit), None) => validate_zip_eocd(reader, file_size, hit.offset(), Some(&zip64_records), None)?
             .into_iter()
             .collect(),
         _ => raw_hits
-            .par_iter_mask(1 << 1)
+            .par_iter_mask(1 << Signature::ZipEocd as u8)
             .filter(|hit| hit.offset() >= leading_end)
             .map_init(Vec::new, |suffixes, hit| {
                 cancellation.run(|| {
-                    validate_zip_eocd(reader, file_size, hit.offset(), &zip64_records, Some(suffixes))
+                    validate_zip_eocd(reader, file_size, hit.offset(), Some(&zip64_records), Some(suffixes))
                 })
             })
             .try_fold(Vec::new, |mut candidates, candidate| -> io::Result<_> {
@@ -741,7 +866,7 @@ fn validate_raw_hits(
         {
             continue;
         }
-        let mut locals = raw_hits.iter_mask(1);
+        let mut locals = raw_hits.iter_mask(1 << Signature::ZipLocal as u8);
         locals.seek_ge(end);
         if locals.next().is_none_or(|hit| hit.offset() != end) {
             continue;
@@ -757,7 +882,7 @@ fn validate_raw_hits(
     candidates.extend(leading_tar);
     let mut previous_xz: Option<usize> = None;
     let mut zip_bzip2_ends = BTreeMap::new();
-    let mut cursor = raw_hits.iter_mask(!((1 << 1) | (1 << 12)));
+    let mut cursor = raw_hits.iter_mask(!((1 << Signature::ZipEocd as u8) | (1 << Signature::Zip64Eocd as u8)));
     if covered_until != 0 {
         cursor.seek_ge(covered_until);
     }
@@ -790,7 +915,9 @@ fn validate_raw_hits(
                 zip_bzip2_ends.pop_first();
             }
         }
-        let resolved = if kind == "zip" {
+        let resolved = if HAS_EXTENDED && hit.pattern as usize == EXTENDED_TAG {
+            validate_extended_candidate(reader, file_size, hit.offset(), &PATTERNS[EXTENDED_TAG..], &mut suffixes)?
+        } else if kind == "zip" {
             validate_zip(reader, file_size, hit.offset(), &mut zip_bzip2_ends)?
         } else if kind == "xz" {
             validate_xz(reader, file_size, hit.offset(), &mut xz_footers)?
@@ -799,7 +926,7 @@ fn validate_raw_hits(
                 reader,
                 file_size,
                 hit.offset(),
-                &mut suffixes[1],
+                &mut suffixes[StreamFormat::Bzip2 as usize],
                 zip_bzip2_ends.remove(&hit.offset()),
             )?
             else {
@@ -811,19 +938,11 @@ fn validate_raw_hits(
             }
             Some(candidate("bzip2", hit.offset(), Some(end), CandidateKind::Archive))
         } else {
-            let suffix_index = match kind {
-                "gzip" => 0,
-                "zstd" => 2,
-                "tar" => 3,
-                _ => 4,
-            };
-            validate_candidate(
-                reader,
-                file_size,
-                kind,
-                hit.offset(),
-                &mut suffixes[suffix_index],
-            )?
+            if let Some(stream) = signature_stream(kind) {
+                validate_stream_candidate(reader, file_size, stream, kind, hit.offset(), &mut suffixes[stream as usize])?
+            } else {
+                validate_archive_candidate(reader, file_size, kind, hit.offset())?
+            }
         };
         let Some(candidate) = resolved else {
             continue;
@@ -932,7 +1051,7 @@ fn new_hit_batch(base_offset: u64, carry_len: usize, len: usize) -> ScanBatch<Hi
 fn scan_sample_batch(sample: &[u8], carry_len: usize, base_offset: u64) -> ScanBatch<HitBuffer> {
     debug_assert!(sample.len() as u64 + HIT_LOOKBEHIND <= HIT_OFFSET_MASK);
     #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("avx2") {
+    if SIMD_PREFIX_TABLES[0] != [0; 32] && is_x86_feature_detected!("avx2") {
         // SAFETY: the feature check guards every AVX2 instruction. The scanner
         // only loads vectors when all 34 accessed bytes belong to `sample`.
         return unsafe { scan_sample_avx2(sample, carry_len, base_offset) };
@@ -1102,53 +1221,12 @@ fn scan_sample_candidate(
     let first = sample[start];
     if first == XZ_FOOTER_MAGIC[0] {
         record_xz_footer(hits, sample, start, carry_len, base_offset);
-        return;
     }
-    // Direct dispatch keeps dense rejected prefixes cheap. A longer generic
-    // loop stops being unrolled by the compiler when new signatures are added.
-    macro_rules! check {
-        ($index:expr) => {
-            if $index < PATTERNS.len() {
-                let magic = PATTERNS[$index].0;
-                if sample.get(start..start + magic.len()) == Some(magic) {
-                    record_raw_hit(
-                        hits,
-                        sample,
-                        carry_len,
-                        base_offset,
-                        $index,
-                        start,
-                        start + magic.len(),
-                    );
-                }
-            }
-        };
-    }
-    // ZIP/RAR prefixes dominate rejected candidates in executables and images.
-    // Keep these paths outside the sparse dispatch table.
-    if first == b'P' {
-        check!(0);
-        check!(1);
-        check!(12);
-        return;
-    }
-    if first == b'R' {
-        check!(3);
-        check!(4);
-        return;
-    }
-    match first {
-        b'7' => check!(2),
-        0x1f => check!(5),
-        b'B' => check!(6),
-        0xfd => check!(7),
-        b'(' => check!(8),
-        b'u' => check!(9),
-        4 => check!(10),
-        0x2a => check!(11),
-        b'S' => check!(13),
-        _ => {}
-    }
+    crate::formats::signatures::visit_prefix(first, |index, magic| {
+        if sample.get(start..start + magic.len()) == Some(magic) {
+            record_raw_hit(hits, sample, carry_len, base_offset, index, start, start + magic.len());
+        }
+    });
 }
 
 fn record_xz_footer(
@@ -1170,7 +1248,7 @@ fn record_xz_footer(
     if parse_xz_footer(footer, base_offset + end as u64).is_ok() {
         hits.results.push(RawHit::new(
             base_offset + start as u64,
-            PATTERNS.len() as u8,
+            FOOTER_TAG,
         ));
     }
 }
@@ -1193,7 +1271,7 @@ fn record_raw_hit(
     let absolute = base_offset + start as u64;
     // Standalone validation rejects multi-disk EOCDs below. Preserve any
     // signature whose fixed record could fit, including across chunks.
-    if pattern == 1 {
+    if pattern == Signature::ZipEocd as usize {
         hits.results.first_zip_eocd = hits.results.first_zip_eocd.min(absolute);
     }
     let (_, _, kind) = PATTERNS[pattern];
@@ -1232,26 +1310,26 @@ fn record_raw_hit(
         }
     }
     hits.results
-        .push(RawHit::new(candidate_offset, pattern as u8));
+        .push(RawHit::new(candidate_offset, if HAS_EXTENDED { pattern.min(EXTENDED_TAG) } else { pattern } as u8));
 }
 
 fn fixed_header_invalid(pattern: usize, bytes: &[u8]) -> bool {
     // Reuse the structural parsers on bytes already in the scan buffer. An
     // incomplete header at a chunk edge must remain eligible for validation.
-    match pattern {
-        0 => bytes
+    match SIGNATURE_IDS[pattern] {
+        Signature::ZipLocal => bytes
             .get(..30)
             .is_some_and(|header| !zip_local_fixed_plausible(header)),
-        1 => bytes
+        Signature::ZipEocd => bytes
             .get(..22)
             .is_some_and(|header| !zip_eocd_fixed_plausible(header)),
-        2 => bytes
+        Signature::SevenZip => bytes
             .get(..32)
             .is_some_and(|header| !seven_zip_start_header_valid(header)),
-        5 => bytes
+        Signature::Gzip => bytes
             .get(..10)
             .is_some_and(|header| gzip_fixed_header_flags(header.try_into().unwrap()).is_err()),
-        6 => bytes.get(..10).map_or_else(
+        Signature::Bzip2 => bytes.get(..10).map_or_else(
             || {
                 bytes.get(..4).is_some_and(|header| {
                     bzip2_header_block_limit(header.try_into().unwrap()).is_err()
@@ -1259,10 +1337,10 @@ fn fixed_header_invalid(pattern: usize, bytes: &[u8]) -> bool {
             },
             |prefix| !bzip2_prefix_valid(prefix.try_into().unwrap()),
         ),
-        7 => bytes
+        Signature::Xz => bytes
             .get(..12)
             .is_some_and(|header| validate_xz_header(header).is_err()),
-        10 => bytes
+        Signature::Lz4 => bytes
             .get(..19)
             .is_some_and(|header| crate::formats::lz4::parse_header(header).is_err()),
         _ => false,
@@ -1294,8 +1372,46 @@ fn validate_candidate(
     offset: u64,
     suffixes: &mut FailedSuffixEvidence,
 ) -> std::io::Result<Option<EmbeddedCandidate>> {
-    match kind {
-        "enc" => {
+    if let Some(stream) = signature_stream(kind) {
+        validate_stream_candidate(file, file_size, stream, kind, offset, suffixes)
+    } else {
+        validate_archive_candidate(file, file_size, kind, offset)
+    }
+}
+
+fn validate_extended_candidate(
+    reader: &ManagedReader, size: u64, offset: u64, signatures: &[crate::formats::signatures::PatternSpec],
+    suffixes: &mut [FailedSuffixEvidence; StreamFormat::COUNT],
+) -> io::Result<Option<EmbeddedCandidate>> {
+    let length = signatures.iter().map(|s| s.0.len()).max().unwrap_or(0);
+    let head = reader.read_cached_at(offset, length)?;
+    for &(magic, _, kind) in signatures {
+        if head.starts_with(magic) {
+            let candidate = if let Some(stream) = signature_stream(kind) {
+                validate_stream_candidate(reader, size, stream, kind, offset, &mut suffixes[stream as usize])?
+            } else {
+                validate_archive_candidate(reader, size, kind, offset)?
+            };
+            if candidate.is_some() { return Ok(candidate); }
+        }
+    }
+    Ok(None)
+}
+
+fn signature_stream(kind: &str) -> Option<StreamFormat> {
+    if kind == "lz4_skippable" { Some(StreamFormat::Lz4) } else { StreamFormat::from_name(kind) }
+}
+
+fn validate_stream_candidate(
+    file: &ManagedReader, file_size: u64, stream: StreamFormat, kind: &str, offset: u64,
+    suffixes: &mut FailedSuffixEvidence,
+) -> io::Result<Option<EmbeddedCandidate>> {
+    match stream.validation() {
+        StreamValidation::Bzip2 => Ok(validate_bzip2(file, file_size, offset, suffixes, None)?
+            .map(|(end, _)| EmbeddedCandidate::bounded_archive(stream.name(), offset, end))),
+        StreamValidation::Xz => Ok(super::compression_stream::xz_streams_fill(file, offset, file_size)?
+            .then(|| EmbeddedCandidate::bounded_archive(stream.name(), offset, file_size))),
+        StreamValidation::Enc => {
             let prefix = read_at(file, offset, 40)?;
             Ok(sunpack_enc::Header::parse(&prefix, file_size - offset)
                 .ok()
@@ -1303,12 +1419,10 @@ fn validate_candidate(
                 // candidate cannot claim other hits; decryption uses EOF.
                 .map(|_| candidate("enc", offset, None, CandidateKind::Archive)))
         }
-        "7z" => validate_seven_zip(file, file_size, offset),
-        "rar4" | "rar5" => validate_rar(file, file_size, offset),
-        "gzip" => validate_gzip(file, file_size, offset, suffixes),
-        "zstd" => validate_zstd(file, file_size, offset, suffixes),
-        "tar" => validate_tar(file, file_size, offset, suffixes),
-        "lz4" | "lz4_skippable" => {
+        StreamValidation::Frames(walk) => Ok(suffixes.validate(offset, true, |visit| walk(file, offset, file_size, visit))?
+            .map(|end| EmbeddedCandidate::bounded_archive(stream.name(), offset, end))),
+        StreamValidation::Tar => validate_tar(file, file_size, offset, suffixes),
+        StreamValidation::Lz4 => {
             if kind == "lz4_skippable" {
                 let magic = read_at(file, offset, 4)?;
                 if magic.len() != 4
@@ -1342,7 +1456,6 @@ fn validate_candidate(
                 CandidateKind::Archive,
             )))
         }
-        _ => Ok(None),
     }
 }
 
@@ -1443,11 +1556,36 @@ fn directory_matches(
     central_directory_complete(observed_end, end, |offset, length| read_at(file, offset, length))
 }
 
+fn validate_root_zip(reader: &ManagedReader, relation: Option<&mut VolumeAnchor>) -> io::Result<Option<EmbeddedCandidate>> {
+    let len = reader.len();
+    let mut bytes_read = 0;
+    let (tail, start) = crate::formats::zip::read_eocd_tail(reader, 0, len, &[], &mut bytes_read)?;
+    let mut root = None;
+    for record in crate::formats::zip::eocd_records(&tail) {
+        let offset = start + record.offset as u64;
+        if let Some(mut item) = validate_zip_eocd(reader, len, offset, None, None)?
+            .filter(|item| item.offset == 0)
+        {
+            if crate::formats::zip::zip_continuation_prefix(&tail[record.end..]) {
+                item.kind = CandidateKind::ZipAwaitingTail;
+            }
+            root = Some(item);
+            break;
+        }
+    }
+    if let Some(anchor) = relation.filter(|_| root.as_ref().is_none_or(|item| item.awaits_zip_tail())) {
+        crate::analysis_native::volume_anchor::apply_relation_zip_tail(anchor, reader, &tail, start, len);
+    }
+    Ok(root)
+}
+
+type Zip64Records = BTreeMap<u64, Vec<(u64, crate::formats::zip::zip64::EndRecord)>>;
+
 fn validate_zip_eocd(
     file: &ManagedReader,
     size: u64,
     eocd_offset: u64,
-    zip64_records: &BTreeMap<u64, Vec<(u64, crate::formats::zip::zip64::EndRecord)>>,
+    zip64_records: Option<&Zip64Records>,
     suffixes: Option<&mut Vec<DirectorySuffix>>,
 ) -> std::io::Result<Option<EmbeddedCandidate>> {
     let header = read_at(file, eocd_offset, 22)?;
@@ -1552,7 +1690,7 @@ struct Zip64EndRecords {
 fn parse_zip64_end_records(
     file: &ManagedReader,
     eocd_offset: u64,
-    records: &BTreeMap<u64, Vec<(u64, crate::formats::zip::zip64::EndRecord)>>,
+    records: Option<&Zip64Records>,
 ) -> io::Result<Option<Zip64EndRecords>> {
     if eocd_offset < 20 {
         return Ok(None);
@@ -1569,22 +1707,31 @@ fn parse_zip64_end_records(
         return Ok(None);
     }
 
-    let Some((record_offset, record)) = records.get(&(eocd_offset - 20)).and_then(|items| {
-        items.iter().find(|(offset, record)| {
-            record.disk == 0
-                && record.cd_disk == 0
-                && record.disk_entries == record.total_entries
-                && offset.checked_sub(recorded_record_offset)
-                    == offset
-                        .checked_sub(record.cd_size)
-                        .and_then(|start| start.checked_sub(record.cd_offset))
-                && *offset >= recorded_record_offset
+    let locator_offset = eocd_offset - 20;
+    let valid = |offset: u64, record: &crate::formats::zip::zip64::EndRecord| {
+        record.disk == 0
+            && record.cd_disk == 0
+            && record.disk_entries == record.total_entries
+            && offset >= recorded_record_offset
+            && offset.checked_sub(recorded_record_offset)
+                == offset.checked_sub(record.cd_size).and_then(|start| start.checked_sub(record.cd_offset))
+    };
+    let located = if let Some(records) = records {
+        records.get(&locator_offset).and_then(|items| {
+            items.iter().find(|(offset, record)| valid(*offset, record)).copied()
         })
-    }) else {
+    } else if recorded_record_offset.checked_add(56).is_some_and(|end| end <= locator_offset) {
+        let fixed = read_at(file, recorded_record_offset, 56)?;
+        crate::formats::zip::zip64::parse_record(&fixed)
+            .filter(|record| recorded_record_offset.checked_add(12 + record.record_size) == Some(locator_offset)
+                && valid(recorded_record_offset, record))
+            .map(|record| (recorded_record_offset, record))
+    } else { None };
+    let Some((record_offset, record)) = located else {
         return Ok(None);
     };
     Ok(Some(Zip64EndRecords {
-        record_offset: *record_offset,
+        record_offset,
         recorded_record_offset,
         disk: record.disk,
         cd_disk: record.cd_disk,
@@ -1714,7 +1861,7 @@ fn validate_zip(
     )))
 }
 
-fn validate_seven_zip(
+pub(crate) fn validate_seven_zip(
     file: &ManagedReader,
     size: u64,
     offset: u64,
@@ -1809,7 +1956,7 @@ fn seven_zip_start_header_valid(header: &[u8]) -> bool {
         && crc32(&header[12..32]) == u32::from_le_bytes(header[8..12].try_into().unwrap())
 }
 
-fn validate_rar(
+pub(crate) fn validate_rar(
     file: &ManagedReader,
     _size: u64,
     offset: u64,
@@ -1888,25 +2035,6 @@ impl FailedSuffixEvidence {
     }
 }
 
-fn validate_gzip(
-    file: &ManagedReader,
-    size: u64,
-    offset: u64,
-    suffixes: &mut FailedSuffixEvidence,
-) -> std::io::Result<Option<EmbeddedCandidate>> {
-    let Some(end) = suffixes.validate(offset, true, |visit| {
-        validate_gzip_structure(file, offset, size, visit)
-    })?
-    else {
-        return Ok(None);
-    };
-    Ok(Some(candidate(
-        "gzip",
-        offset,
-        Some(end),
-        CandidateKind::Archive,
-    )))
-}
 
 fn validate_bzip2(
     file: &ManagedReader,
@@ -1992,25 +2120,6 @@ fn validate_xz(
     }
 }
 
-fn validate_zstd(
-    file: &ManagedReader,
-    size: u64,
-    offset: u64,
-    suffixes: &mut FailedSuffixEvidence,
-) -> std::io::Result<Option<EmbeddedCandidate>> {
-    let Some(end) = suffixes.validate(offset, true, |visit| {
-        validate_zstd_structure(file, offset, size, visit)
-    })?
-    else {
-        return Ok(None);
-    };
-    Ok(Some(candidate(
-        "zstd",
-        offset,
-        Some(end),
-        CandidateKind::Archive,
-    )))
-}
 
 fn validate_tar(
     file: &ManagedReader,

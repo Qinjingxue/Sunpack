@@ -67,8 +67,47 @@ impl EncodingKind {
 pub(crate) fn analyze_zip_filename_encoding(
     archive_input: &ArchiveInput,
 ) -> io::Result<Option<&'static str>> {
+    if let Some(plan) = &archive_input.volume_attempts {
+        // A complete directory commonly occupies the last disk. Its position
+        // relative to the EOCD is invariant across all preceding disk choices.
+        let mut visited = std::collections::HashSet::new();
+        let mut domains = std::collections::HashSet::new();
+        let mut encoding = None;
+        let mut spanning = std::collections::HashMap::new();
+        for layout in &plan.layouts {
+            let Some(slot) = layout.slots.last() else { continue };
+            if !domains.insert(slot.domain) { continue; }
+            for &source in plan.domains[slot.domain].choices.iter() {
+                if !visited.insert(source) { continue; }
+                let Ok(ranges) = parse_ranges(std::iter::once(&plan.sources[source]), &[]) else { continue };
+                let mut reader = VirtualRangeReader::new(&ranges);
+                let mut prefix = None;
+                if let Ok(Some(codepage)) = scan_zip_names(&mut reader, None, &mut prefix) {
+                    if encoding.is_some_and(|old| old != codepage) { return Ok(None); }
+                    encoding = Some(codepage);
+                }
+                if let Some(prefix) = prefix { spanning.insert(source, prefix); }
+            }
+        }
+        if !spanning.is_empty() {
+            use crate::password::input::attempts::{prepare_attempt_evidence_partial, AttemptGeometry};
+            let Some(head) = archive_input.parts.first() else { return Ok(encoding); };
+            let result = prepare_attempt_evidence_partial(&head.extent, plan, &[], AttemptGeometry::DiskRelative, |reader| {
+                scan_spanning_directory(reader, &spanning)
+                    .map_err(|e| crate::password::context::PreparedStatus::new("unreadable_directory", e.to_string()))
+            });
+            if let Ok(evidence) = result {
+                for codepage in evidence.values() {
+                    if encoding.is_some_and(|old| old != codepage) { return Ok(None); }
+                    encoding = Some(codepage);
+                }
+            }
+        }
+        return Ok(encoding);
+    }
     let mut extents = archive_input.physical_extents().peekable();
     let fallback = extents.peek().is_none().then(|| InputExtent {
+        view: None,
         path: archive_input.entry_path.clone(),
         start: 0,
         end: None,
@@ -79,12 +118,44 @@ pub(crate) fn analyze_zip_filename_encoding(
         .analysis
         .zip_spanned
         .then(|| reader.disk_starts());
-    scan_zip_names(&mut reader, disk_starts.as_deref())
+    scan_zip_names(&mut reader, disk_starts.as_deref(), &mut None)
+}
+
+// Locate only disks containing the directory. Opaque payload disks before
+// it never contribute offsets or branch the character-encoding probe.
+fn scan_spanning_directory(
+    reader: &mut crate::password::input::attempts::AttemptReader<'_>,
+    spanning: &std::collections::HashMap<usize, (u64, u64, u64)>,
+) -> io::Result<Option<&'static str>> {
+    let Some(mut disk) = reader.last_disk()? else { return Ok(None); };
+    let Some(source) = reader.native_proof(disk, |i| spanning.contains_key(&i).then_some(i))? else {
+        return Ok(None);
+    };
+    let (mut preceding, size, entries) = spanning[&source];
+    let start = loop {
+        if disk == 0 { return Ok(None); }
+        disk -= 1;
+        let Some(len) = reader.volume_len(disk)? else { return Ok(None); };
+        if preceding <= len { break len - preceding; }
+        preceding -= len;
+    };
+    let mut position = (disk, start);
+    let mut cursor = 0;
+    score_directory(0, size, entries, 0, Vec::new(), |offset, length, buf| {
+        let Some(next) = reader.advance_disk_offset(position.0, position.1, offset - cursor)? else {
+            buf.clear(); return Ok(());
+        };
+        position = next;
+        cursor = offset;
+        *buf = reader.read_disk_spanning(next.0, next.1, length)?;
+        Ok(())
+    })
 }
 
 fn scan_zip_names(
     reader: &mut VirtualRangeReader<'_>,
     disk_starts: Option<&[u64]>,
+    spanning: &mut Option<(u64, u64, u64)>,
 ) -> io::Result<Option<&'static str>> {
     let file_size = reader.len();
     if file_size < ZIP_EOCD_LENGTH as u64 {
@@ -125,6 +196,9 @@ fn scan_zip_names(
         return Ok(None);
     }
     let physical_candidate = directory_end.checked_sub(central_size_u64);
+    if physical_candidate.is_none() {
+        *spanning = Some((central_size_u64 - directory_end, central_size_u64, total_entries));
+    }
     let declared_candidate = match disk_starts {
         Some(starts) => starts
             .get(central_disk)
@@ -161,36 +235,33 @@ fn scan_zip_names(
     let end = central_logical_offset
         .checked_add(central_size_u64)
         .ok_or_else(|| io::Error::other("ZIP central range overflow"))?;
-    let mut cursor = central_logical_offset;
+    score_directory(central_logical_offset, end, total_entries, tail_start, tail,
+        |offset, length, buf| reader.read_at_into(offset, length, buf))
+}
+
+fn score_directory(
+    mut cursor: u64, end: u64, total_entries: u64, mut window_start: u64, mut window: Vec<u8>,
+    mut read: impl FnMut(u64, usize, &mut Vec<u8>) -> io::Result<()>,
+) -> io::Result<Option<&'static str>> {
     let mut scoring = None;
-    // Small central directories are already in the tail read. Larger ones
-    // refill the same buffer starting at the first needed record.
-    let mut window_start = tail_start;
-    let mut window = tail;
-    window.truncate(end.saturating_sub(tail_start) as usize);
+    window.truncate(end.saturating_sub(window_start) as usize);
     let mut checked = 0u64;
     while checked < total_entries {
         if cursor < window_start || cursor + 46 > window_start + window.len() as u64 {
             window_start = cursor;
-            reader.read_at_into(cursor, (end - cursor).min(64 * 1024) as usize, &mut window)?;
+            read(cursor, (end - cursor).min(64 * 1024) as usize, &mut window)?;
         }
         let offset = (cursor - window_start) as usize;
         let Some(fixed) = window.get(offset..offset + 46) else {
             return Ok(None);
         };
-        if &fixed[..4] != super::CD_SIG {
-            return Ok(None);
-        }
-        let length = 46
-            + super::u16_le(fixed, 28) as usize
-            + super::u16_le(fixed, 30) as usize
-            + super::u16_le(fixed, 32) as usize;
+        let Some(length) = super::central_directory_record_len(fixed) else { return Ok(None); };
         if cursor + length as u64 > end {
             return Ok(None);
         }
         if offset + length > window.len() {
             window_start = cursor;
-            reader.read_at_into(
+            read(
                 cursor,
                 (end - cursor).min((64 * 1024).max(length) as u64) as usize,
                 &mut window,
@@ -217,7 +288,7 @@ fn scan_zip_names(
         return Ok(None);
     };
     if !super::central_directory_complete(cursor, end, |offset, length| {
-        reader.read_at(offset, length)
+        read(offset, length, &mut window).map(|()| std::mem::take(&mut window))
     })? {
         return Ok(None);
     }

@@ -3,10 +3,16 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <charconv>
 #include <iterator>
 
 namespace spg {
 namespace {
+constexpr std::string_view mapped_views[] = {
+#define SUNPACK_VIEW(id, tag, bit) #tag,
+#include "../../sunpack/sunpack_runtime/src/io/view/methods.def"
+#undef SUNPACK_VIEW
+};
 struct Locale {
     std::string_view code;
     const wchar_t* windows_name;
@@ -133,6 +139,13 @@ Json describe_setting(const std::string& pointer,const std::string& module,const
         {"block",block},{"blockLabel",block_label},{"module",module},{"primary",primary},
         {"description",meta.contains("description")?local(meta["description"],locale):meta.empty()?tr("unknownDescription",language):std::string()},
         {"editor",meta.value("editor",std::string())},{"options",Json::array()},{"known",!meta.empty()}};
+    if(meta.value("editor",std::string())=="view_list") {
+        result["viewMethods"]=mapped_views;
+        auto& description=result["description"].get_ref<std::string&>();
+        for(const auto& method:mapped_views) {
+            description.append(&method==mapped_views?" ":", ").append(method);
+        }
+    }
     if(pointer=="/cli/language") {
         for(const auto& choice:locales)
             result["options"].push_back({{"value",choice.code},{"label",choice.label}});
@@ -144,6 +157,24 @@ Json describe_setting(const std::string& pointer,const std::string& module,const
 }
 void validate_setting(const std::string& pointer,const Json& value,const std::string& module) {
     const auto& meta=setting(pointer,module);
+    if(meta.value("editor",std::string())=="view_list") {
+        if(!value.is_array()) throw std::runtime_error("settingTypeMismatch");
+        for(const auto& item:value) {
+            if(!item.is_string()) throw std::runtime_error("validation");
+            const auto& tag=item.get_ref<const std::string&>();
+            if(tag=="plain") continue;
+            const auto colon=tag.find(':');
+            const auto method=std::string_view(tag).substr(0,colon);
+            if(colon==std::string::npos || std::find(std::begin(mapped_views),std::end(mapped_views),method)==std::end(mapped_views))
+                throw std::runtime_error("validation");
+            uint32_t depth=0;
+            const auto end=tag.data()+tag.size();
+            auto begin=tag.data()+colon+1;
+            if(begin!=end && *begin=='+') ++begin;
+            const auto parsed=std::from_chars(begin,end,depth);
+            if(parsed.ec!=std::errc{} || parsed.ptr!=end || !depth) throw std::runtime_error("validation");
+        }
+    }
     if(meta.value("editor",std::string())=="rule_list") {
         if(!value.is_array()) throw std::runtime_error("settingTypeMismatch");
         for(const auto& entry:value) if(!entry.is_object() || entry.size()!=2 ||

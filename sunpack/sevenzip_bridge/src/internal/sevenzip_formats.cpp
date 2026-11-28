@@ -2,7 +2,9 @@
 
 #include "lz4_handler.hpp"
 #include "sevenzip_bridge/enc.h"
-#include "sevenzip_paths.hpp"
+#include <array>
+#include <iterator>
+#include <utility>
 
 #ifdef _WIN32
 #include "7zip/Common/RegisterCodec.h"
@@ -21,44 +23,71 @@ namespace sunpack::sevenzip
 
 #ifdef _WIN32
 
-    ExtractionFormats extraction_formats_for_hint(const std::wstring &format_hint)
+    namespace
     {
-        auto hint = lower_text(format_hint);
-        if (!hint.empty() && hint.front() == L'.') hint.erase(hint.begin());
+        struct Handler {
+            std::wstring_view name;
+            unsigned char ids[2];
+            std::wstring_view aliases[3]{};
+            bool encrypted_headers = false;
+            bool auto_detect = true;
+        };
 
-        if (hint == L"enc") return {{format_guid(kEncFormatId)}};
-        if (hint == L"zip" || hint == L"zipx") return {{format_guid(0x01)}};
-        if (hint == L"7z" || hint == L"sevenzip" || hint == L"seven_zip") return {{format_guid(0x07)}, true};
-        if (hint == L"rar4") return {{format_guid(0x03), format_guid(0xCC)}, true};
-        if (hint == L"rar" || hint == L"rar5") return {{format_guid(0xCC), format_guid(0x03)}, true};
-        if (hint == L"tar") return {{format_guid(0xEE)}};
-        if (hint == L"gz" || hint == L"gzip" || hint == L"tgz") return {{format_guid(0xEF)}};
-        if (hint == L"bz2" || hint == L"bzip2" || hint == L"tbz2" || hint == L"tbz") return {{format_guid(0x02)}};
-        if (hint == L"xz" || hint == L"txz") return {{format_guid(0x0C)}};
-        if (hint == L"lz4") return {{format_guid(kLz4FormatId)}};
-        if (hint == L"zst" || hint == L"zstd" || hint == L"tzst") return {{format_guid(0x0E)}};
-        return {{format_guid(0x07), format_guid(0x01), format_guid(0xCC), format_guid(0x03), format_guid(0xEE),
-                 format_guid(0xEF), format_guid(0x02), format_guid(0x0C), format_guid(0x0E), format_guid(kLz4FormatId)}};
+        // Physical fallback order is significant. ENC requires an explicit hint.
+        constexpr Handler handlers[] = {
+            {L"7z", {0x07}, {L"sevenzip", L"seven_zip"}, true},
+            {L"zip", {0x01}, {L"zipx"}},
+            {L"rar5", {0xCC, 0x03}, {L"rar"}, true},
+            {L"rar4", {0x03, 0xCC}, {}, true},
+            {L"tar", {0xEE}},
+            {L"gzip", {0xEF}, {L"gz", L"tgz"}},
+            {L"bzip2", {0x02}, {L"bz2", L"tbz2", L"tbz"}},
+            {L"xz", {0x0C}, {L"txz"}},
+            {L"zstd", {0x0E}, {L"zst", L"tzst"}},
+            {L"lz4", {kLz4FormatId}},
+            {L"enc", {kEncFormatId}, {}, false, false},
+        };
+        constexpr auto fallbacks = [] {
+            std::array<unsigned char, std::size(handlers)> ids{};
+            std::size_t count = 0;
+            for (const auto& h : handlers)
+                if (h.auto_detect) ids[count++] = h.ids[0];
+            return std::pair{ids, count};
+        }();
+
+        bool matches(std::wstring_view hint, std::wstring_view name) noexcept {
+            if (hint.size() != name.size()) return false;
+            for (std::size_t i = 0; i < name.size(); ++i) {
+                const auto c = hint[i];
+                if ((c >= L'A' && c <= L'Z' ? c + (L'a' - L'A') : c) != name[i]) return false;
+            }
+            return true;
+        }
+    }
+
+    ExtractionFormats extraction_formats_for_hint(std::wstring_view hint) noexcept
+    {
+        if (!hint.empty() && hint.front() == L'.') hint.remove_prefix(1);
+        if (!hint.empty()) {
+            for (const auto& handler : handlers) {
+                const ExtractionFormats formats{handler.ids, handler.ids[1] ? 2u : 1u, handler.encrypted_headers};
+                if (matches(hint, handler.name)) return formats;
+                for (auto alias : handler.aliases) {
+                    if (alias.empty()) break;
+                    if (matches(hint, alias)) return formats;
+                }
+            }
+        }
+        return {fallbacks.first.data(), fallbacks.second, false};
     }
 
     std::wstring canonical_archive_type_for_guid(const GUID &format)
     {
-        switch (format.Data4[5])
-        {
-        case 0x01: return L"zip";
-        case 0x02: return L"bzip2";
-        case 0x03: return L"rar4";
-        case 0x07: return L"7z";
-        case 0x0C: return L"xz";
-        case 0x0E: return L"zstd";
-        case 0x0F:
-        case 0xEF: return L"gzip";
-        case 0xCC: return L"rar5";
-        case 0xEE: return L"tar";
-        case kLz4FormatId: return L"lz4";
-        case kEncFormatId: return L"enc";
-        default: return L"";
-        }
+        const auto id = format.Data4[5];
+        if (id == 0x0F) return L"gzip"; // Legacy GZip handler identifier.
+        for (const auto& handler : handlers)
+            if (handler.ids[0] == id) return std::wstring(handler.name);
+        return {};
     }
 
 #endif

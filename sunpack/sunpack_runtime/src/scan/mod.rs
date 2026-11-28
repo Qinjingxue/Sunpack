@@ -7,6 +7,7 @@ pub(crate) mod nested_authorization;
 pub(crate) mod path_filter;
 pub(crate) mod pe_overlay;
 pub(crate) mod scope;
+pub(crate) mod root;
 pub(crate) mod worker_event;
 pub(crate) mod worker_wire;
 

@@ -55,9 +55,19 @@ bool check_extraction_handler_selection_is_read_free() {
     // The selector accepts only the already-analyzed hint, so no input path
     // can be opened. Generic RAR maps to the fixed order (RAR5, then RAR4).
     const auto formats = extraction_formats_for_hint(L"rar");
-    return formats.encrypted_headers && formats.handlers.size() == 2 &&
-        formats.handlers[0].Data4[5] == 0xCC &&
-        formats.handlers[1].Data4[5] == 0x03;
+    const auto fallback = extraction_formats_for_hint(L"unrecognized");
+    const auto enc = extraction_formats_for_hint(L".ENC");
+    const auto alias = extraction_formats_for_hint(L".TbZ2");
+    for (std::size_t i = 0; i < fallback.count; ++i) {
+        if (fallback.ids[i] == enc.ids[0]) return false;
+        const auto name = sunpack::sevenzip::canonical_archive_type_for_guid(fallback[i]);
+        if (name.empty() || extraction_formats_for_hint(name).ids[0] != fallback.ids[i]) return false;
+    }
+    return formats.encrypted_headers && formats.count == 2 &&
+        fallback.count > 2 && fallback.ids[0] == 0x07 && enc.count == 1 &&
+        alias.count == 1 && sunpack::sevenzip::canonical_archive_type_for_guid(alias[0]) == L"bzip2" &&
+        formats[0].Data4[5] == 0xCC &&
+        formats[1].Data4[5] == 0x03;
 }
 
 bool check_wrong_password_evidence() {
@@ -223,7 +233,7 @@ bool check_rar5_short_keyed_member_password_proof() {
         CMyComPtr<IInArchive> handler;
         CMyComPtr<IArchiveOpenCallback> callback(new OpenCallback(candidates[1]));
         const auto formats = extraction_formats_for_hint(L"rar5");
-        if (!input.opened || create_in_archive(formats.handlers.front(), &handler) != S_OK ||
+        if (!input.opened || create_in_archive(formats[0], &handler) != S_OK ||
             handler->Open(input.stream, nullptr, callback) != S_OK)
             return false;
         CMyComPtr<IArchiveGetRawProps> raw;
@@ -330,7 +340,7 @@ bool check_rar5_encrypted_comment_password_fallback() {
         CMyComPtr<IArchiveOpenCallback> callback(new OpenCallback(keys[1]));
         const auto formats = extraction_formats_for_hint(L"rar5");
         UInt32 items = 0;
-        if (!input.opened || create_in_archive(formats.handlers.front(), &handler) != S_OK ||
+        if (!input.opened || create_in_archive(formats[0], &handler) != S_OK ||
             handler->Open(input.stream, nullptr, callback) != S_OK ||
             handler->GetNumberOfItems(&items) != S_OK || items != 0)
             return false;

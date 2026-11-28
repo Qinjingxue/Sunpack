@@ -1811,7 +1811,7 @@ fn scheduler_configuration_changed(previous: &Config, next: &Config) -> bool {
 fn watch_scan_options(config: &Config, has_roots: bool) -> io::Result<Option<NativeDirectoryScanOptions>> {
     if has_roots {
         // Main compiles ordinary rules even when every configured root is deep.
-        crate::pipeline::scan_options(config).map(Some)
+        crate::pipeline::scan_options(config, false).map(Some)
     } else {
         Ok(None)
     }
@@ -2661,8 +2661,7 @@ impl Scheduler {
         ));
         // With no scheduler roots main never compiles scan rules. Reconcile
         // the root policy before activating its scan options below.
-        let deep_options =
-            NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new())?;
+        let deep_options = crate::pipeline::scan_options(&snapshot.config, true)?;
         let passwords = BuiltinStore::shared(&cwd)?;
         let config_observers = Self::observe_config(&cwd, &snapshot, &root_file, passwords.path(), &hub)?;
         let control = journal.state().runtime_record("watch_control");
@@ -2679,7 +2678,7 @@ impl Scheduler {
             Self::persist_watch_control(&journal, enabled, &baseline_roots)?;
         }
         hub.enabled.store(enabled, Ordering::Release);
-        let dedup = Arc::new(Mutex::new(dedup::Index::open(&dir, snapshot.config.watch.deduplication, snapshot.config.watch.deduplication_scope)?));
+        let dedup = Arc::new(Mutex::new(dedup::Index::open(&dir, snapshot.config.watch.deduplication, snapshot.config.watch.deduplication_scope, snapshot.config.filesystem.read_views.clone())?));
         let mut scheduler = Self {
             resuming: false,
             baseline_roots,
@@ -3172,7 +3171,8 @@ impl Scheduler {
             || self.settings.cli.language != snapshot.config.cli.language;
         let process_mode_changed = self.settings.runtime.process_mode != snapshot.config.runtime.process_mode;
         let dedup_changed = self.settings.watch.deduplication != snapshot.config.watch.deduplication
-            || self.settings.watch.deduplication_scope != snapshot.config.watch.deduplication_scope;
+            || self.settings.watch.deduplication_scope != snapshot.config.watch.deduplication_scope
+            || self.settings.filesystem.read_views != snapshot.config.filesystem.read_views;
         let mut observed_paths = config::watch_paths(&self.cwd, &snapshot.sources);
         observed_paths.push(self.root_file.clone());
         let observers_changed = !observes_files(&observed_paths, self.passwords.path(), &self.config_observers);
@@ -3207,7 +3207,7 @@ impl Scheduler {
             }
             if dedup_changed {
                 self.dedup_rebuild.take();
-                self.dedup.lock().unwrap().reset(self.settings.watch.deduplication, self.settings.watch.deduplication_scope)?;
+                self.dedup.lock().unwrap().reset(self.settings.watch.deduplication, self.settings.watch.deduplication_scope, self.settings.filesystem.read_views.clone())?;
             }
             // A no-op reload can retry an abandoned rebuild, but a running
             // baseline and a ready index already have their journal stamps.
@@ -3236,7 +3236,7 @@ impl Scheduler {
                 self.journal.set_retention(self.settings.watch.event_log_retention_days);
                 if dedup_changed {
                     self.dedup_rebuild.take();
-                    self.dedup.lock().unwrap().reset(self.settings.watch.deduplication, self.settings.watch.deduplication_scope)?;
+                    self.dedup.lock().unwrap().reset(self.settings.watch.deduplication, self.settings.watch.deduplication_scope, self.settings.filesystem.read_views.clone())?;
                     self.rebuild_dedup(false, true)?;
                 }
                 let (latest_roots_changed, latest_policy_changed) = self.reconcile_roots(false)?;
@@ -3624,6 +3624,7 @@ impl Scheduler {
 
 impl Scheduler {
     fn activate_scan_options(&mut self) -> io::Result<()> {
+        self.deep_options = crate::pipeline::scan_options(&self.settings, true)?;
         self.options = None;
         match watch_scan_options(&self.settings, !self.roots.is_empty()) {
             Ok(options) => { self.options = options; Ok(()) }

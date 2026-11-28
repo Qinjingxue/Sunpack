@@ -286,9 +286,10 @@ impl CandidateSet {
         use crate::io::archive_state::{InputExtent, InputPart};
         let mut input = ArchiveInput::file(anchor.path.clone(), "rar".into(), String::new());
         let offset = anchor.structure_offset.unwrap_or(0);
-        if offset != 0 || anchor.carrier_limit.is_some() {
+        if offset != 0 || anchor.carrier_limit.is_some() || anchor.view.is_some() {
             input.mode = OpenMode::FileRange;
             input.parts = vec![InputPart::range(InputExtent {
+                view: anchor.view.clone(),
                 path: anchor.path.clone(),
                 start: offset,
                 end: anchor.carrier_limit,
@@ -324,9 +325,9 @@ impl CandidateSet {
         let (out, matched) =
             crate::analysis_native::volume_anchor::resolve_encrypted_relation_anchor(
                 anchor,
-                session.reader(),
+                &session.reader().clone().with_view(anchor.view.as_ref())?,
                 passwords,
-                offset != 0 || anchor.carrier_limit.is_some(),
+                anchor.view.is_some() || offset != 0 || anchor.carrier_limit.is_some(),
                 key.as_ref(),
             )?;
         Ok((out, matched.map(|index| passwords[index].clone())))
@@ -372,14 +373,12 @@ impl CandidateSet {
                 return Ok(Ok(PasswordPlan::verified(password.clone())));
             }
         }
-        if matches!(
-            input.format_hint.as_str(),
-            "tar" | "gzip" | "bzip2" | "xz" | "zstd" | "lz4"
-        ) {
+        let stream = crate::formats::StreamFormat::from_name(&input.format_hint);
+        if stream.is_some_and(|format| !format.can_require_password()) {
             return Ok(Ok(PasswordPlan::clear()));
         }
-        let single_enc_can_defer = mode == Mode::Extract && input.format_hint == "enc" && input.volume_attempts.is_none();
-        let needs_password = input.analysis.password_required || input.format_hint == "enc";
+        let single_enc_can_defer = mode == Mode::Extract && stream.is_some_and(|format| format.can_require_password()) && input.volume_attempts.is_none();
+        let needs_password = input.analysis.password_required || stream.is_some_and(|format| format.can_require_password());
         let scope = ScopedCandidates::new(self.scope_buckets(&input.entry_path));
         // Discovery already identifies inputs that require a password. For the
         // rest, an empty candidate can be confirmed by the ordinary worker

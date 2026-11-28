@@ -176,7 +176,7 @@ fn hard_death_replays_delete_receipt_without_reissuing_wal_or_deleting_replaceme
         let observer = WatchObserver {
             deep: false, dedup_enabled: false,
             dedup: Arc::new(Mutex::new(dedup::Index::open(&base.join("state"),
-                config::WatchDeduplication::None, config::WatchDeduplicationScope::Root).unwrap())),
+                config::WatchDeduplication::None, config::WatchDeduplicationScope::Root, Default::default()).unwrap())),
             dedup_scope: NativeDiscoveryScope::new(base.to_string_lossy().into_owned(), None, Vec::new()),
             catalog, journal: Arc::clone(&journal), owners: HashMap::from([(key(&source), path.into())]),
             outputs: Mutex::new(ObservedOutputs::from(BTreeMap::new())),
@@ -296,7 +296,7 @@ fn claimed_release_reobserves_cancelled_replacement_and_remembers_late_sibling()
         let settings = Arc::new(Config::default());
             let mut scheduler = Scheduler {
                 dedup_rebuild: None, dedup_job_id: 0,
-                dedup: Arc::new(Mutex::new(dedup::Index::open(&base.join("state"), crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root).unwrap())),
+                dedup: Arc::new(Mutex::new(dedup::Index::open(&base.join("state"), crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root, Default::default()).unwrap())),
                 resuming: false, baseline_roots: HashSet::new(),
                 candidate_diagnostics: CandidateDiagnostics::default(),
                 root_scope_records: HashMap::new(),
@@ -360,7 +360,7 @@ fn claimed_release_reobserves_cancelled_replacement_and_remembers_late_sibling()
                 (key(path), capture_file_generation(path).unwrap())).collect();
             let observer = WatchObserver {
                 dedup_enabled: false,
-                dedup: Arc::new(Mutex::new(dedup::Index::open(&base.join("state"), crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root).unwrap())),
+                dedup: Arc::new(Mutex::new(dedup::Index::open(&base.join("state"), crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root, Default::default()).unwrap())),
                 dedup_scope: NativeDiscoveryScope::new(base.join("state").to_string_lossy().into_owned(), None, Vec::new()),
                 catalog: Arc::clone(&scheduler.catalog),
                 deep: false, journal: Arc::clone(&scheduler.journal),

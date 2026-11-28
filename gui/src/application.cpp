@@ -51,7 +51,7 @@ bool copy_text(HWND owner,const std::wstring& text) {
     if(!copied) GlobalFree(memory);
     return copied;
 }
-bool rule_editor(std::string_view editor) { return editor=="rule_list"; }
+bool rule_editor(std::string_view editor) { return editor=="rule_list" || editor=="view_list"; }
 void update_tags(TagCollection& tags,const std::string& id,const std::string& original,const Json& drafts) {
     auto draft=drafts.find(id);
     tags.SetItems(draft==drafts.end()?original:(*draft)["text"].get_ref<const std::string&>());

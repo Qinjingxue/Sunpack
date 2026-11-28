@@ -255,6 +255,7 @@ fn projected_directory_conflict_survives_later_usable_entry_without_a_shared_anc
         bad_name[30] = b'q';
         let name_path = crate::test_support::temp_file("zip_local_name_conflict", &bad_name);
         sources.push(InputExtent {
+            view: None,
             path: name_path.to_string_lossy().into_owned(), start: 0, end: Some(bad_name.len() as u64),
         });
         let plan_mut = Arc::make_mut(&mut plan);
@@ -558,7 +559,7 @@ pub(super) fn volume_alternatives(head: &[u8], bad: &[u8], good: &[u8])
         crate::test_support::temp_file("zip_framing_good", good),
     ];
     let sources: Vec<_> = paths.iter().zip([head.len(), bad.len(), good.len()]).map(|(path, len)| {
-        InputExtent { path: path.to_string_lossy().into_owned(), start: 0, end: Some(len as u64) }
+        InputExtent { view: None, path: path.to_string_lossy().into_owned(), start: 0, end: Some(len as u64) }
     }).collect();
     let plan = Arc::new(VolumeAttemptPlan {
         sources: sources.clone().into_boxed_slice(),

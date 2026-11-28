@@ -37,7 +37,7 @@ fn queued_relation_probe_does_not_block_same_root_promotion() {
             relation_anchor: None,
         };
         started.send(()).unwrap();
-        populate_relation_anchors_cached(std::slice::from_mut(&mut record), &[], Some(&root_path));
+        populate_relation_anchors_cached(std::slice::from_mut(&mut record), &[], Some(&root_path), Default::default());
         probe_done.send(record.relation_anchor.is_some()).unwrap();
     });
     starting.recv().unwrap();

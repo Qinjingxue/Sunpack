@@ -1,4 +1,18 @@
 fn main() {
+    // The GUI consumes the same method list with the C preprocessor.
+    let registry = "src/io/view/methods.def";
+    println!("cargo:rerun-if-changed={registry}");
+    let methods = std::fs::read_to_string(registry).unwrap();
+    let entries: String = methods.lines().filter(|line| !line.is_empty())
+        .map(|line| {
+            let fields = line.strip_prefix("SUNPACK_VIEW(").and_then(|s| s.strip_suffix(')'))
+                .expect("invalid view method registration");
+            let tag = fields.split(',').nth(1).expect("missing view tag").trim();
+            format!("({fields}, {tag:?})")
+        }).collect();
+    let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    std::fs::write(out.join("read_view_methods.rs"), format!("mapped_methods! {{ {entries} }}")).unwrap();
+
     let root = std::path::Path::new("../third_party/lz4");
     let mut build = cc::Build::new();
     build

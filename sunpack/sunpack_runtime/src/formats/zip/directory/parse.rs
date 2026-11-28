@@ -20,7 +20,7 @@ pub(crate) fn find_eocd_prefer_exact(data: &[u8]) -> Option<EocdInfo> {
     records.find(|record| record.end == data.len()).or(Some(latest))
 }
 
-fn eocd_records(data: &[u8]) -> impl Iterator<Item = EocdInfo> + '_ {
+pub(crate) fn eocd_records(data: &[u8]) -> impl Iterator<Item = EocdInfo> + '_ {
     memchr::memmem::rfind_iter(data, EOCD_SIG).filter_map(move |pos| {
         let fixed_end = pos + 22;
         if fixed_end > data.len() {

@@ -1,7 +1,8 @@
 //! Watch-only live logical-input index. It is a disposable cache, never a success receipt.
 use super::dedup_hash::StreamHash;
 use crate::core::config::{WatchDeduplication, WatchDeduplicationScope};
-use crate::io::archive_state::{ArchiveInput, OpenMode, VolumeCompleteness, VolumeSelection};
+use crate::io::archive_state::{ArchiveInput, OpenMode, VolumeCompleteness};
+use crate::io::view::ConfiguredViews;
 use crate::io::reader::{physical_file_generation_from_metadata, PhysicalFileGeneration};
 use crate::collections::{trim_map, SmallOrderedSet};
 use crate::path_keys::{path_ancestors, path_key};
@@ -17,7 +18,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-struct Identity { volume: u64, file: [u8; 16], start: u64, len: u64 }
+struct Identity {
+    volume: u64, file: [u8; 16], start: u64, len: u64,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    reversed: bool,
+}
 #[derive(Clone, Serialize, Deserialize)]
 struct Source { path: String, generation: PhysicalFileGeneration, mtime: f64, usn: i64 }
 type SourceSnapshot = crate::filesystem::WatchFileSnapshot<PhysicalFileGeneration>;
@@ -85,7 +90,7 @@ impl Record {
             let source_index = self.source_index(range);
             let source = &self.sources[source_index];
             let mut refreshed = None;
-            hash.read(Path::new(&source.path), extent.start, extent.len, |opened| {
+            hash.read(Path::new(&source.path), extent.start, extent.len, extent.reversed, |opened| {
                 if short {
                     // The short read handle itself excludes writers and
                     // renames. Consult the USN journal only on a changed generation.
@@ -132,7 +137,7 @@ impl Record {
 }
 #[derive(Serialize, Deserialize)]
 enum Delta<'a> {
-    Begin(u8, u8),
+    Begin(u8, u8, ConfiguredViews),
     Put(Cow<'a, Record>),
     Remove(Vec<u64>),
     Journals(Vec<(String, String, u64)>),
@@ -267,6 +272,7 @@ impl SizeBucket {
 }
 
 pub(super) struct Index {
+    views: ConfiguredViews,
     path: PathBuf, mode: WatchDeduplication, scope: WatchDeduplicationScope, file: Option<File>, seq: u64,
     epoch: u64, generation: u64, next_id: u64, ready: bool, edits: usize,
     domains: HashMap<Arc<str>, u64>,
@@ -280,8 +286,8 @@ pub(super) struct Index {
     objects: HashMap<(Signature, Arc<[Identity]>), RecordIds>, buffer: Vec<u8>,
 }
 impl Index {
-    pub(super) fn open(folder: &Path, mode: WatchDeduplication, scope: WatchDeduplicationScope) -> io::Result<Self> {
-        let mut index = Self { path: folder.join("dedup.wal.bin"), mode, scope, file: None, seq: 0,
+    pub(super) fn open(folder: &Path, mode: WatchDeduplication, scope: WatchDeduplicationScope, views: ConfiguredViews) -> io::Result<Self> {
+        let mut index = Self { path: folder.join("dedup.wal.bin"), mode, scope, views, file: None, seq: 0,
             epoch: 0, generation: 0, next_id: 1, ready: false, edits: 0, domains: HashMap::new(), next_domain: 1, journals: HashMap::new(), records: HashMap::new(),
             owners: HashMap::new(), paths: BTreeMap::new(), sizes: HashMap::new(),
             hashes: HashMap::new(), objects: HashMap::new(), buffer: Vec::new() };
@@ -294,7 +300,8 @@ impl Index {
                 if seq != index.seq + 1 { return Err(wal::invalid("deduplication WAL gap")); }
                 let delta: Delta = wal::decode(&reader.payload)?;
                 match delta {
-                    Delta::Begin(saved, saved_scope) if !begun && saved == mode_tag(mode) && saved_scope == scope_tag(scope) => begun = true,
+                    Delta::Begin(saved, saved_scope, views) if !begun && saved == mode_tag(mode)
+                        && saved_scope == scope_tag(scope) && views == index.views => begun = true,
                     Delta::Put(record) if begun => { index.insert(record.into_owned()); },
                     Delta::Remove(ids) if begun => { for id in ids { index.remove(id); } },
                     Delta::Journals(stamps) if begun => { index.apply_journals(&stamps); },
@@ -349,8 +356,8 @@ impl Index {
         Ok(())
     }
     /// Drops all memory before deleting the old stream, even when the next mode is none.
-    pub(super) fn reset(&mut self, mode: WatchDeduplication, scope: WatchDeduplicationScope) -> io::Result<()> {
-        self.erase()?; self.mode = mode; self.scope = scope;
+    pub(super) fn reset(&mut self, mode: WatchDeduplication, scope: WatchDeduplicationScope, views: ConfiguredViews) -> io::Result<()> {
+        self.erase()?; self.mode = mode; self.scope = scope; self.views = views;
         if mode != WatchDeduplication::None { self.start()?; }
         Ok(())
     }
@@ -367,7 +374,7 @@ impl Index {
         if let Some(folder) = self.path.parent() { fs::create_dir_all(folder)?; }
         let mut file = File::create(&self.path)?;
         file.write_all(&wal::file_header(Kind::DedupWal))?; self.file = Some(file);
-        self.append(&Delta::Begin(mode_tag(self.mode), scope_tag(self.scope)))
+        self.append(&Delta::Begin(mode_tag(self.mode), scope_tag(self.scope), self.views.clone()))
     }
     fn prepare(&mut self, epoch: u64, mut record: Record, baseline: bool) -> Option<Prepared> {
         // Removing a scope with no resident entries can retire its journal
@@ -564,7 +571,7 @@ impl Index {
         let scopes: HashMap<_, _> = scopes.into_iter().map(|scope| (scope.key(), scope)).collect();
         if scopes.is_empty() {
             if !self.journals.is_empty() || self.records.capacity() != 0 || self.needs_rebuild() {
-                self.reset(self.mode, self.scope)?; self.finish_rebuild()?;
+                self.reset(self.mode, self.scope, self.views.clone())?; self.finish_rebuild()?;
             }
             return Ok(());
         }
@@ -688,7 +695,7 @@ impl Index {
         let mut file = File::create(&temp)?; file.write_all(&wal::file_header(Kind::DedupWal))?;
         let mut seq = 0;
         let mut write = |d: &Delta<'_>| -> io::Result<()> { seq += 1; wal::append_frame(&mut file, &mut self.buffer, seq, |out| rmp_serde::encode::write(out, d).map_err(wal::invalid)) };
-        write(&Delta::Begin(mode_tag(self.mode), scope_tag(self.scope)))?;
+        write(&Delta::Begin(mode_tag(self.mode), scope_tag(self.scope), self.views.clone()))?;
         write(&Delta::Journals(self.journals.iter().map(|(scope, (volume, id))| (scope.clone(), volume.clone(), *id)).collect()))?;
         for r in self.records.values() { write(&Delta::Put(Cow::Borrowed(r)))?; }
         if self.ready { write(&Delta::Ready)?; }
@@ -715,22 +722,20 @@ fn describe(owner: &str, scope: &str, inputs: &[&ArchiveInput]) -> io::Result<Op
     let mut sources: Vec<Source> = Vec::new();
     let mut range_sources = Vec::new();
     let mut physical = HashMap::<String, u32>::new();
-    for original in inputs {
-        if original.analysis.missing_volume_evidence.is_some() { return Ok(None); }
+    for &input in inputs {
+        if input.format_hint.is_empty() || input.analysis.missing_volume_evidence.is_some() { return Ok(None); }
         // A singleton fixed plan has no selection ambiguity. Reuse the canonical
         // materializer (including head trimming); never enumerate alternatives.
         let materialized;
-        let input = if let Some(plan) = original.volume_attempts.as_deref() {
-            if plan.layouts.len() != 1 { return Ok(None); }
-            let layout = &plan.layouts[0];
-            if layout.slots.is_empty() || (layout.minimum_slots != 0 && layout.minimum_slots != layout.slots.len()) { return Ok(None); }
-            let Some(sources) = layout.slots.iter().map(|slot| plan.domains.get(slot.domain).and_then(|d| (d.choices.len() == 1).then(|| d.choices[0]))).collect::<Option<Vec<_>>>() else { return Ok(None); };
-            let mut fixed = (*original).clone();
-            if fixed.select_volumes(&VolumeSelection { layout: 0, sources }).is_err() { return Ok(None); }
-            materialized = fixed; &materialized
-        } else { *original };
-        if input.format_hint.is_empty() || input.volume_attempts.is_some() || matches!(input.analysis.volume_completeness, Some(VolumeCompleteness::Missing | VolumeCompleteness::Unknown)) { return Ok(None); }
-        let mut push = |path: &str, start: u64, end: Option<u64>, whole: bool| -> io::Result<bool> {
+        let parts = if let Some(plan) = &input.volume_attempts {
+            let Some(parts) = plan.sole_parts() else { return Ok(None); };
+            materialized = parts;
+            &materialized
+        } else {
+            if matches!(input.analysis.volume_completeness, Some(VolumeCompleteness::Missing | VolumeCompleteness::Unknown)) { return Ok(None); }
+            &input.parts
+        };
+        let mut push = |path: &str, start: u64, end: Option<u64>, whole: bool, reversed: bool, physical_size: Option<u64>| -> io::Result<bool> {
             // Whole files and carriers with one spelling need no lookup table.
             let (existing, path_id) = match sources.first() {
                 None => (None, None),
@@ -762,29 +767,40 @@ fn describe(owner: &str, scope: &str, inputs: &[&ArchiveInput]) -> io::Result<Op
             let observed = &sources[source as usize];
             let Some((volume, file)) = observed.generation.object_id() else { return Ok(false); };
             let size = observed.generation.len;
+            if physical_size.is_some_and(|expected| expected != size) { return Ok(false); }
             let end = match end { Some(end) => end, None if whole => size, None => return Ok(false) };
             let Some(len) = end.checked_sub(start) else { return Ok(false); };
             if len == 0 || end > size { return Ok(false); }
             // Physical segmentation is not content identity. Adjacent extents
             // of the same opened source can share one read and identity range.
-            if range_sources.last().copied().unwrap_or(0) == source
-                && identities.last().is_some_and(|last: &Identity| last.start + last.len == start) {
+            if !reversed && range_sources.last().copied().unwrap_or(0) == source
+                && identities.last().is_some_and(|last: &Identity| !last.reversed && last.start + last.len == start) {
                 identities.last_mut().unwrap().len += len;
             } else {
                 if source != 0 && range_sources.is_empty() {
                     range_sources.resize(identities.len(), 0);
                 }
                 if !range_sources.is_empty() { range_sources.push(source); }
-                identities.push(Identity { volume, file, start, len });
+                identities.push(Identity { volume, file, start, len, reversed });
             }
             Ok(true)
         };
         if input.mode == OpenMode::File {
-            if !push(&input.entry_path, 0, None, true)? { return Ok(None); }
+            if !push(&input.entry_path, 0, None, true, false, None)? { return Ok(None); }
         } else {
-            if input.parts.is_empty() { return Ok(None); }
-            for p in input.parts.iter() {
-                if !push(&p.extent.path, p.extent.start, p.extent.end, input.mode.structured())? { return Ok(None); }
+            if parts.is_empty() { return Ok(None); }
+            for p in parts.iter() {
+                if let Some(view) = &p.extent.view {
+                    let length = view.len();
+                    let end = p.extent.end.unwrap_or(length);
+                    if end <= p.extent.start || end > length { return Ok(None); }
+                    let mut valid = true;
+                    view.visit(p.extent.start, end, |span| {
+                        valid &= push(&p.extent.path, span.start, Some(span.end), false, span.reverse, Some(view.physical_size))?;
+                        Ok(())
+                    })?;
+                    if !valid { return Ok(None); }
+                } else if !push(&p.extent.path, p.extent.start, p.extent.end, input.mode.structured(), false, None)? { return Ok(None); }
             }
         }
     }

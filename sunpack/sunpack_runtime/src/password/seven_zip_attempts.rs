@@ -5,10 +5,7 @@ pub(crate) fn prepare_seven_zip_volume_input(
     sessions: &[NativeArchiveSession],
 ) -> Result<PasswordContext, PreparedStatus> {
     // A complete invariant prefix does not depend on inaccessible later parts.
-    let mut prefix = crate::password::input::prefix::common_attempt_prefix(head, plan, sessions);
-    if prefix.is_empty() && plan.head_size_from_total.is_none() && plan.tail_totals.is_empty() {
-        prefix.push(head.clone());
-    }
+    let prefix = crate::password::input::prefix::common_attempt_prefix(head, plan, sessions);
     use crate::password::input::parse_range_prefix;
     let invariant_start = if !prefix.is_empty() {
         parse_range_prefix(prefix.iter(), sessions, Some(SEVEN_Z_HEADER_SIZE as u64))

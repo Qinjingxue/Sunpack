@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use crc32fast::hash as crc32;
 use memchr::memmem;
 
-use crate::analysis_native::structure::{compression_stream_evidence, unified_prefilter_mask_from_head, StructuralStreamKind};
+use crate::analysis_native::structure::unified_prefilter_mask_from_head;
 use crate::formats::rar::{rar4_end_volume, rar5_header_len, rar5_main_header, read_vint};
 use crate::io::reader::{capture_file_generation, ManagedReader, PhysicalFileGeneration};
 use crate::io::resource_lifecycle::{IdleRayonPool, NativeReadScope, TrackedFile};
@@ -15,11 +15,7 @@ use crate::scan::compression_stream::StreamReadiness;
 use crate::scan::pe_overlay::{probe_pe_prefix, PeState};
 use std::borrow::Cow;
 
-const SEVEN_ZIP: &[u8] = b"7z\xbc\xaf'\x1c";
-const RAR4: &[u8] = b"Rar!\x1a\x07\x00";
-const RAR5: &[u8] = b"Rar!\x1a\x07\x01\x00";
-const ZIP_LOCAL: &[u8] = b"PK\x03\x04";
-const ZIP_EOCD: &[u8] = b"PK\x05\x06";
+use crate::formats::signatures::{RAR4, RAR5, SEVEN_ZIP, ZIP_EOCD, ZIP_LOCAL};
 const ZIP_SPLIT_MARKER: &[u8] = b"PK\x07\x08";
 const RAR4_MAIN_HEADER_PASSWORD: u16 = 0x0080;
 const CHEAP_FAST_PROBE_THREADS: usize = 8;
@@ -51,9 +47,11 @@ pub(crate) const UNRESOLVED_VOLUME: u32 = 1 << 23;
 pub(crate) const ZIP_AWAITING_TAIL: u32 = 1 << 24;
 // The structure of this standalone input requires bytes beyond the observed end.
 pub(crate) const STANDALONE_TRUNCATED: u32 = 1 << 25;
+pub(crate) const BOUNDED_SOURCE: u32 = 1 << 26;
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct VolumeAnchor {
+    pub(crate) view: Option<Arc<crate::io::view::ReadView>>,
     pub(crate) path: String,
     pub(crate) size: u64,
     pub(crate) format: &'static str,
@@ -106,8 +104,39 @@ impl ZipEocdSearch {
 }
 
 impl VolumeAnchor {
+    pub(crate) fn volume_header_within(&self, end: u64) -> bool {
+        let header = match self.format {
+            "7z" if self.seven_zip_next_header.is_some() => 32,
+            "zip" if self.has_any(ZIP_LOCAL_HEADER) => 30,
+            "zip" if self.zip_directory.is_some() => return self.proven_extent_end().is_some_and(|n| n <= end),
+            _ => return false,
+        };
+        !self.standalone && self.structure_offset.unwrap_or(0).saturating_add(header) <= end
+    }
+
+    pub(crate) fn bounded_prefix(&self, end: u64) -> Option<Self> {
+        if self.standalone || !matches!(self.format, "" | "zip" | "7z")
+            || self.proven_extent_end().is_some() || self.structure_offset.unwrap_or(0) >= end
+            || end >= self.carrier_limit.unwrap_or(self.size).min(self.size) {
+            return None;
+        }
+        let mut prefix = self.clone();
+        prefix.size = end;
+        prefix.zip_eocd_search = None;
+        prefix.flags = prefix.flags & !(ZIP_TAIL_CHECKED | ZIP_CARRIER_CHECKED) | BOUNDED_SOURCE;
+        Some(prefix)
+    }
+    pub(crate) fn open(&self) -> std::io::Result<ManagedReader> { ManagedReader::open(&self.path)?.with_view(self.view.as_ref()) }
     pub(crate) fn has_any(&self, flags: u32) -> bool {
         self.flags & flags != 0
+    }
+
+    pub(crate) fn detection_stream(&self) -> bool {
+        self.standalone && Self::is_stream_format(self.format)
+    }
+
+    pub(crate) fn is_stream_format(format: &str) -> bool {
+        crate::formats::StreamFormat::from_name(format).is_some()
     }
 
     pub(crate) fn standalone_truncated(&self) -> bool {
@@ -130,12 +159,12 @@ impl VolumeAnchor {
         use crate::formats::zip::{read_zip_local_member, EOCD_SEARCH_BYTES};
 
         let suffix = self.zip_eocd_search.as_deref().filter(|suffix| suffix.start != 0)?;
-        if self.structure_offset != Some(0) || !self.has_any(ZIP_LOCAL_HEADER)
+        if self.view.is_some() || self.structure_offset != Some(0) || !self.has_any(ZIP_LOCAL_HEADER)
             || self.has_any(ZIP_CARRIER_CHECKED | ZIP_SPLIT_START)
         {
             return None;
         }
-        let reader = ManagedReader::open(&self.path).ok()?.probe_reader();
+        let reader = self.open().ok()?.probe_reader();
         if reader.physical_generation() != Some(&suffix.generation) {
             return None;
         }
@@ -306,6 +335,7 @@ pub(crate) fn probe_volume_anchor_record_cheap(
     size: u64,
     cell: Option<&CheapAnchorCell>,
     scope: Option<&NativeReadScope>,
+    probe_views: crate::io::view::ViewProbes,
 ) -> CheapAnchor {
     let mut cached = cell.map(|cell| cell.lock().unwrap_or_else(|error| error.into_inner()));
     if let Some(anchor) = cached.as_deref().and_then(Option::as_ref) {
@@ -315,9 +345,21 @@ pub(crate) fn probe_volume_anchor_record_cheap(
     let mut prefix = [0u8; 512];
     let read = scope
         .map_or_else(|| open_cheap_file(path), |scope| scope.open_reader(path))
-        .and_then(|mut file| file.read_exact(&mut prefix[..read_len]));
+        .and_then(|mut file| {
+            file.read_exact(&mut prefix[..read_len])?;
+            Ok(probe_views.rejections(&file, size, &prefix[..read_len]))
+        });
     let anchor = match read {
-        Ok(()) => probe_volume_anchor_from_head(path, size, &prefix[..read_len]),
+        Ok(mask) => {
+            let mut anchor = probe_volume_anchor_from_head(path, size, &prefix[..read_len]);
+            if mask != 0 {
+                match &mut anchor {
+                    CheapAnchor::Negative { reject_mask, .. } => *reject_mask |= mask,
+                    CheapAnchor::Full(full) => Arc::make_mut(full).format_reject_mask |= mask,
+                }
+            }
+            anchor
+        }
         Err(error) => CheapAnchor::from_probe(
             path,
             VolumeAnchor {
@@ -339,7 +381,6 @@ pub(crate) fn probe_volume_anchor_from_head(path: &str, size: u64, head: &[u8]) 
     let result = VolumeAnchor {
         size,
         bytes_read: prefix_len as u64,
-        format_reject_mask: unified_prefilter_mask_from_head(size, prefix),
         ..VolumeAnchor::default()
     };
     let mut reader = None;
@@ -384,6 +425,10 @@ pub(crate) fn probe_volume_anchor_path_cheap(path: &str) -> VolumeAnchor {
             return result;
         }
     };
+    probe_volume_anchor_reader(result, &reader)
+}
+
+pub(crate) fn probe_volume_anchor_reader(mut result: VolumeAnchor, reader: &ManagedReader) -> VolumeAnchor {
     let size = reader.len();
     result.size = size;
     let prefix = match reader.read_at(0, size.min(512) as usize) {
@@ -393,9 +438,13 @@ pub(crate) fn probe_volume_anchor_path_cheap(path: &str) -> VolumeAnchor {
             return result;
         }
     };
+    probe_volume_anchor_prefix(result, reader, &prefix)
+}
+
+pub(crate) fn probe_volume_anchor_prefix(mut result:VolumeAnchor, reader:&ManagedReader, prefix:&[u8]) -> VolumeAnchor {
+    result.size = reader.len();
     result.bytes_read += prefix.len() as u64;
-    result.format_reject_mask = unified_prefilter_mask_from_head(size, &prefix);
-    probe_cheap_prefix(result, &prefix, |offset, len| reader.read_direct_at(offset, len))
+    probe_cheap_prefix(result, prefix, |offset, len| reader.read_direct_at(offset, len))
 }
 
 fn probe_cheap_prefix(
@@ -403,8 +452,10 @@ fn probe_cheap_prefix(
     prefix: &[u8],
     mut read: impl FnMut(u64, usize) -> std::io::Result<Vec<u8>>,
 ) -> VolumeAnchor {
-    let prefix = complete_anchor_prefix(prefix, &mut result, 0, &mut read);
-    let prefix = prefix.as_ref();
+    let full = complete_anchor_prefix(prefix, &mut result, 0, &mut read);
+    let stream = crate::formats::StreamFormat::from_header(&full);
+    result.format_reject_mask = unified_prefilter_mask_from_head(result.size, prefix, stream);
+    let prefix = full.as_ref();
     // Relation is a split-volume recovery layer, not a general archive
     // detector.  The cheap pass only keeps structure that can itself seed
     // a split suspicion, plus the leading stream facts that prevent a
@@ -432,7 +483,7 @@ fn probe_cheap_prefix(
     let pe = probe_pe_prefix(prefix, result.size);
     result.pe_state = pe.state();
     result.pe_image_end = pe.image_end();
-    probe_standalone_stream(prefix, &mut result, read);
+    if let Some(stream) = stream { probe_standalone_stream(stream, prefix, &mut result, read); }
     result
 }
 
@@ -738,7 +789,7 @@ fn probe_zip_reader(
             let mut physical = **directory;
             physical.end += base;
             !matches!(
-                crate::formats::zip::visit_relation_directory(&out.path, physical, |_, _| {}),
+                crate::formats::zip::visit_relation_directory(reader, physical, |_, _| {}),
                 Ok(true)
             )
         })
@@ -895,15 +946,12 @@ fn probe_zip_eocd(
 /// their bucket, so physical first/terminal disks are found before naming.
 pub(crate) fn upgrade_relation_zip_tail(anchor: &VolumeAnchor) -> VolumeAnchor {
     let mut out = anchor.clone();
-    // Most members in a split bucket have no EOCD. Read their bounded
-    // tails directly instead of retaining the adjacent shared cache blocks.
-    let Ok(reader) = ManagedReader::open(&anchor.path).map(|reader| reader.probe_reader()) else {
-        return out;
-    };
+    let Ok(reader) = anchor.open().map(|reader| reader.probe_reader()) else { return out };
+    let size = anchor.size.min(reader.len());
     if anchor.zip_eocd_search.as_ref().is_some_and(|search| {
         reader.physical_generation() == Some(&search.generation)
             && search.unique_offset.is_some_and(|offset| {
-                offset < reader.len().saturating_sub(crate::formats::zip::EOCD_SEARCH_BYTES)
+                offset < size.saturating_sub(crate::formats::zip::EOCD_SEARCH_BYTES)
             })
     }) {
         // A complete physical scan found only one signature outside this window.
@@ -911,35 +959,41 @@ pub(crate) fn upgrade_relation_zip_tail(anchor: &VolumeAnchor) -> VolumeAnchor {
         return out;
     }
     let Ok((tail, start)) =
-        crate::formats::zip::read_eocd_tail(&reader, 0, reader.len(), &[], &mut out.bytes_read)
+        crate::formats::zip::read_eocd_tail(&reader, 0, size, &[], &mut out.bytes_read)
     else {
         return out;
     };
+    apply_relation_zip_tail(&mut out, &reader, &tail, start, size);
+    out
+}
+
+pub(crate) fn apply_relation_zip_tail(out: &mut VolumeAnchor, reader: &ManagedReader,
+    tail: &[u8], start: u64, size: u64) {
     out.flags |= ZIP_TAIL_CHECKED;
     let mut terminal = VolumeAnchor {
-        path: anchor.path.clone(),
-        size: reader.len(),
+        path: out.path.clone(),
+        size,
         ..Default::default()
     };
-    if !probe_zip_reader(&[], &tail, start, &mut terminal, &reader, 0) {
+    if !probe_zip_reader(&[], tail, start, &mut terminal, reader, 0) {
         // A failed directory probe is insufficient. Skip a suffix only when
         // there is no possible fixed record starting anywhere in its bytes.
-        if anchor.has_any(ZIP_LOCAL_HEADER)
-            && tail.len() as u64 == reader.len() - start
+        if out.has_any(ZIP_LOCAL_HEADER)
+            && tail.len() as u64 == size - start
             && memmem::find(
                 &tail[..tail.len().saturating_sub(22 - ZIP_EOCD.len())],
                 ZIP_EOCD,
             ).is_none()
         {
             out.zip_eocd_search = reader.physical_generation()
-                .filter(|generation| generation.len == anchor.size)
+                .filter(|generation| generation.len == out.size)
                 .map(|generation| Arc::new(ZipEocdSearch {
                     generation: generation.clone(),
                     start,
                     unique_offset: None,
                 }));
         }
-        return out;
+        return;
     }
     out.format = terminal.format;
     out.strong = terminal.strong;
@@ -955,7 +1009,7 @@ pub(crate) fn upgrade_relation_zip_tail(anchor: &VolumeAnchor) -> VolumeAnchor {
     if out.has_any(ZIP_SPLIT_END) {
         out.multivolume = true;
         out.flags &= !FIRST;
-    } else if anchor.has_any(ZIP_LOCAL_HEADER)
+    } else if out.has_any(ZIP_LOCAL_HEADER)
         && out.has_any(TERMINAL)
     {
         out.standalone = true;
@@ -963,7 +1017,6 @@ pub(crate) fn upgrade_relation_zip_tail(anchor: &VolumeAnchor) -> VolumeAnchor {
         out.flags &= !ZIP_TAIL_WITHOUT_HEAD;
     }
     out.discard_zip_continuation_head();
-    out
 }
 
 /// Only a known ZIP bucket without a terminal enters this fallback. Scan its
@@ -977,9 +1030,10 @@ pub(crate) fn upgrade_relation_zip_carrier_tail(
     if out.has_any(ZIP_CARRIER_CHECKED) {
         return out;
     }
-    let Ok(reader) = ManagedReader::open(&out.path).map(|r| r.probe_reader()) else {
+    let Ok(reader) = out.open().map(|r| r.probe_reader()) else {
         return out;
     };
+    let size = anchor.size.min(reader.len());
     // The managed reader already checks a fresh handle for this path.
     let checked_suffix = out.zip_eocd_search.take().filter(|search| {
         reader.physical_generation() == Some(&search.generation)
@@ -990,7 +1044,7 @@ pub(crate) fn upgrade_relation_zip_carrier_tail(
         checked_suffix.as_ref().and_then(|search| search.unique_offset)
     });
     // Keep enough overlap to find a signature straddling the checked suffix.
-    let mut end = checked_suffix.as_ref().map_or(reader.len(), |suffix| {
+    let mut end = checked_suffix.as_ref().map_or(size, |suffix| {
         if suffix.start == 0 { 0 } else { suffix.start + ZIP_EOCD.len() as u64 - 1 }
     });
     if let Some(offset) = unique_eocd {
@@ -1009,7 +1063,7 @@ pub(crate) fn upgrade_relation_zip_carrier_tail(
         out.bytes_read += window.len() as u64;
         for at in memmem::rfind_iter(&window, ZIP_EOCD) {
             let offset = start + at as u64;
-            if reader.len() - offset < 22 {
+            if size - offset < 22 {
                 continue;
             }
             possible_eocd = true;
@@ -1028,7 +1082,7 @@ pub(crate) fn upgrade_relation_zip_carrier_tail(
             let len = 22 + usize::from(comment);
             if offset
                 .checked_add(len as u64)
-                .is_none_or(|stop| stop > reader.len())
+                .is_none_or(|stop| stop > size)
             {
                 continue;
             }
@@ -1043,7 +1097,7 @@ pub(crate) fn upgrade_relation_zip_carrier_tail(
             };
             let mut candidate = VolumeAnchor {
                 path: out.path.clone(),
-                size: reader.len(),
+                size,
                 ..Default::default()
             };
             if !probe_zip_reader(&[], tail, offset, &mut candidate, &reader, 0)
@@ -1055,7 +1109,7 @@ pub(crate) fn upgrade_relation_zip_carrier_tail(
                 continue;
             };
             if !matches!(
-                crate::formats::zip::visit_relation_directory(&out.path, **directory, |_, _| {}),
+                crate::formats::zip::visit_relation_directory(&reader, **directory, |_, _| {}),
                 Ok(true)
             ) {
                 continue;
@@ -1064,8 +1118,8 @@ pub(crate) fn upgrade_relation_zip_carrier_tail(
             // ordinary tail window. Carry the same append evidence as Deep;
             // do not make that directory a successful bounded delivery.
             let after = offset + len as u64;
-            if candidate.has_any(ZIP_SINGLE_DISK) && reader.len().saturating_sub(after) >= 10 {
-                let Ok(next) = reader.read_cached_at(after, 30) else { return out };
+            if candidate.has_any(ZIP_SINGLE_DISK) && size.saturating_sub(after) >= 10 {
+                let Ok(next) = reader.read_cached_at(after, 30.min((size - after) as usize)) else { return out };
                 candidate.bytes_read += next.len() as u64;
                 if crate::formats::zip::zip_continuation_prefix(&next) {
                     candidate.flags |= ZIP_AWAITING_TAIL;
@@ -1167,7 +1221,7 @@ pub(crate) fn upgrade_relation_rar_end(anchor: &VolumeAnchor) -> VolumeAnchor {
     if anchor.encrypted || anchor.relation_has_next.is_some() || anchor.has_any(RAR_END_CHECKED) {
         return anchor.clone();
     }
-    let Ok(reader) = ManagedReader::open(&anchor.path) else {
+    let Ok(reader) = anchor.open() else {
         return anchor.clone();
     };
     upgrade_relation_rar_end_reader(anchor, &reader).unwrap_or_else(|_| anchor.clone())
@@ -1416,7 +1470,9 @@ fn probe_anchor_reader_prefix(
         return Ok(true);
     }
     if format.is_empty() && offset == 0 {
-        probe_standalone_stream(prefix, result, |offset, len| reader.read_direct_at(offset, len));
+        if let Some(stream) = crate::formats::StreamFormat::from_header(prefix) {
+            probe_standalone_stream(stream, prefix, result, |offset, len| reader.read_direct_at(offset, len));
+        }
         if !result.format.is_empty() {
             return Ok(true);
         }
@@ -1437,43 +1493,22 @@ fn probe_anchor_reader_prefix(
 }
 
 fn probe_standalone_stream(
+    kind: crate::formats::StreamFormat,
     prefix: &[u8],
     out: &mut VolumeAnchor,
     mut read: impl FnMut(u64, usize) -> std::io::Result<Vec<u8>>,
 ) {
     // Confirm the prefix before ruling this file out as a possible volume.
     // Continuation bytes can coincide with a leading stream signature.
-    let format = if prefix.starts_with(sunpack_enc::MAGIC) {
-        sunpack_enc::Header::parse(prefix, out.size).is_ok().then_some("enc")
-    } else if crate::formats::lz4::leading(prefix) {
-        crate::formats::lz4::standalone_truncated(prefix, out.size, |offset, count| {
-            let bytes = read(offset, count)?;
-            out.bytes_read += bytes.len() as u64;
-            Ok(bytes)
-        }).map(|truncated| {
-            if truncated {
-                out.flags |= STANDALONE_TRUNCATED;
-            }
-            "lz4"
-        })
-    } else if let Some(kind) = StructuralStreamKind::from_header(prefix) {
-        compression_stream_evidence(kind, prefix, out.size, |offset, count| {
-            let bytes = read(offset, count)?;
-            out.bytes_read += bytes.len() as u64;
-            Ok(bytes)
-        }).map(|readiness| {
-            if matches!(readiness, StreamReadiness::Truncated) {
-                out.flags |= STANDALONE_TRUNCATED;
-            }
-            kind.format()
-        })
-    } else if prefix.get(257..262) == Some(b"ustar") {
-        crate::formats::tar::header_identity(prefix, out.size).then_some("tar")
-    } else {
-        None
-    };
-    let Some(format) = format else { return; };
-    out.format = format;
+    let Some(readiness) = kind.root_readiness(prefix, out.size, |offset, count| {
+        let bytes = read(offset, count)?;
+        out.bytes_read += bytes.len() as u64;
+        Ok(bytes)
+    }) else { return; };
+    if matches!(readiness, StreamReadiness::Truncated) {
+        out.flags |= STANDALONE_TRUNCATED;
+    }
+    out.format = kind.name();
     out.strong = true;
     out.standalone = true;
     out.flags |= FIRST;

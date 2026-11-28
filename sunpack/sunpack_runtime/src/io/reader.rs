@@ -137,6 +137,7 @@ impl Deref for CachedBytes {
 }
 
 pub(crate) trait ByteSource: Send + Sync {
+    fn read_view(&self) -> Option<&Arc<super::view::ReadView>> { None }
     fn len(&self) -> u64;
     fn hint_probe_window(&self, _offset: u64) {}
     fn validate_cached_range(&self, _offset: u64, _len: usize) -> io::Result<()> {
@@ -215,6 +216,12 @@ struct ProbeSource {
 }
 
 impl ByteSource for ProbeSource {
+    fn read_view(&self) -> Option<&Arc<super::view::ReadView>> {
+        self.reader.read_view()
+    }
+    fn physical_generation(&self) -> Option<&PhysicalFileGeneration> {
+        self.reader.physical_generation()
+    }
     fn len(&self) -> u64 {
         self.reader.len()
     }
@@ -345,6 +352,13 @@ struct ReaderInner {
 }
 
 impl ManagedReader {
+    pub(super) fn validate_cached_range(&self, offset: u64, len: usize) -> io::Result<()> {
+        self.source.validate_cached_range(offset, len)
+    }
+    pub(crate) fn read_view(&self) -> Option<&Arc<super::view::ReadView>> { self.source.read_view() }
+    pub(crate) fn with_view(self, view: Option<&Arc<super::view::ReadView>>) -> io::Result<Self> {
+        match view { Some(view) => view.bind(&self), None => Ok(self) }
+    }
     pub(crate) fn new(source: Arc<dyn ByteSource>, config: ReaderConfig) -> Self {
         Self {
             source,
@@ -676,6 +690,11 @@ impl NativeArchiveSession {
     pub(crate) fn new(path: String) -> io::Result<Self> {
         let reader = ManagedReader::open(&path)?;
         Ok(Self { path, reader })
+    }
+
+    pub(crate) fn from_open_file(path: &str, file: TrackedFile) -> io::Result<Self> {
+        let source = manager().adopt_file(Path::new(path), file)?;
+        Ok(Self { path: path.to_owned(), reader: ManagedReader::new(source, ReaderConfig::default()) })
     }
 
     pub(crate) fn reader(&self) -> &ManagedReader {
@@ -1398,7 +1417,10 @@ impl ReaderManager {
     fn open_file(&self, path: &Path) -> io::Result<Arc<FileSource>> {
         // Inspect the handle opened through the current path, never the pooled
         // handle: rename/replacement can leave that handle on the old file.
-        let file = TrackedFile::open_reader(path)?;
+        self.adopt_file(path, TrackedFile::open_reader(path)?)
+    }
+
+    fn adopt_file(&self, path: &Path, file: TrackedFile) -> io::Result<Arc<FileSource>> {
         #[cfg(windows)]
         let canonical = super::resource_lifecycle::resolved_reader_path(&file)
             .unwrap_or_else(|_| path.to_path_buf());
@@ -1782,13 +1804,13 @@ fn read_file_at(file: &File, offset: u64, len: usize) -> io::Result<Vec<u8>> {
 }
 
 #[cfg(unix)]
-fn positional_read(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
+pub(crate) fn positional_read(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
     use std::os::unix::fs::FileExt;
     file.read_at(buffer, offset)
 }
 
 #[cfg(windows)]
-fn positional_read(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
+pub(crate) fn positional_read(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
     use std::os::windows::fs::FileExt;
     file.seek_read(buffer, offset)
 }

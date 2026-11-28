@@ -305,10 +305,10 @@ namespace sunpack::sevenzip
         const auto formats = [&]()
         {
             PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::FormatCandidates);
-            return extraction_formats_for_hint(format_hint).handlers;
+            return extraction_formats_for_hint(format_hint);
         }();
 #else
-        const auto formats = extraction_formats_for_hint(format_hint).handlers;
+        const auto formats = extraction_formats_for_hint(format_hint);
 #endif
         const auto prefetch_config = input_prefetch_config(format_hint, mode == ArchiveOpenMode::NativeVolumes);
 
@@ -318,7 +318,7 @@ namespace sunpack::sevenzip
         const UInt64 start_only = 0;
         const bool bounded_composition = current_extraction_replay && current_extraction_replay->volumes.started;
         OpenedArchiveStream input{};
-        for (std::size_t attempt_index = 0; attempt_index < formats.size() * (bounded_composition ? 1 : 2); ++attempt_index)
+        for (std::size_t attempt_index = 0; attempt_index < formats.count * (bounded_composition ? 1 : 2); ++attempt_index)
         {
             if (cancel_token && cancel_token->load(std::memory_order_acquire)) {
                 result.status = PasswordTestStatus::Error;
@@ -326,8 +326,8 @@ namespace sunpack::sevenzip
                 result.message = "archive extraction cancelled";
                 return result;
             }
-            const GUID &format = formats[attempt_index % formats.size()];
-            const UInt64 *search_limit = attempt_index < formats.size() ? &start_only : nullptr;
+            const GUID &format = formats[attempt_index % formats.count];
+            const UInt64 *search_limit = attempt_index < formats.count ? &start_only : nullptr;
 
             CMyComPtr<IInArchive> archive;
 

@@ -396,8 +396,12 @@ pub struct ArchiveResult {
 
 /// Sparse presentation facts retained while the canonical input is available.
 /// Extraction diagnostics keep their original completeness independently.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct ScanLayout {
+    pub(crate) views: Box<[crate::io::archive_state::ViewReport]>,
+    pub(crate) zip_directory_id: Option<Arc<str>>,
+    pub(crate) head_view: Option<crate::io::archive_state::ViewReport>,
+    pub(crate) distinguish_end: bool,
     pub(crate) range: bool,
     pub(crate) volumes: bool,
 }
@@ -407,14 +411,18 @@ impl ScanLayout {
         use crate::io::archive_state::{AnalysisOrigin, OpenMode};
         let extent = input.physical_extents().next();
         Self {
+            views: input.view_tags().into(),
+            zip_directory_id: input.analysis.zip_directory_id.clone(),
+            head_view: extent.and_then(|e| e.view.as_deref()).map(Into::into),
+            distinguish_end: input.analysis.distinguish_end,
             range: extent.is_some_and(|extent| extent.start != 0
-                || input.mode == OpenMode::FileRange
-                || extent.end.is_some() && input.analysis.origin == AnalysisOrigin::Embedded),
+                || if let Some(view)=&extent.view { extent.end.is_some_and(|end|end < view.len()) }
+                else {input.mode == OpenMode::FileRange || extent.end.is_some() && input.analysis.origin == AnalysisOrigin::Embedded}),
             volumes: !input.volume_style.is_empty() || input.mode.structured(),
         }
     }
 
-    pub(crate) fn volumes(self, result: &ArchiveResult) -> (bool, Option<&'static str>) {
+    pub(crate) fn volumes(&self, result: &ArchiveResult) -> (bool, Option<&'static str>) {
         let completeness = result.volume_completeness;
         let missing = completeness == Some(VolumeCompleteness::Missing);
         if result.volume_attempts.is_some() {

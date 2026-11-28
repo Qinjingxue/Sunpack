@@ -141,10 +141,7 @@ fn prepare_zip_attempt_anchor(
     plan: &VolumeAttemptPlan,
     sessions: &[NativeArchiveSession],
 ) -> Option<ZipAnchor> {
-    let mut prefix = super::input::prefix::common_attempt_prefix(head, plan, sessions);
-    if prefix.is_empty() && plan.head_size_from_total.is_none() && plan.tail_totals.is_empty() {
-        prefix.push(head.clone());
-    }
+    let prefix = super::input::prefix::common_attempt_prefix(head, plan, sessions);
     if prefix.is_empty() { return None; }
     let ranges = available_range_prefix(prefix.iter(), sessions);
     let mut reader = VirtualRangeReader::streaming(&ranges);

@@ -42,9 +42,10 @@ fn zip_terminal_absence_preserves_split_headers_and_chunk_edges() {
             2,
             2,
             Some(&generation),
+            None,
         )
         .unwrap();
-        let anchors = scan.relation_anchors();
+        let anchors = scan.relation_anchors("", None);
         assert!(!anchors.is_empty());
         let absent = terminals.iter().all(|offset| data.len() - offset < 22);
         assert_eq!(scan.zip_eocd_absent, absent);
@@ -55,6 +56,54 @@ fn zip_terminal_absence_preserves_split_headers_and_chunk_edges() {
             .all(|a| a.has_any(ZIP_CARRIER_CHECKED) == absent));
         let _ = fs::remove_file(path);
     }
+}
+
+#[test]
+fn streaming_view_stops_at_the_cancelled_chunk() {
+    use crate::io::{cancellation::{Cancellation, is_cancellation}, reader::ByteSource};
+    struct CancelAfterFirstRead(Cancellation);
+    impl ByteSource for CancelAfterFirstRead {
+        fn len(&self) -> u64 { 128 * 1024 }
+        fn read_at(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+            assert_eq!(offset, 0, "view read continued after cancellation");
+            self.0.cancel();
+            Ok(vec![0; len])
+        }
+    }
+    let cancel = Cancellation::new();
+    let reader = ManagedReader::new(Arc::new(CancelAfterFirstRead(cancel.clone())), ReaderConfig::default());
+    let result = cancel.run(|| scan_embedded_archives_native_with_iocp(reader, 64 * 1024, 2, 1, None, None));
+    assert!(result.is_err_and(|err| is_cancellation(&err)));
+}
+
+#[test]
+fn mapped_scans_reload_overlap_before_a_changed_span() {
+    use crate::io::view::{ReadView, Span, ViewMethod};
+
+    let chunk = 64 * 1024;
+    let seam = 3 * chunk;
+    let mut gzip = GzEncoder::new(Vec::new(), Compression::fast());
+    gzip.write_all(b"member crossing a mapped seam").unwrap();
+    let gzip = gzip.finish().unwrap();
+    let mut bytes = vec![b'x'; 6 * chunk];
+    bytes[seam - 1..seam - 1 + gzip.len()].copy_from_slice(&gzip);
+    bytes[seam..seam + chunk].reverse();
+    let size = bytes.len() as u64;
+    let file = ManagedReader::from_bytes(bytes, ReaderConfig::default());
+    let mut shared = 0..0;
+    let mut scan = |depth, spans| {
+        let view = Arc::new(ReadView { method: ViewMethod::Apate, depth, physical_size: size, spans });
+        scan_embedded_archives_native_with_iocp(view.bind(&file).unwrap(), chunk, 2, 1, None, Some(&mut shared)).unwrap()
+    };
+    let span = |start, end, reverse| Span { start, end, reverse };
+    assert!(scan(1, vec![span(0, size, false)]).candidates().is_empty());
+    let result = scan(2, vec![
+        span(0, seam as u64, false), span(seam as u64, (seam + chunk) as u64, true),
+        span((seam + chunk) as u64, size, false),
+    ]);
+    let [member] = result.candidates() else { panic!("expected the restored gzip member") };
+    assert_eq!((member.format, member.offset), ("gzip", (seam - 1) as u64));
+    assert!(!shared.is_empty());
 }
 
 fn stored_hits(hits: &[RawHit]) -> hit_storage::HitStorage {
@@ -368,7 +417,7 @@ fn simd_scan_matches_reference_with_footers_and_carry_boundaries() {
                 {
                     expected
                         .results
-                        .push(RawHit::new(4096 + start as u64, PATTERNS.len() as u8));
+                        .push(RawHit::new(4096 + start as u64, FOOTER_TAG));
                 }
             }
             let mut actual = scan_sample(sample, carry_len, 4096);
@@ -399,7 +448,7 @@ fn simd_scan_matches_reference_with_footers_and_carry_boundaries() {
             {
                 expected
                     .results
-                    .push(RawHit::new(start as u64, PATTERNS.len() as u8));
+                    .push(RawHit::new(start as u64, FOOTER_TAG));
             }
         }
         let mut actual = scan_sample(&dense, 0, 0);
@@ -1011,6 +1060,7 @@ fn validates_supported_stream_headers_in_one_pass() {
         4,
         4,
         None,
+        None,
     )
     .unwrap();
     assert!(scan.raw_hit_count > 2000);
@@ -1032,10 +1082,16 @@ fn validates_zstd_maximum_frame_header_layout() {
 
     let path = temp_file("embedded_zstd_maximum_header", &data);
     let reader = ManagedReader::open(&path).unwrap();
-    let candidate = validate_zstd(&reader, data.len() as u64, 0, &mut Default::default())
+    let candidate = bounded_candidate(&reader, "zstd", 0, data.len() as u64)
         .unwrap()
         .expect("the full 14-byte RFC frame header must be accepted");
     assert_eq!(candidate.end_offset, Some(data.len() as u64));
+    // The shared tag resolves an overlapping prefix by validating actual bytes.
+    let extended = validate_extended_candidate(&reader, reader.len(), 0,
+        &[(b"\x28\xb5", "gzip", "gzip"), (ZSTD, "zstd", "zstd")],
+        &mut std::array::from_fn(|_| Default::default()),
+    ).unwrap().unwrap();
+    assert_eq!((extended.format, extended.end_offset), ("zstd", candidate.end_offset));
     let _ = fs::remove_file(path);
 }
 
@@ -1045,7 +1101,7 @@ fn zstd_last_block_requires_declared_checksum_bytes() {
     let path = temp_file("embedded_zstd_missing_checksum", &data);
     let reader = ManagedReader::open(&path).unwrap();
     assert!(
-        validate_zstd(&reader, data.len() as u64, 0, &mut Default::default())
+        bounded_candidate(&reader, "zstd", 0, data.len() as u64)
             .unwrap()
             .is_none()
     );
@@ -1058,7 +1114,7 @@ fn zstd_zero_length_rle_still_requires_its_content_byte() {
     let path = temp_file("embedded_zstd_empty_rle", &data);
     let reader = ManagedReader::open(&path).unwrap();
     assert!(
-        validate_zstd(&reader, data.len() as u64, 0, &mut Default::default())
+        bounded_candidate(&reader, "zstd", 0, data.len() as u64)
             .unwrap()
             .is_none()
     );

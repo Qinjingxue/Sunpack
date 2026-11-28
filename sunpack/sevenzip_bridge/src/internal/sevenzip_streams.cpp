@@ -20,7 +20,7 @@ namespace sunpack::sevenzip
         };
         if (!input_ranges.empty())
         {
-            return opened_stream(new MultiRangeInStream(input_ranges, trace, prefetch_config, probe_reads));
+            return opened_stream(new MultiRangeInStream(input_ranges, trace, prefetch_config, probe_reads, mode));
         }
         // Rust supplies the ordered volumes and the SFX mode. An executable
         // extension alone says nothing about how the volumes should be read.

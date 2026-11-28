@@ -10,6 +10,7 @@ pub(crate) mod display_wake;
 pub(crate) mod iocp;
 pub(crate) mod read_fault;
 pub(crate) mod reader;
+pub(crate) mod view;
 pub(crate) mod resource_error;
 pub(crate) mod resource_lifecycle;
 pub(crate) mod runtime_binary;

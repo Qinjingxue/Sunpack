@@ -41,7 +41,7 @@ fn compaction_sharing_conflict_keeps_the_index_writable() {
     use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
 
     let dir = Sandbox::new();
-    let mut index = Index::open(&dir.0, WatchDeduplication::FileId, WatchDeduplicationScope::Root).unwrap();
+    let mut index = Index::open(&dir.0, WatchDeduplication::FileId, WatchDeduplicationScope::Root, Default::default()).unwrap();
     let padding = Delta::Journals(vec![("scope".into(), "test-volume".repeat(384), 1)]);
     for _ in 0..1024 {
         index.append(&padding).unwrap();
@@ -67,7 +67,7 @@ fn compaction_sharing_conflict_keeps_the_index_writable() {
     assert!(fs::metadata(&index.path).unwrap().len() >= 4 * 1024 * 1024);
     assert!(!index.path.with_extension("tmp").exists());
     drop(index);
-    let mut index = Index::open(&dir.0, WatchDeduplication::FileId, WatchDeduplicationScope::Root).unwrap();
+    let mut index = Index::open(&dir.0, WatchDeduplication::FileId, WatchDeduplicationScope::Root, Default::default()).unwrap();
     assert!(!index.needs_rebuild());
     assert_eq!(index.journals["scope"], ("test-volume".into(), 2));
     let stamp = Delta::Journals(vec![("scope".into(), "test-volume".into(), 2)]);
@@ -79,9 +79,18 @@ fn compaction_sharing_conflict_keeps_the_index_writable() {
     assert!(index.reconcile_journals(&[("scope".into(), "test-volume".into(), 3)]).unwrap());
     index.finish_rebuild().unwrap();
     drop(index);
-    let reopened = Index::open(&dir.0, WatchDeduplication::FileId, WatchDeduplicationScope::Root).unwrap();
+    let reopened = Index::open(&dir.0, WatchDeduplication::FileId, WatchDeduplicationScope::Root, Default::default()).unwrap();
     assert!(!reopened.needs_rebuild());
     assert_eq!(reopened.journals["scope"], ("test-volume".into(), 3));
+    drop(reopened);
+    let open = |depths: Vec<u32>| Index::open(&dir.0, WatchDeduplication::FileId, WatchDeduplicationScope::Root,
+        crate::io::view::ConfiguredViews::from_methods(true, depths.into_iter().map(|n| (crate::io::view::ViewMethod::Apate, n)).collect())).unwrap();
+    let mut mapped = open(vec![3, 1]);
+    assert!(mapped.needs_rebuild());
+    mapped.finish_rebuild().unwrap();
+    drop(mapped);
+    assert!(!open(vec![1, 3, 1]).needs_rebuild());
+    assert!(open(vec![1]).needs_rebuild());
 }
 
 #[test]
@@ -89,7 +98,7 @@ fn live_identity_alias_lifetime_and_mode_reset() {
     let dir = Sandbox::new(); let first = dir.file("first.zip", b"confirmed archive bytes");
     let mut alias = first.clone(); alias.entry_path = dir.0.join("alias.zip").to_string_lossy().into_owned();
     fs::hard_link(&first.entry_path, &alias.entry_path).unwrap();
-    let mut index = Index::open(&dir.0.join("index"), WatchDeduplication::FileId, WatchDeduplicationScope::Root).unwrap();
+    let mut index = Index::open(&dir.0.join("index"), WatchDeduplication::FileId, WatchDeduplicationScope::Root, Default::default()).unwrap();
     index.reconcile_journals(&[("scope".into(), "test-volume".into(), 1)]).unwrap();
     let writer = OpenOptions::new().write(true).open(&first.entry_path).unwrap();
     assert!(index.prepare_path(&first.entry_path, "scope", &[&first], true).unwrap().is_none());
@@ -105,14 +114,14 @@ fn live_identity_alias_lifetime_and_mode_reset() {
     assert!(!admit(&mut index, &alias, false));
     index.reconcile_scopes(&[]).unwrap();
     assert_eq!(index.records.capacity(), 0); assert!(!index.needs_rebuild());
-    index.reset(WatchDeduplication::None, WatchDeduplicationScope::Root).unwrap();
+    index.reset(WatchDeduplication::None, WatchDeduplicationScope::Root, Default::default()).unwrap();
     assert!(!index.path.exists()); assert_eq!(index.records.capacity(), 0); assert!(index.paths.is_empty());
 }
 #[test]
 fn hash_size_prefilter_concurrent_admission_restart_and_torn_cache() {
     let dir = Sandbox::new(); let first = dir.file("first.zip", b"same confirmed bytes"); let copy = dir.file("copy.zip", b"same confirmed bytes");
     let alias = dir.0.join("hardlink.zip"); fs::hard_link(&first.entry_path, &alias).unwrap();
-    let folder = dir.0.join("index"); let mut index = Index::open(&folder, WatchDeduplication::Hash, WatchDeduplicationScope::Root).unwrap();
+    let folder = dir.0.join("index"); let mut index = Index::open(&folder, WatchDeduplication::Hash, WatchDeduplicationScope::Root, Default::default()).unwrap();
     index.reconcile_journals(&[("scope".into(), "test-volume".into(), 1)]).unwrap();
     let a = index.prepare_path(&first.entry_path, "scope", &[&first], false).unwrap().unwrap();
     let b = index.prepare_path(&copy.entry_path, "scope", &[&copy], false).unwrap().unwrap();
@@ -124,7 +133,7 @@ fn hash_size_prefilter_concurrent_admission_restart_and_torn_cache() {
     let cached = index.prepare_path(&linked.entry_path, "scope", &[&linked], true).unwrap().unwrap();
     assert!(cached.record.digest.is_some(), "same physical generation reuses the hash without reading");
     index.finish_rebuild().unwrap(); drop(index);
-    let mut index = Index::open(&folder, WatchDeduplication::Hash, WatchDeduplicationScope::Root).unwrap(); assert!(!index.needs_rebuild());
+    let mut index = Index::open(&folder, WatchDeduplication::Hash, WatchDeduplicationScope::Root, Default::default()).unwrap(); assert!(!index.needs_rebuild());
     assert!(admit(&mut index, &copy, false));
     index.reconcile_journals(&[("other-scope".into(), "test-volume".into(), 1)]).unwrap();
     // A separately monitored root on the same volume may not be included in
@@ -145,7 +154,7 @@ fn hash_size_prefilter_concurrent_admission_restart_and_torn_cache() {
     assert!(!admit(&mut index, &first, true));
     index.finish_rebuild().unwrap();
     drop(index); OpenOptions::new().append(true).open(folder.join("dedup.wal.bin")).unwrap().write_all(&[1, 2, 3]).unwrap();
-    let index = Index::open(&folder, WatchDeduplication::Hash, WatchDeduplicationScope::Root).unwrap(); assert!(index.needs_rebuild()); assert!(index.records.is_empty());
+    let index = Index::open(&folder, WatchDeduplication::Hash, WatchDeduplicationScope::Root, Default::default()).unwrap(); assert!(index.needs_rebuild()); assert!(index.records.is_empty());
 }
 
 #[test]
@@ -153,7 +162,7 @@ fn hash_admission_rechecks_the_path_after_reading() {
     let dir = Sandbox::new();
     let first = dir.file("first.zip", b"identical archive bytes");
     let copy = dir.file("copy.zip", b"identical archive bytes");
-    let mut index = Index::open(&dir.0.join("index"), WatchDeduplication::Hash, WatchDeduplicationScope::Root).unwrap();
+    let mut index = Index::open(&dir.0.join("index"), WatchDeduplication::Hash, WatchDeduplicationScope::Root, Default::default()).unwrap();
     index.reconcile_journals(&[("scope".into(), "test-volume".into(), 1)]).unwrap();
     assert!(!admit(&mut index, &first, true));
 
@@ -176,7 +185,7 @@ fn scope_retirement_discards_an_admission_already_in_flight() {
     let other = NativeDiscoveryScope::new(
         dir.0.join("other").to_string_lossy().into_owned(), None, vec![],
     );
-    let mut index = Index::open(&dir.0.join("index"), WatchDeduplication::Hash, WatchDeduplicationScope::Root).unwrap();
+    let mut index = Index::open(&dir.0.join("index"), WatchDeduplication::Hash, WatchDeduplicationScope::Root, Default::default()).unwrap();
     index.reconcile_journals(&[
         ("scope".into(), "test-volume".into(), 1),
         (other.key().into(), "test-volume".into(), 1),
@@ -199,7 +208,7 @@ fn lazy_admission_continues_when_a_hashed_representative_disappears() {
     let first = dir.file("first.zip", b"identical bytes");
     let second = dir.file("second.zip", b"identical bytes");
     let arrival = dir.file("arrival.zip", b"identical bytes");
-    let mut index = Index::open(&dir.0.join("index"), WatchDeduplication::Hash, WatchDeduplicationScope::Root).unwrap();
+    let mut index = Index::open(&dir.0.join("index"), WatchDeduplication::Hash, WatchDeduplicationScope::Root, Default::default()).unwrap();
     index.reconcile_journals(&[("scope".into(), "test-volume".into(), 1)]).unwrap();
     assert!(!admit(&mut index, &first, true));
     assert!(!admit(&mut index, &second, true));
@@ -218,7 +227,7 @@ fn stale_bucket_resumes_without_using_an_observation_from_before_unlock() {
     let dir = Sandbox::new();
     let bytes = b"duplicate bytes";
     let arrival = dir.file("arrival.zip", bytes);
-    let mut index = Index::open(&dir.0.join("index"), WatchDeduplication::Hash, WatchDeduplicationScope::Root).unwrap();
+    let mut index = Index::open(&dir.0.join("index"), WatchDeduplication::Hash, WatchDeduplicationScope::Root, Default::default()).unwrap();
     index.reconcile_journals(&[("scope".into(), "test-volume".into(), 1)]).unwrap();
     for n in 0..2 * STALE_BATCH + 1 {
         let peer = dir.file(&format!("peer-{n}.zip"), bytes);
@@ -255,7 +264,7 @@ fn process_exit_recovers_ready_index_but_rebuilds_unpublished_baseline() {
         let root = PathBuf::from(root);
         let first = input(&root, "first.zip");
         let copy = input(&root, "copy.zip");
-        let mut index = Index::open(&root.join("index"), WatchDeduplication::Hash, WatchDeduplicationScope::Root).unwrap();
+        let mut index = Index::open(&root.join("index"), WatchDeduplication::Hash, WatchDeduplicationScope::Root, Default::default()).unwrap();
         index.reconcile_journals(&[("scope".into(), "test-volume".into(), 1)]).unwrap();
         assert!(!admit(&mut index, &first, true));
         let phase = std::env::var(PHASE).unwrap();
@@ -282,7 +291,7 @@ fn process_exit_recovers_ready_index_but_rebuilds_unpublished_baseline() {
             .env(CHILD, &dir.0).env(PHASE, phase).output().unwrap();
         assert_eq!(output.status.code(), Some(73), "{}\n{}",
             String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
-        let mut index = Index::open(&dir.0.join("index"), WatchDeduplication::Hash, WatchDeduplicationScope::Root).unwrap();
+        let mut index = Index::open(&dir.0.join("index"), WatchDeduplication::Hash, WatchDeduplicationScope::Root, Default::default()).unwrap();
         if phase == "ready" {
             assert!(!index.needs_rebuild());
             assert_eq!(index.records.len(), 2);
@@ -321,21 +330,21 @@ fn root_and_global_domains_follow_live_scope_ownership() {
     };
     for mode in [WatchDeduplication::FileId, WatchDeduplication::Hash] {
         let folder = dir.0.join(if mode == WatchDeduplication::Hash { "hash-index" } else { "id-index" });
-        let mut index = Index::open(&folder, mode, WatchDeduplicationScope::Root).unwrap();
+        let mut index = Index::open(&folder, mode, WatchDeduplicationScope::Root, Default::default()).unwrap();
         index.reconcile_journals(&stamps).unwrap();
         assert!(!admit_scope(&mut index, &first, parent_scope.key()));
         assert!(!admit_scope(&mut index, &alias, nested_scope.key()), "same object in another root is independently admitted");
         assert!(!admit_scope(&mut index, &copy, other_scope.key()));
         index.finish_rebuild().unwrap(); drop(index);
         // Identical mode with a different comparison scope must discard its old WAL.
-        let mut index = Index::open(&folder, mode, WatchDeduplicationScope::Global).unwrap();
+        let mut index = Index::open(&folder, mode, WatchDeduplicationScope::Global, Default::default()).unwrap();
         assert!(index.needs_rebuild() && index.records.is_empty());
         index.reconcile_journals(&stamps).unwrap();
         assert!(!admit_scope(&mut index, &first, parent_scope.key()));
         assert!(admit_scope(&mut index, &alias, nested_scope.key()));
         assert_eq!(admit_scope(&mut index, &copy, other_scope.key()), mode == WatchDeduplication::Hash);
         index.finish_rebuild().unwrap(); drop(index);
-        let mut index = Index::open(&folder, mode, WatchDeduplicationScope::Global).unwrap();
+        let mut index = Index::open(&folder, mode, WatchDeduplicationScope::Global, Default::default()).unwrap();
         assert!(!index.needs_rebuild());
         // Removing a nested monitoring root does not remove inputs still covered
         // by its parent. Rebinding preserves IDs, cached hashes and owner state.
@@ -357,7 +366,7 @@ fn root_and_global_domains_follow_live_scope_ownership() {
             assert!(!index.owners.contains_key(path_key(&alias.entry_path).as_str()));
             assert!(index.owners.contains_key(path_key(&copy.entry_path).as_str()));
         }
-        let generation = index.generation(); index.reset(mode, WatchDeduplicationScope::Root).unwrap();
+        let generation = index.generation(); index.reset(mode, WatchDeduplicationScope::Root, Default::default()).unwrap();
         assert!(index.generation() != generation && index.records.is_empty() && index.needs_rebuild());
     }
 }
@@ -366,7 +375,7 @@ fn root_and_global_domains_follow_live_scope_ownership() {
 fn lazy_baseline_exhausts_same_size_candidates_and_hardlinks_need_no_hash() {
     let dir = Sandbox::new();
     let folder = dir.0.join("index");
-    let mut index = Index::open(&folder, WatchDeduplication::Hash, WatchDeduplicationScope::Root).unwrap();
+    let mut index = Index::open(&folder, WatchDeduplication::Hash, WatchDeduplicationScope::Root, Default::default()).unwrap();
     index.reconcile_journals(&[("scope".into(), "test-volume".into(), 1)]).unwrap();
     let inputs: Vec<_> = [b"aaaaaa", b"bbbbbb", b"cccccc"].iter().enumerate()
         .map(|(i, bytes)| dir.file(&format!("base-{i}.zip"), *bytes)).collect();
@@ -377,7 +386,7 @@ fn lazy_baseline_exhausts_same_size_candidates_and_hardlinks_need_no_hash() {
         assert!(matches!(index.advance(prepared).unwrap(), Admission::Finished(false)));
     }
     index.finish_rebuild().unwrap(); drop(index);
-    let mut index = Index::open(&folder, WatchDeduplication::Hash, WatchDeduplicationScope::Root).unwrap();
+    let mut index = Index::open(&folder, WatchDeduplication::Hash, WatchDeduplicationScope::Root, Default::default()).unwrap();
     assert!(!index.needs_rebuild());
     assert!(index.records.values().all(|r| r.digest.is_none()));
     let copy = dir.file("copy-last.zip", b"cccccc");
@@ -400,27 +409,27 @@ fn lazy_baseline_exhausts_same_size_candidates_and_hardlinks_need_no_hash() {
 fn byte_stream_identity_ignores_carrier_and_split_boundaries_but_tracks_every_source() {
     use crate::io::archive_state::{InputExtent, InputPart};
     let dir = Sandbox::new();
-    let mut index = Index::open(&dir.0.join("index"), WatchDeduplication::Hash, WatchDeduplicationScope::Root).unwrap();
+    let mut index = Index::open(&dir.0.join("index"), WatchDeduplication::Hash, WatchDeduplicationScope::Root, Default::default()).unwrap();
     index.reconcile_journals(&[("scope".into(), "test-volume".into(), 1)]).unwrap();
     let whole = dir.file("whole.zip", b"ABCDEF");
     assert!(!admit(&mut index, &whole, true));
     let mut carrier = dir.file("carrier.bin", b"junkABCDEFtail");
     carrier.mode = OpenMode::FileRange;
-    carrier.parts = vec![InputPart::range(InputExtent { path: carrier.entry_path.clone(), start: 4, end: Some(10) })].into();
+    carrier.parts = vec![InputPart::range(InputExtent { view: None, path: carrier.entry_path.clone(), start: 4, end: Some(10) })].into();
     assert!(admit(&mut index, &carrier, false));
     let left = dir.file("part-1", b"ABC"); let right = dir.file("part-2", b"DEF");
     let mut split = left.clone(); split.mode = OpenMode::NativeVolumes;
     split.parts = [left.entry_path.clone(), right.entry_path.clone()].into_iter()
-        .map(|path| InputPart::range(InputExtent { path, start: 0, end: None })).collect::<Vec<_>>().into();
+        .map(|path| InputPart::range(InputExtent { view: None, path, start: 0, end: None })).collect::<Vec<_>>().into();
     assert!(admit(&mut index, &split, false));
     let one = dir.file("other-1", b"A"); let two = dir.file("other-2", b"BCDEF");
     let mut other = one.clone(); other.mode = OpenMode::NativeVolumes;
-    other.parts = [InputExtent { path: one.entry_path.clone(), start: 0, end: Some(1) },
-        InputExtent { path: two.entry_path.clone(), start: 0, end: Some(5) }].into_iter().map(InputPart::range).collect();
+    other.parts = [InputExtent { view: None, path: one.entry_path.clone(), start: 0, end: Some(1) },
+        InputExtent { view: None, path: two.entry_path.clone(), start: 0, end: Some(5) }].into_iter().map(InputPart::range).collect();
     assert!(admit(&mut index, &other, false));
     let mut reversed = right.clone(); reversed.mode = OpenMode::NativeVolumes;
-    reversed.parts = [InputExtent { path: right.entry_path.clone(), start: 0, end: Some(3) },
-        InputExtent { path: left.entry_path.clone(), start: 0, end: Some(3) }].into_iter().map(InputPart::range).collect();
+    reversed.parts = [InputExtent { view: None, path: right.entry_path.clone(), start: 0, end: Some(3) },
+        InputExtent { view: None, path: left.entry_path.clone(), start: 0, end: Some(3) }].into_iter().map(InputPart::range).collect();
     assert!(!admit(&mut index, &reversed, false));
     // Two independent logical inputs are still compared as the requested ordered stream.
     let multi_owner = dir.0.join("group").to_string_lossy().into_owned();
@@ -447,24 +456,24 @@ fn recursion_scope_removes_whole_cross_level_input_and_persists_removal() {
         let dir = Sandbox::new(); fs::create_dir_all(dir.0.join("child")).unwrap();
         let head = dir.file("head", b"ABC"); let tail = dir.file("child/tail", b"DEF");
         let mut input = head.clone(); input.mode = OpenMode::NativeVolumes;
-        input.parts = [InputExtent { path: head.entry_path.clone(), start: 0, end: Some(3) },
-            InputExtent { path: tail.entry_path.clone(), start: 0, end: Some(3) }].into_iter().map(InputPart::range).collect();
+        input.parts = [InputExtent { view: None, path: head.entry_path.clone(), start: 0, end: Some(3) },
+            InputExtent { view: None, path: tail.entry_path.clone(), start: 0, end: Some(3) }].into_iter().map(InputPart::range).collect();
         let recursive = NativeDiscoveryScope::new(dir.0.to_string_lossy().into_owned(), None, vec![]);
         let flat = NativeDiscoveryScope::new(dir.0.to_string_lossy().into_owned(), Some(0), vec![]);
         let folder = dir.0.join("index");
-        let mut index = Index::open(&folder, WatchDeduplication::Hash, scope_mode).unwrap();
+        let mut index = Index::open(&folder, WatchDeduplication::Hash, scope_mode, Default::default()).unwrap();
         index.reconcile_journals(&[(recursive.key().into(), "test-volume".into(), 1)]).unwrap();
         let p = index.prepare_path(&input.entry_path, recursive.key(), &[&input], true).unwrap().unwrap();
         assert!(matches!(index.advance(p).unwrap(), Admission::Finished(false))); index.finish_rebuild().unwrap();
         index.reconcile_scopes(&[flat]).unwrap();
         assert!(index.records.is_empty()); assert!(index.paths.is_empty()); drop(index);
-        let mut index = Index::open(&folder, WatchDeduplication::Hash, scope_mode).unwrap();
+        let mut index = Index::open(&folder, WatchDeduplication::Hash, scope_mode, Default::default()).unwrap();
         assert!(!index.needs_rebuild()); assert!(index.records.is_empty());
         index.reconcile_scopes(&[recursive.clone()]).unwrap();
         let p = index.prepare_path(&input.entry_path, recursive.key(), &[&input], true).unwrap().unwrap();
         assert!(matches!(index.advance(p).unwrap(), Admission::Finished(false))); assert_eq!(index.records.len(), 1);
         index.finish_rebuild().unwrap(); drop(index);
-        let index = Index::open(&folder, WatchDeduplication::Hash, scope_mode).unwrap();
+        let index = Index::open(&folder, WatchDeduplication::Hash, scope_mode, Default::default()).unwrap();
         assert_eq!(index.records.len(), 1); assert!(index.records.values().all(|r| r.digest.is_none()));
     }
 }
@@ -477,7 +486,7 @@ fn lazy_baseline_aliases_share_one_physical_hash() {
         let path = dir.0.join(format!("alias-{number}")); fs::hard_link(&source.entry_path, &path).unwrap();
         aliases.push(ArchiveInput::file(path.to_string_lossy().into_owned(), "zip".into(), "alias".into()));
     }
-    let mut index = Index::open(&dir.0.join("index"), WatchDeduplication::Hash, WatchDeduplicationScope::Root).unwrap();
+    let mut index = Index::open(&dir.0.join("index"), WatchDeduplication::Hash, WatchDeduplicationScope::Root, Default::default()).unwrap();
     index.reconcile_journals(&[("scope".into(), "test-volume".into(), 1)]).unwrap();
     assert!(!admit(&mut index, &source, true));
     for alias in &aliases { assert!(admit(&mut index, alias, true)); }

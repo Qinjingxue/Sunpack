@@ -200,7 +200,7 @@ fn reversed_completions_are_hashed_in_range_order_without_unbounded_reordering()
     use xxhash_rust::xxh3::{xxh3_128, Xxh3};
     let bytes: Vec<u8> = (0..600_037).map(|i| (i * 19 + i / 61) as u8).collect();
     let start = (4u64 << 30) + 37;
-    let mut ordered = OrderedReads::new(start);
+    let mut ordered = OrderedReads::new(start, false);
     let mut hash = Xxh3::new();
     let mut offset = 0;
     while offset < bytes.len() {

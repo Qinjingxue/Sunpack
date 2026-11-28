@@ -35,12 +35,12 @@ fn targeted_zip_carrier_reuses_the_scan_and_preserves_the_peer_archive() {
     );
     let targets = FileTargets::new(vec![(path_str.to_owned(), "archive".into())]);
     let table = NativeCandidateTable::from_directory_with_shared_zip_scan(
-        &raw, &filtered, Some(&targets), false, true,
+        &raw, &filtered, Some(&targets), false, true, false
     );
     let prepared = table.prepared_zip_scan.as_ref().unwrap();
     assert!(prepared.zip_eocd_absent());
     let EmbeddedOutcome::Scan(scan) =
-        scan_embedded_candidate(path_str, false, Some(PeState::None), 1, Some(prepared))
+        scan_embedded_candidate(path_str, false, Some(PeState::None), 1, Some(prepared), ScanRetention::Archives)
     else {
         panic!("the carrier should retain the independent archive");
     };

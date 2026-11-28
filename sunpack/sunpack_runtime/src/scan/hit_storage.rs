@@ -8,7 +8,7 @@
 //! otherwise the directory widens to u64. This is scan-local private storage.
 //! The cost selector includes position checkpoints, type evidence and padding;
 //! GROUP is permitted only when its type masks preserve every original tuple.
-use super::{PackedHit, RawHit, HIT_LOOKBEHIND, HIT_OFFSET_MASK, PATTERNS};
+use super::{PackedHit, RawHit, HIT_LOOKBEHIND, HIT_OFFSET_MASK, PACKED_PATTERNS as PATTERNS};
 use crate::io::scratch::{Blob, Slots, Spool, MEMORY_BYTES};
 use rayon::prelude::*;
 use std::io::{self, Read, Seek, SeekFrom, Write};

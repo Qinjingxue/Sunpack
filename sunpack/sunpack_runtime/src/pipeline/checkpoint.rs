@@ -511,13 +511,19 @@ pub(super) struct CheckpointKey(String);
 
 impl CheckpointKey {
     pub(super) fn for_input(input: &ArchiveInput) -> Self {
-        Self(format!("{}|{}|{}", path_key(&input.entry_path), input.format_hint,
-            input.physical_extents().next().map_or(0, |extent| extent.start)))
+        let extent = input.physical_extents().next();
+        Self(crate::io::archive_state::logical_input_id(
+            &path_key(&input.entry_path), &input.format_hint, extent.map_or(0, |e| e.start),
+            extent.and_then(|e| e.view.as_deref()).map(Into::into).as_ref(),
+            input.analysis.zip_directory_id.as_deref(),
+            extent.filter(|_| input.analysis.distinguish_end).and_then(|e| e.end),
+        ))
     }
 }
 
 fn layout_matches(saved: &ArchiveInput, input: &ArchiveInput) -> bool {
         if saved.mode != input.mode
+            || !saved.analysis.compatible_directory(&input.analysis)
             || saved.format_hint != input.format_hint
         {
             return false;

@@ -1,13 +1,13 @@
 //! Public 7z packed checksums for the candidate projection. Cache physical
 //! segment CRCs only while assembling one plan, including projection replays.
-use super::{AttemptReader, AttemptSource, Cancellation, Topology};
+use super::{AttemptReader, AttemptSource, Cancellation, EvidenceAddress, Topology};
 use crate::io::cancellation::CancellableOnce;
 use crc32fast::Hasher;
 use std::collections::HashMap;
 use std::io;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
-type Segment = (usize, u64, u64);
+type Segment = (EvidenceAddress, u64);
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Digest {
@@ -19,20 +19,19 @@ enum Digest {
 #[derive(Default)]
 pub(crate) struct PackedCrcs {
     digests: Mutex<HashMap<Segment, Arc<CancellableOnce<Digest>>>>,
-    by_start: OnceLock<Box<[(u64, usize)]>>,
 }
 
-impl PackedCrcs {
-    fn edges(&self, graph: &Topology, start: u64) -> &[(u64, usize)] {
-        let sorted = self.by_start.get_or_init(|| {
-            let mut edges: Vec<_> = graph.edges.iter().enumerate()
+impl Topology {
+    fn packed_edges_from(&self, start: u64) -> &[(u64, usize)] {
+        let sorted = self.packed_by_start.get_or_init(|| {
+            let mut edges: Vec<_> = self.edges.iter().enumerate()
                 .filter(|(_, edge)| edge.start < edge.end)
                 .map(|(index, edge)| (edge.start, index))
                 .collect();
             edges.sort_unstable();
             let mut max_end = 0;
             for (end, index) in &mut edges {
-                max_end = max_end.max(graph.edges[*index].end);
+                max_end = max_end.max(self.edges[*index].end);
                 *end = max_end;
             }
             edges.into()
@@ -40,9 +39,12 @@ impl PackedCrcs {
         &sorted[sorted.partition_point(|&(end, _)| end <= start)..]
     }
 
-    fn segment(&self, key: Segment, source: &AttemptSource, cancel: &Cancellation) -> Digest {
+}
+
+impl PackedCrcs {
+    fn segment(&self, key: Segment, source: &AttemptSource, offset: u64, cancel: &Cancellation) -> Digest {
         let slot = Arc::clone(self.digests.lock().unwrap_or_else(|err| err.into_inner()).entry(key).or_default());
-        slot.get_or_init(cancel, || digest_range(source, key.1, key.2, cancel))
+        slot.get_or_init(cancel, || digest_range(source, offset, key.1, cancel))
             .copied().unwrap_or(Digest::Unavailable)
     }
 }
@@ -58,7 +60,7 @@ fn digest_range(source: &AttemptSource, mut offset: u64, mut remaining: u64, can
             return Digest::Unavailable;
         }
         let size = remaining.min(buffer.len() as u64) as usize;
-        match reader.read_direct_into_at(offset, &mut buffer[..size]) {
+        match source.read(reader, offset, &mut buffer[..size]) {
             Ok(0) => return Digest::Truncated,
             Ok(count) => {
                 crc.update(&buffer[..count]);
@@ -85,14 +87,14 @@ impl AttemptReader<'_> {
         let shortest = projection.ends.iter().zip(&graph.ends).filter_map(|(&active, &(_, end, _, _))| {
             active.then_some(end)
         }).min().unwrap_or(end);
-        let mut remaining = cache.edges(graph, start).iter().map(|&(_, index)| index)
+        let mut remaining = graph.packed_edges_from(start).iter().map(|&(_, index)| index)
             .filter(|&index| projection.active[index] && graph.edges[index].end > start).peekable();
         let observe = |index: usize, position, size| {
             let edge = &graph.edges[index];
             if edge.unresolved { return Digest::Unavailable; }
             let source = &self.sources[edge.source];
             let offset = source.start + (position - edge.start);
-            cache.segment((edge.source, offset, size), source, &cancel)
+            cache.segment((source.address(edge.source, offset, size), size), source, offset, &cancel)
         };
         let mut position = start;
         let mut crc = Hasher::new();
@@ -129,9 +131,8 @@ impl AttemptReader<'_> {
                 } else {
                     let source = &self.sources[edge.source];
                     let offset = source.start + (position - edge.start);
-                    *by_location.entry((edge.source, offset)).or_insert_with(|| {
-                        observe(index, position, size)
-                    })
+                    let addr = source.address(edge.source, offset, size);
+                    *by_location.entry(addr).or_insert_with(|| cache.segment((addr, size), source, offset, &cancel))
                 };
                 cancel.check_io()?;
                 let group = *by_digest.entry(digest).or_insert_with(|| {

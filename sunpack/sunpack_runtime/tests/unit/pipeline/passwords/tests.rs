@@ -408,7 +408,7 @@ fn compound_attempts_reuse_exact_layout_and_generation_only() {
     let mut input = ArchiveInput::file(head.to_string_lossy().into_owned(), "rar".into(), "archive".into());
     input.parts = vec![head.clone(), tail.clone()].into_iter().enumerate().map(|(index, path)| InputPart {
         role: if index == 0 { crate::io::archive_state::InputRole::First } else { crate::io::archive_state::InputRole::Member },
-        extent: InputExtent { path: path.to_string_lossy().into_owned(), start: 0, end: Some(4) },
+        extent: InputExtent { view: None, path: path.to_string_lossy().into_owned(), start: 0, end: Some(4) },
         volume_number: Some(index as u32 + 1), canonical_name: format!("part{}.rar", index + 1),
     }).collect();
     let cache = RecentPasswords::default();
@@ -515,6 +515,7 @@ fn full_final_batch_confirms_password_and_prunes_ciphertext_alternative() {
         crate::test_support::temp_file("full_batch_decoy_7z", &corrupt),
         crate::test_support::temp_file("full_batch_tail_7z", &ENCRYPTED_7Z_HEADER[split..])];
     let sources: Box<[_]> = paths.iter().map(|path| InputExtent {
+        view: None,
         path: path.to_string_lossy().into_owned(),
         start: 0,
         end: Some(path.metadata().unwrap().len()),

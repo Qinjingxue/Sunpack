@@ -17,7 +17,24 @@ pub(crate) fn common_attempt_prefix(
     let Ok(head_len) = head_len else {
         return Vec::new();
     };
-    common_prefix_with_head_len(head, plan, head_len)
+    let prefix = common_prefix_with_head_len(head, plan, head_len);
+    if !prefix.is_empty() { return prefix; }
+    // A shared start is still usable up to the shortest first-disk boundary.
+    // Beyond it the bytes may come from a different disk or view.
+    let eof = head.view.as_ref().map_or(head_len, |v| v.len());
+    let declared_end = head.end.unwrap_or(eof).min(eof);
+    let mut end = declared_end;
+    let mut admitted = false;
+    for source in plan.head_sources() {
+        if source.path != head.path || source.start != head.start || source.view != head.view {
+            return prefix;
+        }
+        let source_end = source.end.unwrap_or(eof).min(eof);
+        admitted |= source_end == declared_end;
+        end = end.min(source_end);
+    }
+    if !admitted || end <= head.start { return prefix; }
+    vec![InputExtent { end: Some(end), ..head.clone() }]
 }
 
 fn common_prefix_with_head_len(
@@ -27,13 +44,14 @@ fn common_prefix_with_head_len(
 ) -> Vec<InputExtent> {
     let end = |extent: &InputExtent| {
         if extent.path == head.path {
-            Some(extent.end.unwrap_or(head_file_len).min(head_file_len))
+            let len = extent.view.as_ref().map_or(head_file_len, |v| v.len());
+            Some(extent.end.unwrap_or(len).min(len))
         } else {
             extent.end
         }
     };
     let equal = |left: &InputExtent, right: &InputExtent| {
-        left.path == right.path && left.start == right.start && end(left) == end(right)
+        left.path == right.path && left.view == right.view && left.start == right.start && end(left) == end(right)
     };
     let same_extent = |domain: usize| -> Option<&InputExtent> {
         let choices = &plan.domains.get(domain)?.choices;
@@ -103,10 +121,11 @@ fn common_prefix_with_head_len(
         if end.is_none_or(|end| end < extent.start) {
             break;
         }
-        if !seen.insert((&extent.path, extent.start, end)) {
+        if !seen.insert((&extent.path, extent.view.as_deref(), extent.start, end)) {
             break;
         }
         result.push(InputExtent {
+            view: extent.view.clone(),
             path: extent.path.clone(),
             start: extent.start,
             end,
@@ -126,6 +145,7 @@ mod tests {
             sources: ["head", "middle", "tail", "other"]
                 .into_iter()
                 .map(|path| InputExtent {
+                    view: None,
                     path: path.into(),
                     start: 10,
                     end: Some(110),
@@ -197,6 +217,13 @@ mod tests {
             common_prefix_with_head_len(&plan.sources[0], &plan, 110),
             plan.sources[..3]
         );
+        // A second disk can use the same logical interval in a different view.
+        plan.sources[2] = plan.sources[1].clone();
+        plan.sources[2].view = Some(Arc::new(crate::io::view::ReadView {
+            method: crate::io::view::ViewMethod::Apate, depth: 1, physical_size: 120,
+            spans: vec![crate::io::view::Span { start: 10, end: 120, reverse: true }],
+        }));
+        assert_eq!(common_prefix_with_head_len(&plan.sources[0], &plan, 110), plan.sources[..3]);
     }
     #[test]
     fn missing_disk_stops_before_gap_even_for_early_tail() {

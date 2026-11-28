@@ -263,6 +263,7 @@ fn projected_lzma2_successor_removes_bad_cbc_source_after_prefix_survives() {
     let (mut paths, mut sources, mut plan) = uncertain_tail_fixture_at(&archive[..fixed_start], &[], 112);
     let fixed_path = crate::test_support::temp_file("7z_fixed_tail", &archive[fixed_start..]);
     sources.push(InputExtent {
+        view: None,
         path: fixed_path.to_string_lossy().into_owned(),
         start: 0,
         end: Some((archive.len() - fixed_start) as u64),
@@ -495,7 +496,7 @@ fn uncertain_7z_tails_use_crc_linked_evidence_but_preserve_unknown_paths() {
     // A physical EOF inside the declared extent excludes this choice when
     // another tail supplies the range. An open failure retains its choice.
     Arc::make_mut(&mut plan).sources[3].end = Some((bytes.len() - 48) as u64);
-    let unavailable = InputExtent { path: format!("{}.absent", sources[3].path), ..plan.sources[3].clone() };
+    let unavailable = InputExtent { view: None, path: format!("{}.absent", sources[3].path), ..plan.sources[3].clone() };
     Arc::make_mut(&mut plan).sources = plan.sources.iter().cloned().chain([unavailable.clone()]).collect();
     Arc::make_mut(&mut plan).domains[1].choices = Arc::new(vec![2, 3, 4]);
     let uncertain = prepare_seven_zip_attempts(&sources[0], &plan, &[], None).unwrap_or_else(|_| panic!("retain unsupported paths"));
@@ -548,6 +549,7 @@ fn uncertain_tail_fixture_at(
     let sources: Vec<_> = paths
         .iter()
         .map(|path| InputExtent {
+            view: None,
             path: path.to_string_lossy().into_owned(),
             start: 0,
             end: Some(std::fs::metadata(path).unwrap().len()),
@@ -653,6 +655,12 @@ fn encrypted_header_alternative_ciphertexts_share_candidate_kdf_and_confirm() {
         prepare_seven_zip_attempts(&earlier_head, &plan, &[], None).is_err(),
         "an earlier explicit boundary is a different logical head"
     );
+    earlier_head.view = Some(Arc::new(crate::io::view::ReadView {
+        method: crate::io::view::ViewMethod::Apate, depth: 1, physical_size: 48,
+        spans: vec![crate::io::view::Span { start: 0, end: 48, reverse: true }],
+    }));
+    assert!(prepare_seven_zip_attempts(&earlier_head, &plan, &[], None).is_err(),
+        "an undeclared view must not admit another head at the same offset");
     let context =
         prepare_seven_zip_attempts(&fixed_head, &plan, &[], None).unwrap_or_else(|error| match error {
             PreparedStatus::Status(status, message) => panic!("header tails: {status}: {message}"),
@@ -742,6 +750,7 @@ fn encrypted_header_alternative_ciphertexts_share_candidate_kdf_and_confirm() {
     ] {
         let path = crate::test_support::temp_file(name, data);
         sources.push(InputExtent {
+            view: None,
             path: path.to_string_lossy().into_owned(),
             start: 0,
             end: Some(data.len() as u64),

@@ -360,6 +360,15 @@ void editing(Fixture& f) {
     save_config_field(c,flatten,"\"outer\"","string","inner",false);
     assert(read_json(c)["post_extract"]["flatten_directory_name"]=="inner");
     fails([&]{save_config_field(c,flatten,"\"inner\"","string","unknown",false);});
+    const std::string views="/filesystem/read_views";
+    const auto methods=describe_setting(views,"","en")["viewMethods"];
+    for(const auto& method:methods) {
+        const auto name=method.get<std::string>();
+        validate_setting(views,Json::array({"plain",name+":+02"}));
+        fails([&]{validate_setting(views,Json::array({name+":4294967296"}));});
+    }
+    assert(!methods.empty());
+    fails([&]{validate_setting(views,Json::array({"unknown:1"}));});
     for(auto mode:{"none","file_id","hash"}) validate_setting("/watch/deduplication",Json(mode));
     fails([&]{validate_setting("/watch/deduplication",Json("sha256"));});
     for(auto scope:{"root","global"}) validate_setting("/watch/deduplication_scope",Json(scope));

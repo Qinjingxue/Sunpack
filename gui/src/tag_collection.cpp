@@ -15,7 +15,10 @@ void TagCollection::SetItems(const std::string& source) {
     if(source_==source) return;
     auto values=parse_json(source);
     std::vector<Tag> next; next.reserve(values.size());
-    for(const auto& value:values) next.push_back({wide(value.at("value").get_ref<const std::string&>()),value.at("regex").get<bool>()});
+    for(const auto& value:values) {
+        if(value.is_string()) next.push_back({wide(value.get_ref<const std::string&>()), false});
+        else next.push_back({wide(value.at("value").get_ref<const std::string&>()),value.at("regex").get<bool>()});
+    }
     tags_=std::move(next); width_=-1;
     if(source_.capacity()/4>source.size()) source_=std::string(source);
     else source_=source;

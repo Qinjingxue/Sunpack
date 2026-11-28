@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct InputMember {
     generation: FileIdentity,
+    view: Option<Arc<crate::io::view::ReadView>>,
     start: u64,
     end: Option<u64>,
     number: u32,
@@ -27,6 +28,7 @@ impl InputMember {
     ) -> std::io::Result<Self> {
         Ok(Self {
             generation: reader.file_identity()?,
+            view: reader.read_view().cloned(),
             start,
             end,
             number,

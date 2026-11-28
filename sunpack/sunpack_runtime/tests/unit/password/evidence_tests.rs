@@ -67,6 +67,7 @@ fn scan_discarded_prefix_skips_wide_unvisited_suffixes() {
     let count = 48;
     let plan = VolumeAttemptPlan {
         sources: (0..=2 * width).map(|id| InputExtent {
+            view: None,
             path: id.to_string(), start: 0, end: Some(1),
         }).collect(),
         domains: [vec![0], (1..=width).collect(), (width + 1..=2 * width).collect()]
@@ -104,6 +105,7 @@ fn candidate_removal_preserves_correlations_order_and_unrelated_domains() {
     let plan = VolumeAttemptPlan {
         sources: (0..7)
             .map(|i| InputExtent {
+                view: None,
                 path: i.to_string(),
                 start: 0,
                 end: Some(10),
@@ -229,6 +231,7 @@ fn different_weak_verifiers_keep_their_passwords_across_batches() {
     use crate::password::zip::ZipPasswordContext;
     let sources: Box<[_]> = ["head", "tailA", "tailB", "unreadable"]
         .map(|path| InputExtent {
+            view: None,
             path: path.into(),
             start: 0,
             end: Some(40),

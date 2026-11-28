@@ -1,7 +1,7 @@
 //! Demand-driven byte evidence over unresolved volume layouts.
 //! Paths merge at equal logical positions; only bytes actually requested by a
 //! format parser split a projection. Candidate KDFs run after preparation.
-use crate::io::archive_state::{InputExtent, VolumeAttemptPlan};
+use crate::io::archive_state::{InputExtent, VolumeAttemptPlan, VolumeLayout};
 use crate::io::cancellation::Cancellation;
 use crate::io::reader::{ManagedReader, NativeArchiveSession};
 use crate::password::context::PreparedStatus;
@@ -62,9 +62,43 @@ impl AttemptFile {
 }
 
 struct AttemptSource {
+    view: Option<Arc<crate::io::view::ReadView>>,
     file: Arc<AttemptFile>,
     start: u64,
     len: Option<u64>,
+}
+
+// Valid only inside this preparation: all sources of one path share the same
+// live AttemptFile. A logical source index covers reads spanning several runs.
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+enum EvidenceAddress {
+    Physical { file: usize, offset: u64, reverse: bool },
+    Logical { source: usize, offset: u64 },
+}
+
+impl AttemptSource {
+    fn address(&self, source: usize, offset: u64, len: u64) -> EvidenceAddress {
+        let file = Arc::as_ptr(&self.file) as usize;
+        match &self.view {
+            None => EvidenceAddress::Physical { file, offset, reverse: false },
+            Some(view) => {
+                if self.file.open().is_ok_and(|r| r.len() == view.physical_size) {
+                    if let Some(run) = view.single_run(offset, len) {
+                        return EvidenceAddress::Physical { file, offset: run.start, reverse: run.reverse };
+                    }
+                }
+                EvidenceAddress::Logical { source, offset }
+            }
+        }
+    }
+
+    fn read(&self, reader: &ManagedReader, offset: u64, dest: &mut [u8]) -> io::Result<usize> {
+        match &self.view {
+            Some(view) if view.physical_size != reader.len() => Err(io::Error::other("volume view source changed")),
+            Some(view) => view.read(reader, offset, dest, true),
+            None => reader.read_direct_into_at(offset, dest),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -97,6 +131,8 @@ struct Edge {
 }
 #[derive(Default)]
 struct Topology {
+    partitioned: bool,
+    packed_by_start: OnceLock<Box<[(u64, usize)]>>,
     nodes: Vec<Node>,
     edges: Vec<Edge>,
     roots: Vec<[usize; 3]>,
@@ -106,6 +142,7 @@ struct Topology {
 }
 
 struct DiskMapping {
+    minimum_length: u64,
     first: usize,
     rest: Vec<usize>,
     different_source: bool,
@@ -143,6 +180,7 @@ impl Topology {
     // Use the full geometry so method selection stays stable when a parser
     // replays on a narrower projection.
     fn range_is_ambiguous(&self, start: u64, size: u64) -> bool {
+        if self.partitioned && size != 0 { return true; }
         let ranges = self.ambiguous_ranges.get_or_init(|| ambiguous_logical_ranges(self.edges.iter()));
         overlaps_range(ranges, start, size)
     }
@@ -153,10 +191,12 @@ impl Topology {
             for (index, edge) in self.edges.iter().enumerate() {
                 mappings.entry(edge.disk).and_modify(|mapping| {
                     let first = &self.edges[mapping.first];
+                    mapping.minimum_length = mapping.minimum_length.min(edge.end - edge.start);
                     mapping.different_source |= first.source != edge.source;
                     mapping.different_length |= first.end - first.start != edge.end - edge.start;
                     mapping.rest.push(index);
                 }).or_insert(DiskMapping {
+                    minimum_length: edge.end - edge.start,
                     first: index, rest: Vec::new(), different_source: false, different_length: false,
                 });
             }
@@ -175,6 +215,7 @@ impl Topology {
     }
 
     fn disk_range_is_ambiguous(&self, mut disk: usize, mut offset: u64, mut size: u64) -> bool {
+        if self.partitioned && size != 0 { return true; }
         let mappings = self.disk_mappings();
         while size != 0 {
             let Some(mapping) = mappings.get(&disk) else { break; };
@@ -419,6 +460,10 @@ pub(crate) struct PreparedEvidence<T> {
 }
 
 impl<T> PreparedEvidence<T> {
+    pub(crate) fn values(self) -> impl Iterator<Item = T> {
+        self.alternatives.into_iter().map(|(value, _)| value)
+    }
+
     pub(crate) fn reduced_plan(&self) -> Result<Option<Arc<VolumeAttemptPlan>>, PreparedStatus> {
         if self.rejected.is_empty() {
             return Ok(None);
@@ -506,7 +551,12 @@ pub(crate) fn prepare_attempt_evidence_partial<T: Send>(
             let end = match extent.end {
                 Some(end) => Some(end),
                 None => match file.open() {
-                    Ok(reader) => Some(reader.len()),
+                    Ok(reader) => Some(
+                        extent
+                            .view
+                            .as_ref()
+                            .map_or_else(|| reader.len(), |v| v.len()),
+                    ),
                     Err(error) => {
                         unresolved.get_or_insert_with(|| {
                             unknown(format!("resource_unavailable: {error}"))
@@ -522,6 +572,7 @@ pub(crate) fn prepare_attempt_evidence_partial<T: Send>(
                 })
                 .transpose()?;
             Ok(AttemptSource {
+                view: extent.view.clone(),
                 file,
                 start: extent.start,
                 len,
@@ -529,11 +580,62 @@ pub(crate) fn prepare_attempt_evidence_partial<T: Send>(
         })
         .collect::<Result<Vec<_>, PreparedStatus>>()?
         .into();
+    let declared_head = std::cell::OnceCell::new();
+    let is_head = |i: usize| {
+        let Some(extent) = plan.sources.get(i) else {
+            return false;
+        };
+        if extent.path != head.path {
+            return false;
+        }
+        if extent == head {
+            return true;
+        }
+        let same_head = |s: &InputExtent| {
+            if s.path != head.path || (s.view == head.view && s.start != head.start) { return false; }
+            if s == head { return true; }
+            let logical_end = |s: &InputExtent| {
+                let len = match &s.view {
+                    Some(view) => view.len(),
+                    None => sources[i].file.open().ok()?.len(),
+                };
+                Some(s.end.unwrap_or(len).min(len))
+            };
+            let (Some(end), Some(head_end)) = (logical_end(s), logical_end(head)) else { return false };
+            if s.view == head.view { return end == head_end; }
+            use crate::io::archive_state::PhysicalRanges;
+            end.checked_sub(s.start) == head_end.checked_sub(head.start) &&
+                PhysicalRanges::new(s.view.as_deref(), s.start, Some(end)) ==
+                PhysicalRanges::new(head.view.as_deref(), head.start, Some(head_end))
+        };
+        // Interning can retain an equivalent head at a different logical
+        // offset. Other masks at our offset require a declared head as before.
+        if extent.start != head.start { return same_head(extent); }
+        *declared_head.get_or_init(|| plan.head_sources().any(same_head))
+    };
+    let mut prepared_contexts = Vec::new();
+    let mut rejected = Vec::new();
+    let mut evaluate = |graph: Topology| {
+        evaluate_geometry(
+            graph,
+            geometry,
+            plan,
+            &sources,
+            &prepare,
+            &mut prepared_contexts,
+            &mut rejected,
+            &mut unresolved,
+        )
+    };
     let mut graph = Topology::default();
     // A terminal source can appear in several layout lengths. Index the
     // declared total once, retaining the earliest declaration for a source.
     let tail_totals: HashMap<_, _> = if matches!(geometry, AttemptGeometry::TailTotals) {
-        plan.tail_totals.iter().rev().map(|entry| (entry.source, entry.total)).collect()
+        plan.tail_totals
+            .iter()
+            .rev()
+            .map(|entry| (entry.source, entry.total))
+            .collect()
     } else {
         HashMap::new()
     };
@@ -581,156 +683,342 @@ pub(crate) fn prepare_attempt_evidence_partial<T: Send>(
                 let total = match geometry {
                     AttemptGeometry::Forward { .. } | AttemptGeometry::DiskRelative => None,
                     AttemptGeometry::TrimmedHead { total } => Some(total),
-                    AttemptGeometry::TailTotals => tail_totals.get(&source).copied()
+                    AttemptGeometry::TailTotals => tail_totals
+                        .get(&source)
+                        .copied()
                         .or(plan.head_size_from_total),
                 };
                 terminal_groups.entry(total).or_default().push(source);
             }
             for (trim_total, terminal_choices) in terminal_groups {
-                let case = graph.roots.len();
-                let disk_number =
-                    |slot: usize| layout.slots[slot].number.saturating_sub(1) as usize;
-                let last_disk = disk_number(count - 1);
-                let unresolved = |slot: usize| slot >= contiguous;
-                let choices = |slot: usize| -> Result<&[usize], PreparedStatus> {
-                    if slot + 1 == count {
-                        Ok(&terminal_choices)
-                    } else {
-                        domain_choices(slot)
-                    }
+                let mut choices = (0..count - 1)
+                    .map(domain_choices)
+                    .collect::<Result<Vec<_>, _>>()?;
+                choices.push(&terminal_choices);
+                let case = GeometryCase {
+                    layout,
+                    layout_index,
+                    contiguous,
+                    choices,
+                    trim_total,
+                    geometry,
+                    prefix_end,
+                    minimum: plan.minimum_size.unwrap_or(0),
                 };
-                let is_head = |source: usize| {
-                    let Some(extent) = plan.sources.get(source) else {
-                        return false;
+                // Equal offsets share nodes. When one layer has more distinct
+                // coordinates than the input has sources, stream disjoint
+                // intervals through the same verifier instead of materializing
+                // their product with all the remaining slots.
+                let mut cuts = Vec::new();
+                let mut pending = Vec::new();
+                loop {
+                    Cancellation::check_current_io().map_err(|e| unknown(e.to_string()))?;
+                    let checkpoint = (
+                        graph.nodes.len(),
+                        graph.edges.len(),
+                        graph.roots.len(),
+                        graph.ends.len(),
+                    );
+                    let split = case.expand(&mut graph, &sources, &is_head, &cuts)?;
+                    if let Some((slot, middle)) = split {
+                        graph.nodes.truncate(checkpoint.0);
+                        graph.edges.truncate(checkpoint.1);
+                        graph.roots.truncate(checkpoint.2);
+                        graph.ends.truncate(checkpoint.3);
+                        graph.partitioned = true;
+                        // All later topologies also represent just part of the input.
+                        if !graph.roots.is_empty() {
+                            evaluate(std::mem::take(&mut graph))?;
+                        }
+                        graph.partitioned = true;
+                        pending.push((cuts.len(), slot, middle + 1));
+                        cuts.push((slot, 0, middle));
+                        continue;
+                    }
+                    if !cuts.is_empty() {
+                        evaluate(std::mem::take(&mut graph))?;
+                        graph.partitioned = true;
+                    }
+                    let Some((depth, slot, first)) = pending.pop() else {
+                        break;
                     };
-                    if extent.path != head.path || extent.start != head.start {
-                        return false;
-                    }
-                    let Some(reader) = sources
-                        .get(source)
-                        .and_then(|source| source.file.open().ok())
-                    else {
-                        return false;
-                    };
-                    // Relation heads use None for physical EOF; attempt sources
-                    // store that same EOF explicitly. Compare resolved extents,
-                    // not Option spelling, without merging an earlier bounded head.
-                    let eof = reader.len();
-                    extent.end.unwrap_or(eof).min(eof) == head.end.unwrap_or(eof).min(eof)
-                };
-                match trim_total {
-                    None => {
-                        let root = graph.node();
-                        graph.roots.push([layout_index, count, root]);
-                        let mut layer = BTreeMap::from([(0u64, root)]);
-                        for slot in 0..count {
-                            let mut next = BTreeMap::new();
-                            for (&offset, &node) in &layer {
-                                for &source in choices(slot)? {
-                                    if slot == 0 && !is_head(source) {
-                                        continue;
-                                    }
-                                    let range = sources
-                                        .get(source)
-                                        .ok_or_else(|| unknown("invalid volume source"))?;
-                                    let Some(length) = range.len else {
-                                        continue;
-                                    };
-                                    let end = match prefix_end {
-                                        Some(limit) => offset.saturating_add(length).min(limit),
-                                        None => offset.checked_add(length).ok_or_else(|| {
-                                            unknown("logical volume size overflow")
-                                        })?,
-                                    };
-                                    let next_position =
-                                        if matches!(geometry, AttemptGeometry::DiskRelative) {
-                                            0
-                                        } else {
-                                            end
-                                        };
-                                    let target =
-                                        *next.entry(next_position).or_insert_with(|| graph.node());
-                                    graph.edge(
-                                        node,
-                                        target,
-                                        source,
-                                        offset,
-                                        end,
-                                        case,
-                                        disk_number(slot),
-                                        unresolved(slot),
-                                    );
-                                }
-                            }
-                            layer = next;
-                        }
-                        graph.ends.extend(
-                            layer
-                                .into_iter()
-                                .map(|(offset, node)| (node, offset, case, last_disk)),
-                        );
-                    }
-                    Some(total) => {
-                        let end = graph.node();
-                        graph.ends.push((end, total, case, last_disk));
-                        let mut layer = BTreeMap::from([(total, end)]);
-                        for slot in (1..count).rev() {
-                            let mut next = BTreeMap::new();
-                            // Append outgoing edges in domain order, even
-                            // though their origins are built from the tail.
-                            for &source in choices(slot)? {
-                                let range = sources
-                                    .get(source)
-                                    .ok_or_else(|| unknown("invalid volume source"))?;
-                                let Some(length) = range.len else {
-                                    continue;
-                                };
-                                for (&offset, &node) in &layer {
-                                    let Some(start) = offset.checked_sub(length) else {
-                                        continue;
-                                    };
-                                    let origin = *next.entry(start).or_insert_with(|| graph.node());
-                                    graph.edge(
-                                        origin,
-                                        node,
-                                        source,
-                                        start,
-                                        offset,
-                                        case,
-                                        disk_number(slot),
-                                        unresolved(slot),
-                                    );
-                                }
-                            }
-                            layer = next;
-                        }
-                        let root = graph.node();
-                        graph.roots.push([layout_index, count, root]);
-                        for &source in choices(0)? {
-                            if !is_head(source) {
-                                continue;
-                            }
-                            let Some(available) = sources[source].len.filter(|&len| len != 0) else {
-                                continue;
-                            };
-                            for (&length, &node) in layer.range(1..=available) {
-                                graph.edge(
-                                    root,
-                                    node,
-                                    source,
-                                    0,
-                                    length,
-                                    case,
-                                    disk_number(0),
-                                    unresolved(0),
-                                );
-                            }
-                        }
-                    }
+                    cuts.truncate(depth);
+                    cuts.push((slot, first, u64::MAX));
                 }
             }
         }
     }
+    evaluate(graph)?;
+    prepared_contexts.sort_by(|left, right| left.0.cmp(&right.0));
+    if prepared_contexts.is_empty() && rejected.is_empty() && unresolved.is_none() {
+        return Err(unknown("no usable volume password evidence"));
+    }
+    Ok(PreparedEvidence {
+        plan: Arc::clone(plan),
+        alternatives: prepared_contexts
+            .into_iter()
+            .map(|(_, context, projection)| (context, projection))
+            .collect(),
+        rejected,
+        unresolved,
+    })
+}
+
+struct GeometryCase<'a> {
+    layout: &'a VolumeLayout,
+    layout_index: usize,
+    contiguous: usize,
+    choices: Vec<&'a [usize]>,
+    trim_total: Option<u64>,
+    geometry: AttemptGeometry,
+    prefix_end: Option<u64>,
+    minimum: u64,
+}
+
+impl GeometryCase<'_> {
+    fn expand(
+        &self,
+        graph: &mut Topology,
+        sources: &[AttemptSource],
+        is_head: &impl Fn(usize) -> bool,
+        cuts: &[(usize, u64, u64)],
+    ) -> Result<Option<(usize, u64)>, PreparedStatus> {
+        let count = self.choices.len();
+        let disk_number = |slot: usize| self.layout.slots[slot].number.saturating_sub(1) as usize;
+        let case = graph.roots.len();
+        let last_disk = disk_number(count - 1);
+        let interval = |slot| {
+            cuts.iter()
+                .filter(|c| c.0 == slot)
+                .fold((0, u64::MAX), |(lo, hi), c| (lo.max(c.1), hi.min(c.2)))
+        };
+        let split = |slot, layer: &BTreeMap<u64, usize>| {
+            (layer.len() > sources.len().max(count)).then(|| {
+                let lo = *layer.first_key_value().unwrap().0;
+                let hi = *layer.last_key_value().unwrap().0;
+                (slot, lo + (hi - lo) / 2)
+            })
+        };
+        match self.trim_total {
+            None => {
+                // Propagate the remaining capacity backwards before constructing any
+                // prefix offsets. A declared size can leave just one viable choice
+                // even when the unconstrained prefix has exponentially many sums.
+                let required = self.prefix_end.unwrap_or(self.minimum);
+                let mut reachable = Vec::new();
+                if !matches!(self.geometry, AttemptGeometry::DiskRelative)
+                    && (required != 0 || !cuts.is_empty())
+                {
+                    reachable.resize(count, (0, u64::MAX));
+                    let mut bounds = HashMap::new();
+                    let mut low = required;
+                    let mut high = u64::MAX;
+                    for slot in (0..count).rev() {
+                        let cut = interval(slot);
+                        low = low.max(cut.0);
+                        high = high.min(cut.1);
+                        if low > high {
+                            return Ok(None);
+                        }
+                        reachable[slot] = (low, high);
+                        let domain = self.choices[slot];
+                        let (shortest, longest) = *bounds
+                            .entry((domain.as_ptr(), domain.len()))
+                            .or_insert_with(|| {
+                                domain
+                                    .iter()
+                                    .filter_map(|&i| sources.get(i)?.len)
+                                    .fold((u64::MAX, 0), |(lo, hi), n| (lo.min(n), hi.max(n)))
+                            });
+                        low = low.saturating_sub(longest);
+                        if self.prefix_end.is_none_or(|limit| high < limit) && high != u64::MAX {
+                            let Some(before) = high.checked_sub(shortest) else {
+                                return Ok(None);
+                            };
+                            high = before;
+                        } else {
+                            high = u64::MAX;
+                        }
+                    }
+                    if low != 0 {
+                        return Ok(None);
+                    }
+                }
+                let root = graph.node();
+                graph.roots.push([self.layout_index, count, root]);
+                let mut layer = BTreeMap::from([(0u64, root)]);
+                for slot in 0..count {
+                    let mut next = BTreeMap::new();
+                    let (lo_cut, hi_cut) = reachable.get(slot).copied().unwrap_or((0, u64::MAX));
+                    for (&offset, &node) in &layer {
+                        for &source in self.choices[slot] {
+                            if slot == 0 && !is_head(source) {
+                                continue;
+                            }
+                            let range = sources
+                                .get(source)
+                                .ok_or_else(|| unknown("invalid volume source"))?;
+                            let Some(length) = range.len else {
+                                continue;
+                            };
+                            let end = match self.prefix_end {
+                                Some(limit) => offset.saturating_add(length).min(limit),
+                                None => offset
+                                    .checked_add(length)
+                                    .ok_or_else(|| unknown("logical volume size overflow"))?,
+                            };
+                            let next_position =
+                                if matches!(self.geometry, AttemptGeometry::DiskRelative) {
+                                    0
+                                } else {
+                                    end
+                                };
+                            if !(lo_cut..=hi_cut).contains(&next_position) {
+                                continue;
+                            }
+                            let target = *next.entry(next_position).or_insert_with(|| graph.node());
+                            if let Some(cut) = split(slot, &next) {
+                                return Ok(Some(cut));
+                            }
+                            graph.edge(
+                                node,
+                                target,
+                                source,
+                                offset,
+                                end,
+                                case,
+                                disk_number(slot),
+                                slot >= self.contiguous,
+                            );
+                        }
+                    }
+                    layer = next;
+                }
+                graph.ends.extend(
+                    layer
+                        .into_iter()
+                        .map(|(offset, node)| (node, offset, case, last_disk)),
+                );
+            }
+            Some(total) => {
+                // A suffix offset must fit the preceding disks. The
+                // carrier head may be trimmed to any positive length.
+                // Discard impossible sums before allocating graph nodes.
+                let Some(head_max) = self.choices[0]
+                    .iter()
+                    .copied()
+                    .filter(|&i| is_head(i))
+                    .filter_map(|i| sources.get(i).and_then(|s| s.len))
+                    .max()
+                    .filter(|&n| n > 0)
+                else {
+                    return Ok(None);
+                };
+                let mut prefix = Vec::with_capacity(count);
+                prefix.push((1u64, head_max));
+                let mut bounds = HashMap::new();
+                for slot in 1..count.saturating_sub(1) {
+                    let domain = self.choices[slot];
+                    let (low, high) = *bounds
+                        .entry((domain.as_ptr(), domain.len()))
+                        .or_insert_with(|| {
+                            domain
+                                .iter()
+                                .filter_map(|&i| sources.get(i).and_then(|s| s.len))
+                                .fold((u64::MAX, 0u64), |(lo, hi), len| (lo.min(len), hi.max(len)))
+                        });
+                    let (lo, hi) = prefix[slot - 1];
+                    prefix.push((lo.saturating_add(low), hi.saturating_add(high)));
+                }
+                let end = graph.node();
+                graph.ends.push((end, total, case, last_disk));
+                let mut layer = BTreeMap::from([(total, end)]);
+                for slot in (1..count).rev() {
+                    let mut next = BTreeMap::new();
+                    let (lo_cut, hi_cut) = interval(slot);
+                    // Append outgoing edges in domain order, even
+                    // though their origins are built from the tail.
+                    for &source in self.choices[slot] {
+                        let range = sources
+                            .get(source)
+                            .ok_or_else(|| unknown("invalid volume source"))?;
+                        let Some(length) = range.len else {
+                            continue;
+                        };
+                        let (lo, hi) = prefix[slot - 1];
+                        let Some(first) = lo.checked_add(length) else {
+                            continue;
+                        };
+                        let first = first.max(lo_cut.saturating_add(length));
+                        let last = hi.min(hi_cut).saturating_add(length);
+                        if first > last {
+                            continue;
+                        }
+                        for (&offset, &node) in layer.range(first..=last) {
+                            let start = offset - length;
+                            if start < lo_cut || start > hi_cut {
+                                continue;
+                            }
+                            let origin = *next.entry(start).or_insert_with(|| graph.node());
+                            if let Some(cut) = split(slot, &next) {
+                                return Ok(Some(cut));
+                            }
+                            graph.edge(
+                                origin,
+                                node,
+                                source,
+                                start,
+                                offset,
+                                case,
+                                disk_number(slot),
+                                slot >= self.contiguous,
+                            );
+                        }
+                    }
+                    layer = next;
+                }
+                let root = graph.node();
+                graph.roots.push([self.layout_index, count, root]);
+                for &source in self.choices[0] {
+                    if !is_head(source) {
+                        continue;
+                    }
+                    let Some(available) = sources[source].len.filter(|&len| len != 0) else {
+                        continue;
+                    };
+                    for (&length, &node) in layer.range(1..=available) {
+                        graph.edge(
+                            root,
+                            node,
+                            source,
+                            0,
+                            length,
+                            case,
+                            disk_number(0),
+                            self.contiguous == 0,
+                        );
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+
+fn evaluate_geometry<T: Send>(
+    mut graph: Topology,
+    geometry: AttemptGeometry,
+    plan: &Arc<VolumeAttemptPlan>,
+    sources: &Arc<[AttemptSource]>,
+    prepare: &(impl Fn(&mut AttemptReader<'_>) -> Result<Option<T>, PreparedStatus> + Sync),
+    prepared_contexts: &mut Vec<(
+        Vec<usize>,
+        T,
+        Arc<crate::password::evidence::VolumeProjection>,
+    )>,
+    rejected: &mut Vec<Arc<crate::password::evidence::VolumeProjection>>,
+    unresolved: &mut Option<PreparedStatus>,
+) -> Result<(), PreparedStatus> {
     let minimum = match geometry {
         AttemptGeometry::DiskRelative => 0,
         AttemptGeometry::Forward {
@@ -782,8 +1070,6 @@ pub(crate) fn prepare_attempt_evidence_partial<T: Send>(
         projection.prune().then(|| Arc::new(projection))
     });
     let mut pending = Vec::new();
-    let mut prepared_contexts = Vec::new();
-    let mut rejected = Vec::new();
     // Physical observations are not retained in an unbounded byte cache. The
     // prepared format owns its existing Spool; projections retain only edges.
     let cancellation = Cancellation::current();
@@ -802,7 +1088,7 @@ pub(crate) fn prepare_attempt_evidence_partial<T: Send>(
             .into_par_iter()
             .map(|projection| {
                 cancellation.run(|| {
-                    let mut reader = AttemptReader::new(&sources, projection);
+                    let mut reader = AttemptReader::new(sources, projection);
                     let result = prepare(&mut reader);
                     (reader, result)
                 })
@@ -843,17 +1129,7 @@ pub(crate) fn prepare_attempt_evidence_partial<T: Send>(
             }
         }
     }
-    prepared_contexts.sort_by(|left, right| left.0.cmp(&right.0));
-    if prepared_contexts.is_empty() && rejected.is_empty() && unresolved.is_none() {
-        return Err(unknown("no usable volume password evidence"));
-    }
-    Ok(PreparedEvidence {
-        plan: Arc::clone(plan),
-        alternatives: prepared_contexts.into_iter()
-            .map(|(_, context, projection)| (context, projection)).collect(),
-        rejected,
-        unresolved,
-    })
+    Ok(())
 }
 
 pub(crate) struct AttemptReader<'a> {
@@ -932,6 +1208,7 @@ impl DeferredReads {
         debug_assert!(!self.disk_relative);
         let ranges = std::cell::OnceCell::<Vec<(u64, u64)>>::new();
         move |start, size| {
+            if self.projection.topology.partitioned { return size != 0; }
             if let Some(ranges) = ranges.get() {
                 return overlaps_range(ranges, start, size);
             }
@@ -1142,11 +1419,18 @@ impl AttemptReader<'_> {
     }
 
     pub(crate) fn volume_len(&mut self, disk: usize) -> io::Result<Option<u64>> {
+        self.volume_len_for_read(disk, None)
+    }
+
+    /// A read inside every candidate's bounds needs no exact EOF observation.
+    fn volume_len_for_read(&mut self, disk: usize, sufficient: Option<u64>) -> io::Result<Option<u64>> {
         self.metadata_ready()?;
         let topology = &self.projection.topology;
-        if topology.roots.len() == 1 && topology.disk_mappings().get(&disk).is_none_or(|m| !m.different_length) {
-            return Ok(topology.disk_edges(disk).find(|(index, _)| self.projection.active[*index])
-                .map(|(_, edge)| edge.end - edge.start));
+        if topology.roots.len() == 1 {
+            let Some(mapping) = topology.disk_mappings().get(&disk) else { return Ok(None) };
+            if !mapping.different_length || sufficient.is_some_and(|end| end <= mapping.minimum_length) {
+                return Ok(Some(mapping.minimum_length));
+            }
         }
         // Ok sorts before Err so a missing volume keeps its previous priority.
         self.partition_disk(disk, Err(()), |edge| Ok(edge.end - edge.start))
@@ -1202,7 +1486,8 @@ impl AttemptReader<'_> {
         let mut bytes = vec![0; size];
         let mut written = 0;
         while written < size {
-            let Some(length) = self.volume_len(disk)? else {
+            let requested_end = offset.checked_add((size - written) as u64);
+            let Some(length) = self.volume_len_for_read(disk, requested_end)? else {
                 break;
             };
             if offset > length {
@@ -1241,7 +1526,7 @@ impl AttemptReader<'_> {
         mut amount: u64,
     ) -> io::Result<Option<(usize, u64)>> {
         loop {
-            let Some(length) = self.volume_len(disk)? else {
+            let Some(length) = self.volume_len_for_read(disk, offset.checked_add(amount))? else {
                 return Ok(None);
             };
             if offset > length {
@@ -1300,7 +1585,8 @@ impl AttemptReader<'_> {
         };
         let mut read = 0;
         while read < bytes.len() {
-            match reader.read_direct_into_at(offset + read as u64, &mut bytes[read..]) {
+            let result = source.read(reader, offset + read as u64, &mut bytes[read..]);
+            match result {
                 Ok(0) => {
                     self.fault = Some(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
@@ -1456,7 +1742,7 @@ impl AttemptReader<'_> {
             Truncated,
             Unavailable,
         }
-        let mut reads = HashMap::<(usize, u64), Observation>::new();
+        let mut reads = HashMap::<EvidenceAddress, Observation>::new();
         let mut truncated = Vec::new();
         let mut unavailable = Vec::new();
         let mut bytes = vec![0; count];
@@ -1464,13 +1750,10 @@ impl AttemptReader<'_> {
         let mut compared_group = None;
         for &index in covering {
             let edge = &self.projection.topology.edges[index];
-            let location = (
-                edge.source,
-                self.sources[edge.source].start
-                    + disk
-                        .map(|(_, offset)| offset)
-                        .unwrap_or(self.position.saturating_sub(edge.start)),
-            );
+            let source = &self.sources[edge.source];
+            let offset = source.start + disk.map(|(_, offset)| offset)
+                .unwrap_or(self.position.saturating_sub(edge.start));
+            let location = source.address(edge.source, offset, count as u64);
             if let Some(&read) = reads.get(&location) {
                 match read {
                     Observation::Bytes(group) => groups[group].1.push(index),

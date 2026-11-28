@@ -33,6 +33,7 @@ fn recovery_descriptor_exports_only_supported_missing_volume_evidence() {
         .is_none());
     input.mode = OpenMode::NativeVolumes;
     input.parts = Box::new([InputPart::range(InputExtent {
+        view: None,
         path: input.entry_path.clone(),
         start: 0,
         end: None,
@@ -48,6 +49,7 @@ fn recovery_descriptor_exports_only_supported_missing_volume_evidence() {
     input.parts = vec![
         input.parts[0].clone(),
         InputPart::range(InputExtent {
+            view: None,
             path: "truncated.7z.002".into(),
             start: 0,
             end: None,
@@ -89,6 +91,7 @@ fn recovery_volume_descriptor_preserves_style_roles_and_plan_order() {
     input.parts = Box::new([InputPart {
         role: InputRole::Terminal,
         extent: InputExtent {
+            view: None,
             path: "first.zip".into(),
             start: 0,
             end: Some(12),
@@ -137,7 +140,7 @@ fn scan_removes_only_discarded_combinations_in_original_order() {
         number: domain as u32 + 1, canonical_name: domain.to_string(), domain,
     }).into() };
     let plan = VolumeAttemptPlan {
-        sources: (0..6).map(|i| InputExtent { path: i.to_string(), start: 0, end: Some(1) }).collect(),
+        sources: (0..6).map(|i| InputExtent { view: None, path: i.to_string(), start: 0, end: Some(1) }).collect(),
         layouts: vec![layout.clone(), layout].into(), domains: domains.into(),
         tail_totals: Box::default(), minimum_size: None, head_size_from_total: None,
     };
@@ -169,6 +172,7 @@ fn trimmed_head_admission_keeps_first_sufficient_duplicate_extent() {
             .into_iter()
             .enumerate()
             .map(|(i, end)| InputExtent {
+                view: None,
                 path: if i == 5 { "tail" } else { "carrier" }.into(),
                 start: 0,
                 end,
@@ -234,6 +238,7 @@ fn shared_volume_domains_are_indexed_once_and_validate_checkpoint_geometry() {
     let mut plan = VolumeAttemptPlan {
         sources: (0..count)
             .map(|i| InputExtent {
+                view: None,
                 path: format!("part-{i}"),
                 start: 0,
                 end: Some(10),
@@ -404,6 +409,7 @@ fn project_input_slice(
         let finish = end.min(stop);
         if begin < finish {
             mapped.push(InputExtent {
+                view: None,
                 path: path.clone(),
                 start: base + (begin - cursor),
                 end: Some(base + (finish - cursor)),

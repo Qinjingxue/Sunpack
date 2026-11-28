@@ -744,7 +744,7 @@ Json config_fields(const Json& config,const std::string& source,const std::strin
         }
         if(editor=="recursive" && choice<0) choice=2;
         field.update(Json{{"id",pointer},{"key",pointer+"@"+language},{"type",type},{"text",std::move(text)},{"boolean",item.is_boolean()?item.get<bool>():false},
-            {"editor",editor},{"choice",choice},{"items",editor=="rule_list"?item:Json::array()}});
+            {"editor",editor},{"choice",choice},{"items",(editor=="rule_list" || editor=="view_list")?item:Json::array()}});
         rows.push_back(std::move(field));
     };
     walk(config,"","");
@@ -755,7 +755,7 @@ Json config_fields(const Json& config,const std::string& source,const std::strin
         if(!range.length) throw std::out_of_range("settingChanged");
         const auto raw=tokens.text(range);
         field["original"]=std::string(raw);
-        if(field["editor"]=="rule_list") field.erase("text");
+        if(field["editor"]=="rule_list" || field["editor"]=="view_list") field.erase("text");
         else if(field["type"]!="string") field["text"]=std::string(raw);
     }
     return rows;

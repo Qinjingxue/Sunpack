@@ -654,6 +654,15 @@ void tag_config(Application& app,const fs::path& dir) {
     const auto filters=parse_json(source)["filesystem"]["scan_filters"];
     assert(source.find(filters[0].dump())!=std::string::npos);
     assert(source.find(filters[1].dump())!=std::string::npos);
+    const std::string view_id="/filesystem/read_views", view_input="tag-input-"+view_id;
+    search_setting(app,view_id);
+    edit_text(app,view_input,L"apate:0");
+    assert(ui_debug_key(app.window(),VK_RETURN)==0);
+    pump([&]{return state(app.page(),"saveErrors").contains(view_id);},"Reject zero read-view depth");
+    edit_text(app,view_input,L"apate:2");
+    assert(ui_debug_key(app.window(),VK_RETURN)==0);
+    finish_input(app);
+    assert(read_json(config_path)[Json::json_pointer(view_id)]==Json::array({"plain","apate:2"}));
     search_config(app,L"");
 }
 

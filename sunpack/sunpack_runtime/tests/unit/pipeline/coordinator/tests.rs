@@ -617,7 +617,7 @@ fn verified_scan_finishes_without_starting_worker() {
         let mut input = ArchiveInput::file(path.clone(), "rar".into(), "encrypted".into());
         input.analysis.password_required = true;
         if projected {
-            let extent = InputExtent { path, start: 0, end: Some(fs::metadata(&source).unwrap().len()) };
+            let extent = InputExtent { view: None, path, start: 0, end: Some(fs::metadata(&source).unwrap().len()) };
             let mut part = InputPart::range(extent.clone());
             part.volume_number = Some(1);
             part.canonical_name = "archive.part1.rar".into();
@@ -729,7 +729,7 @@ fn recovery_selection_uses_unique_physical_anchors_without_io() {
     // retaining the previous second volume as a physical source anchor.
     arrived.entry_path = source.with_extension("first").to_string_lossy().into_owned();
     arrived.parts = Box::new([crate::io::archive_state::InputPart::range(
-        crate::io::archive_state::InputExtent { path: old.entry_path.clone(), start: 0, end: None })]);
+        crate::io::archive_state::InputExtent { view: None, path: old.entry_path.clone(), start: 0, end: None })]);
     let logical = |input| LogicalInput { input, password: None, failure: None };
     let engine = Engine::new(PathBuf::from("unused-worker"));
     let observer = |_: Event| {};
@@ -1044,7 +1044,7 @@ fn completed_watch_family_returns_existing_success_without_extracting_or_reownin
     let mut input = ArchiveInput::file(head.to_string_lossy().into_owned(), "zip".into(), "archive".into());
     input.mode = OpenMode::NativeVolumes;
     input.parts = [&head, &tail].map(|path| crate::io::archive_state::InputPart::range(
-        crate::io::archive_state::InputExtent { path: path.to_string_lossy().into_owned(), start: 0, end: None },
+        crate::io::archive_state::InputExtent { view: None, path: path.to_string_lossy().into_owned(), start: 0, end: None },
     )).into();
     let task = Task {
         primary: None, owned_paths: [&head, &tail, &launcher].map(|path| path.to_string_lossy().into_owned()).into(),
@@ -1085,6 +1085,7 @@ fn completed_watch_family_returns_existing_success_without_extracting_or_reownin
     let mut alternative_input = task.entry().clone();
     alternative_input.volume_attempts = Some(Arc::new(crate::io::archive_state::VolumeAttemptPlan {
         sources: [&head, &tail, &alternative].map(|path| crate::io::archive_state::InputExtent {
+            view: None,
             path: path.to_string_lossy().into_owned(), start: 0, end: None,
         }).into(),
         layouts: Box::new([]), domains: Box::new([]), head_size_from_total: None,
@@ -1146,7 +1147,7 @@ fn partial_departure_fails_admission_and_keeps_generations_for_extraction() {
         let mut input = ArchiveInput::file(path.to_string_lossy().into_owned(), "rar".into(), "archive".into());
         input.mode = OpenMode::NativeVolumes;
         input.parts = [&path, &missing].map(|path| crate::io::archive_state::InputPart::range(
-            crate::io::archive_state::InputExtent { path: path.to_string_lossy().into_owned(), start: 0, end: None },
+            crate::io::archive_state::InputExtent { view: None, path: path.to_string_lossy().into_owned(), start: 0, end: None },
         )).into();
         let companion = missing.with_extension("exe");
         let mut task = Task {
@@ -2100,13 +2101,18 @@ fn watch_volume_retry_waits_for_a_late_writer_to_close() {
     let root = marker.with_extension("volumes");
     fs::create_dir(&root).unwrap();
     let first = root.join("split.7z.001");
-    fs::write(&first, head).unwrap();
+    let mut masked = b"mask".to_vec();
+    masked.extend_from_slice(&head[4..]);
+    masked.extend(head[..4].iter().rev());
+    masked.extend(4i32.to_le_bytes());
+    fs::write(&first, masked).unwrap();
 
     let mut request = Request::new(vec![first.clone()], Mode::Extract);
     request.origin = Origin::Watch;
+    Arc::make_mut(&mut request.config).filesystem.read_views = crate::io::view::ConfiguredViews::parse([Some("plain"), Some("apate:1")].into_iter()).unwrap();
     let engine = Engine::new(PathBuf::from("unused-worker"));
     let candidates = CandidateSet::new(Arc::from([]), None, &engine.recent_passwords, None);
-    let options = discovery::scan_options(&request.config).unwrap();
+    let options = discovery::scan_options(&request.config, false).unwrap();
     let discovered = discovery::discover(&request, &options, &candidates, true).unwrap();
     let [task] = discovered.tasks.as_slice() else {
         panic!("expected an incomplete volume group");
@@ -2114,6 +2120,7 @@ fn watch_volume_retry_waits_for_a_late_writer_to_close() {
     let Some(discovery::TaskContext::Retry(context)) = &task.context else {
         panic!("expected retained volume resolution context");
     };
+    assert_eq!(task.entry().parts[0].extent.view.as_ref().unwrap().depth, 1);
     let mut original = receipt(task.entry(), task.source, 1);
     let output = root.join("damaged-output");
     fs::create_dir(&output).unwrap();
@@ -2125,22 +2132,25 @@ fn watch_volume_retry_waits_for_a_late_writer_to_close() {
     CreatedOutputs::register(&run.created_outputs, &output, &original);
 
     let last = root.join("split.7z.002");
-    let mut writer = fs::File::create(&last).unwrap();
+    // NTFS permits shared writers on published names. Exercise the recovery
+    // boundary with a publisher that denies readers until it closes.
+    use std::os::windows::fs::OpenOptionsExt;
+    let mut writer = fs::OpenOptions::new().create_new(true).write(true).share_mode(0).open(&last).unwrap();
     writer.write_all(&[0; 13]).unwrap();
     writer.write_all(&next_header).unwrap();
-    assert!(discovery::retry_volume(&original, &[], context, &options, &candidates, &request)
+    assert!(discovery::retry_volume(task.entry(), &original.source_paths, &[], context, &options, &candidates, &request)
         .unwrap().is_none());
     assert!(output.join("damaged.bin").is_file());
     drop(writer);
-    assert!(discovery::retry_volume(&original, &[], context, &options, &candidates, &request)
+    assert!(discovery::retry_volume(task.entry(), &original.source_paths, &[], context, &options, &candidates, &request)
         .unwrap().is_some());
     // A live retry cannot replace a member that was still present at
     // admission. Only names admitted as departed may be left behind.
     let departed = root.join("split.7z.002.downloading");
     original.source_paths.push(departed.clone());
-    assert!(discovery::retry_volume(&original, &[], context, &options, &candidates, &request)
+    assert!(discovery::retry_volume(task.entry(), &original.source_paths, &[], context, &options, &candidates, &request)
         .unwrap().is_none());
-    assert!(discovery::retry_volume(&original, &[departed], context, &options, &candidates, &request)
+    assert!(discovery::retry_volume(task.entry(), &original.source_paths, &[departed], context, &options, &candidates, &request)
         .unwrap().is_some());
     run.discard_failed_output(&original, &output, &mut Outcome::default()).unwrap();
     assert!(!output.exists());
@@ -2150,6 +2160,7 @@ fn watch_volume_retry_waits_for_a_late_writer_to_close() {
     // dies when its blocker retires, even with a checkpoint view in flight.
     let mut lookup = Request::new(vec![first.clone()], Mode::Extract);
     lookup.origin = Origin::Watch;
+    lookup.config = request.config.clone();
     lookup.discovery_scope = Some(crate::scan::scope::NativeDiscoveryScope::new(
         root.to_string_lossy().into_owned(), Some(0), Vec::new()));
     let plan = engine.find_watch_volume(&lookup, &options, false).unwrap().unwrap();
@@ -2158,7 +2169,7 @@ fn watch_volume_retry_waits_for_a_late_writer_to_close() {
     let id = crate::watch_store::watch_path_key(&path);
     let state = crate::watch_store::NativeWatchState::new();
     let entry = Arc::new(serde_json::from_value(serde_json::json!({
-        "path":path, "size":64, "mtime":0.0, "file_id":"", "change_usn":0,
+        "path":path, "size":72, "mtime":0.0, "file_id":"", "change_usn":0,
         "status":"suspended_missing_volume", "last_error":"", "failure_kind":"missing_volume",
         "failure_payload":{}, "last_attempt_at":0.0,
     })).unwrap());
@@ -2206,6 +2217,7 @@ fn alias_dedup_covers_candidate_and_preflight_failure_plans() {
         if candidate {
             input.volume_attempts = Some(Arc::new(VolumeAttemptPlan {
                 sources: Box::new([InputExtent {
+                    view: None,
                     path: input.entry_path.clone(), start: 0, end: None,
                 }]),
                 layouts: Box::new([]), domains: Box::new([]),
@@ -2228,6 +2240,7 @@ fn alias_dedup_covers_candidate_and_preflight_failure_plans() {
     let mut first = make(&path, false, true);
     first.inputs[0].input.mode = OpenMode::FileRange;
     first.inputs[0].input.parts = Box::new([InputPart::range(InputExtent {
+        view: None,
         path: path.to_string_lossy().into_owned(), start: 0, end: Some(4),
     })]);
     let mut different = make(&alias, false, true);
@@ -2237,6 +2250,15 @@ fn alias_dedup_covers_candidate_and_preflight_failure_plans() {
     let mut tasks = vec![first, different];
     dedup_resolved_plans(&mut tasks);
     assert_eq!(tasks.len(), 2, "distinct physical ranges must remain separate");
+    let mut restored = make(&alias, true, false);
+    let plan = Arc::make_mut(restored.inputs[0].input.volume_attempts.as_mut().unwrap());
+    plan.sources[0].view = Some(Arc::new(crate::io::view::ReadView {
+        method: crate::io::view::ViewMethod::Apate, depth: 1, physical_size: 16,
+        spans: vec![crate::io::view::Span { start: 4, end: 12, reverse: true }],
+    }));
+    let mut tasks = vec![make(&path, true, false), restored];
+    dedup_resolved_plans(&mut tasks);
+    assert_eq!(tasks.len(), 2, "same offsets in different candidate views");
     fs::remove_file(path).unwrap();
 }
 

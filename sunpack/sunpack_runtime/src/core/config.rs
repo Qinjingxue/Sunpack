@@ -144,6 +144,7 @@ pub enum FlattenDirectoryName {
 
 #[derive(Clone, PartialEq)]
 pub struct FilesystemConfig {
+    pub(crate) read_views: crate::io::view::ConfiguredViews,
     pub scan_filters_enabled: bool,
     pub scan_filters: Arc<[ScanFilter]>,
 }
@@ -849,6 +850,10 @@ impl Config {
             &["runtime", "process_mode"],
             "normal",
         ))?;
+        let view_tags = field(value, &["filesystem", "read_views"]).as_array()
+            .ok_or_else(|| invalid("filesystem.read_views must be an array"))?;
+        let read_views = crate::io::view::ConfiguredViews::parse(view_tags.iter().map(Value::as_str))
+            .map_err(invalid)?;
         let recursive_extract = match field(value, &["recursive_extract"]) {
             Value::String(value) => Recursion::parse(value)?,
             Value::Number(value) => value.as_u64().filter(|&count| count > 0)
@@ -951,6 +956,7 @@ impl Config {
                 },
             },
             filesystem: FilesystemConfig {
+                read_views,
                 scan_filters_enabled,
                 scan_filters,
             },

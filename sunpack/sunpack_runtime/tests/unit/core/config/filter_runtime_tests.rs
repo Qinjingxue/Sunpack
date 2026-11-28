@@ -95,13 +95,16 @@ fn disabled_rules_validate_shape_without_compiling_expressions() {
     assert!(Config::parse(&raw).is_err());
     raw["filesystem"]["scan_filters"][0]["full_names"][0]["value"] = Value::String("[".into());
     raw["filesystem"]["scan_filters"][0]["enabled"] = Value::Bool(true);
+    raw["filesystem"]["read_views"] = serde_json::json!(["apate:1"]);
     let config = Config::parse(&raw).unwrap();
-    assert!(crate::pipeline::scan_options(&config).is_err());
+    assert!(crate::pipeline::scan_options(&config, false).is_err());
+    let deep = crate::pipeline::scan_options(&config, true).unwrap();
+    assert!(!deep.probe_plain && deep.probe_views.enabled());
     let second = raw["filesystem"]["scan_filters"][0].clone();
     raw["filesystem"]["scan_filters"].as_array_mut().unwrap().push(second);
     assert_eq!(Config::parse(&raw).unwrap().validate_scan_filters().len(), 2);
     raw["filesystem"]["scan_filters_enabled"] = Value::Bool(false);
-    assert!(crate::pipeline::scan_options(&Config::parse(&raw).unwrap()).is_ok());
+    assert!(crate::pipeline::scan_options(&Config::parse(&raw).unwrap(), false).is_ok());
     raw["filesystem"]["scan_filters"][0]["full_names"][0]["regex"] = Value::String("bad".into());
     assert!(Config::parse(&raw).is_err());
     let a = PathRule::parse(&serde_json::json!({"name":"blacklist"})).unwrap();

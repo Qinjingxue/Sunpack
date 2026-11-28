@@ -1,5 +1,5 @@
 use crate::analysis_native::volume_anchor::{
-    CheapAnchor, VolumeAnchor, EMBEDDED_VOLUME, RAR_PASSWORD_MATCHED_INCOMPLETE, SEVEN_ZIP_CARRIER_INTERRUPTED,
+    CheapAnchor, VolumeAnchor, EMBEDDED_VOLUME,
 };
 use crate::path_keys::{case_key, path_key};
 use crate::relations::{
@@ -27,7 +27,6 @@ pub(crate) enum CandidateProjection<'a> {
     File {
         path: &'a str,
         format_hint: &'a str,
-        logical_name: String,
         standalone_truncated: bool,
     },
     Relation {
@@ -81,6 +80,12 @@ impl Candidate {
 
 #[derive(Default)]
 pub(crate) struct NativeCandidateTable {
+    pub(crate) empty_middles: HashMap<String, (crate::io::reader::PhysicalFileGeneration, std::ops::Range<u64>)>,
+    pub(crate) plain_volume_anchors: HashMap<String, Vec<Arc<VolumeAnchor>>>,
+    // Only supplemental physical rows, and only while a mixed-view scope is pending.
+    // None records a completed scan with no independent sibling to project.
+    pub(crate) plain_peer_scans: HashMap<String, Option<Arc<NativeScanResult>>>,
+    pub(crate) read_scopes: Vec<ReadScope>,
     rows: Vec<Candidate>,
     prepared_zip_scan: Option<PreparedZipScan>,
     // Decrypted continuations may outlive their headless proposal. Transfer
@@ -89,6 +94,46 @@ pub(crate) struct NativeCandidateTable {
     volume_entry_peers: Vec<(Arc<DirectorySnapshotTable>, usize)>,
     // Shared physical facts; row indices survive only for this discovery scan.
     relation_sources: Vec<NativeDirectorySnapshot>,
+}
+
+pub(crate) struct ReadScope {
+    pub raw: NativeDirectorySnapshot,
+    pub selected: NativeDirectorySnapshot,
+    pub aliases: Option<Box<SplitAliases>>,
+}
+
+pub(crate) struct SplitAliases {
+    pub names: HashSet<String>,
+    pub stems: HashSet<String>,
+}
+
+impl ReadScope {
+    pub(crate) fn new(raw: &NativeDirectorySnapshot, filtered: &NativeDirectorySnapshot, targets: Option<&FileTargets>) -> Self {
+        let mut aliases = None;
+        let selected = match targets {
+            None => filtered.clone(),
+            Some(targets) => {
+                let rows = targets.selected_rows(filtered);
+                if rows.len() < targets.names_by_path.len() {
+                    let found: HashSet<_> = rows.iter().map(|&r| path_key(&filtered.table.paths[r])).collect();
+                    let names: HashSet<_> = targets.names_by_path.iter().filter(|(p, _)| !found.contains(*p))
+                        .map(|(_, name)| name.clone()).collect();
+                    let mut stems = HashSet::new();
+                    for row in filtered.rows().filter(|&r| !filtered.table.is_dir(r)) {
+                        let path = &filtered.table.paths[row];
+                        let stem = catalog_stem(path);
+                        if !stems.contains(&stem) && (names.contains(&stem)
+                            || names.contains(&case_key(&filesystem_logical_name(path)))) {
+                            stems.insert(stem);
+                        }
+                    }
+                    if !stems.is_empty() { aliases = Some(Box::new(SplitAliases { names, stems })); }
+                }
+                filtered.view(rows)
+            }
+        };
+        Self { raw: raw.clone(), selected, aliases }
+    }
 }
 
 pub(crate) struct FileTargets {
@@ -120,22 +165,14 @@ impl FileTargets {
         })
     }
 
-    fn select(&self, snapshot: &NativeDirectorySnapshot) -> Option<NativeDirectorySnapshot> {
-        let mut exact = 0;
-        let rows: Vec<_> = snapshot
-            .rows()
-            .filter(|&row| {
-                let key = path_key(&snapshot.table.paths[row]);
-                if self.names_by_path.contains_key(&key) {
-                    exact += 1;
-                    true
-                } else {
-                    false
-                }
-            })
-            .collect();
+    fn selected_rows(&self, snapshot: &NativeDirectorySnapshot) -> Vec<usize> {
+        snapshot.rows().filter(|&row| self.contains_key(&path_key(&snapshot.table.paths[row]))).collect()
+    }
+
+    pub(crate) fn select(&self, snapshot: &NativeDirectorySnapshot) -> Option<NativeDirectorySnapshot> {
+        let rows = self.selected_rows(snapshot);
         // Preserve logical-name recovery for targets excluded from the view.
-        (exact == self.names_by_path.len()).then(|| snapshot.view(rows))
+        (rows.len() == self.names_by_path.len()).then(|| snapshot.view(rows))
     }
 
     fn retain(&self, rows: &mut Vec<Candidate>) {
@@ -177,11 +214,8 @@ impl FileTargets {
         let mut selected = matched.into_iter();
         rows.retain(|row| {
             let contains = selected.next().unwrap();
-            contains || matches!(row, Candidate::Relation(group) if {
-                let data = group.candidate_data();
-                data.is_split && Path::new(data.logical_name().as_ref()).file_name()
-                    .is_some_and(|name| expected.contains(case_key(&name.to_string_lossy()).as_str()))
-            })
+            contains || matches!(row, Candidate::Relation(group) if group.split_alias()
+                .is_some_and(|name| expected.contains(name.as_str())))
         });
     }
 }
@@ -287,6 +321,25 @@ impl NativeDiscoveryRoutes {
     }
 }
 
+/// One file-level decision shared by all readers of this discovery scope.
+#[derive(Clone, Copy, Default)]
+pub(crate) enum EmbeddedAdmission {
+    #[default]
+    Disabled,
+    All,
+    MinimumBytes(f64),
+}
+
+impl EmbeddedAdmission {
+    pub(crate) fn accepts(self, size: u64) -> bool {
+        match self {
+            Self::Disabled => false,
+            Self::All => true,
+            Self::MinimumBytes(minimum) => size > 0 && size as f64 >= minimum,
+        }
+    }
+}
+
 enum EmbeddedOutcome {
     Residual,
     Failed(Arc<io::Error>),
@@ -325,7 +378,7 @@ impl NativeEmbeddedBatch {
     fn project_outcomes(
         &mut self,
 
-        table: &NativeCandidateTable,
+        table: &mut NativeCandidateTable,
         outcomes: impl Iterator<Item = (usize, EmbeddedOutcome)>,
     ) -> Vec<EmbeddedPageRow> {
         let mut projected = Vec::new();
@@ -338,7 +391,17 @@ impl NativeEmbeddedBatch {
                 EmbeddedOutcome::Scan(scan) => {
                     let path = table.rows[index].path();
                     let key = path_key(path);
-                    let mut anchors = scan.relation_anchors();
+                    if !table.read_scopes.is_empty() {
+                        if let Some(proof) = &scan.empty_middle {
+                            table.empty_middles.insert(key.clone(), proof.clone());
+                        }
+                    }
+                    if !table.read_scopes.is_empty() && self.supplemental.contains(&index) {
+                        table.plain_peer_scans.insert(key.clone(),
+                            scan.has_independent_archive().then(|| Arc::clone(&scan)));
+                    }
+                    if !scan.has_candidates() { continue; }
+                    let mut anchors = scan.relation_anchors(path, None);
                     let has_claims = self.claimed_ranges.contains_key(&key);
                     let independent = (has_claims || !anchors.is_empty()) && scan.has_independent_archive();
                     if has_claims {
@@ -356,8 +419,7 @@ impl NativeEmbeddedBatch {
                         }
                     }
                     if !anchors.is_empty() {
-                        for mut anchor in anchors {
-                            anchor.path = path.to_owned();
+                        for anchor in anchors {
                             let retain_scan = anchor.needs_password || independent;
                             self.pending_volumes.push(PendingEmbeddedVolume {
                                 index,
@@ -409,11 +471,7 @@ fn scan_embedded_jobs(
             order.sort_by_cached_key(|&position| {
                 let (group, index) = jobs[position];
                 let (table, _) = groups[group];
-                let size = match &table.rows[index] {
-                    Candidate::File(table, row) => table.sizes[*row],
-                    Candidate::Relation(group) => group.entry_anchor().map(|anchor| anchor.size),
-                };
-                std::cmp::Reverse(size.unwrap_or(0))
+                std::cmp::Reverse(table.embedded_size(index))
             });
         }
         let next = AtomicUsize::new(0);
@@ -433,8 +491,12 @@ fn scan_embedded_jobs(
                         };
                         let (table, batch) = groups[group];
                         let (path, pe) = table.rows[index].embedded_source();
+                        let retention = if table.read_scopes.is_empty() { ScanRetention::Archives }
+                            else if batch.supplemental.contains(&index) { ScanRetention::Peer }
+                            else { ScanRetention::ViewEvidence };
                         let outcome = scan_embedded_candidate(
                             path, batch.force_scan, pe, parallel_files, table.prepared_zip_scan.as_ref(),
+                            retention,
                         );
                         if !matches!(outcome, EmbeddedOutcome::Residual) {
                             completed.push((position, group, index, outcome));
@@ -781,27 +843,12 @@ impl NativeEmbeddedBatch {
                     batch.excluded.insert(key);
                 }
                 if let Some(scan) = item.scan {
-                    let failure_reason = anchor.expected_logical_size.is_none().then(|| {
-                        if matched.contains_key(&match_key)
-                            || anchor.has_any(RAR_PASSWORD_MATCHED_INCOMPLETE)
-                        {
-                            "embedded_truncated"
-                        } else if anchor.wrong_password {
-                            "embedded_wrong_password"
-                        } else {
-                            "embedded_password_required"
-                        }
-                    });
                     let (_, resolutions) = fallback_scans
                         .entry(item.index)
                         .or_insert_with(|| (scan, HashMap::new()));
                     resolutions.insert(
                         anchor.structure_offset.unwrap_or(0),
-                        RarInputResolution {
-                            end_offset: anchor.expected_logical_size,
-                            password: matched.get(&match_key).cloned(),
-                            failure_reason,
-                        },
+                        RarInputResolution::from_anchor(&anchor, matched.get(&match_key).cloned()),
                     );
                 }
                 continue;
@@ -836,6 +883,11 @@ impl NativeEmbeddedBatch {
             fallback.retain(|row| !batch.supplemental.contains(&row.index()));
             return Ok(fallback);
         }
+        if !table.read_scopes.is_empty() {
+            for anchor in &anchors {
+                table.plain_volume_anchors.entry(path_key(&anchor.path)).or_default().push(anchor.clone());
+            }
+        }
         let sources = &table.relation_sources;
         // Only these newly discovered slices may re-enter a claimed carrier.
         // Other files retain the existing whole-file ownership exclusion.
@@ -843,52 +895,6 @@ impl NativeEmbeddedBatch {
         batch.excluded.retain(|key| !anchor_paths.contains(key));
         let excluded = &batch.excluded;
         let mut groups = resolve_embedded_volumes(sources, anchors, excluded, cache);
-        // A lone encrypted file keeps its existing embedded boundary result.
-        // Only a real candidate proposal replaces those individual failures.
-        groups.retain(|group| group.unresolved_password_group()
-            || !group.entry_anchor().is_some_and(|a|
-                a.needs_password && !a.multivolume && a.rar5_encryption.is_some()));
-        // A failed NextHeader inside a carrier can also be damaged standalone
-        // data. Require actual peers for this speculative split identity.
-        // Index only nominated stems once, rather than rescan scopes per head.
-        let speculative = |group: &NativeRelationGroup| {
-            !group.relation_confirmed()
-                && group
-                    .entry_anchor()
-                    .is_some_and(|a| a.has_any(SEVEN_ZIP_CARRIER_INTERRUPTED))
-        };
-        let mut peers: HashMap<String, HashSet<String>> = groups
-            .iter()
-            .filter(|g| speculative(g))
-            .map(|g| (catalog_stem(g.entry_path()), HashSet::new()))
-            .collect();
-        if !peers.is_empty() {
-            for snapshot in sources {
-                for row in snapshot.rows() {
-                    if !snapshot.table.relation_member_eligible(row) {
-                        continue;
-                    }
-                    let path = &snapshot.table.paths[row];
-                    if let Some(paths) = peers.get_mut(&catalog_stem(path)) {
-                        // Only two distinct witnesses are needed. Retaining
-                        // every peer would duplicate a large bucket's paths.
-                        if paths.len() >= 2 {
-                            continue;
-                        }
-                        let key = path_key(path);
-                        if !excluded.contains(&key) {
-                            paths.insert(key);
-                        }
-                    }
-                }
-            }
-            groups.retain(|g| {
-                !speculative(g)
-                    || peers
-                        .get(&catalog_stem(g.entry_path()))
-                        .is_some_and(|p| p.len() > 1)
-            });
-        }
         if !batch.supplemental.is_empty() {
             // Ownership is physical: a related carrier may also hold a second
             // split head. Keep its connected groups before cleanup can own the
@@ -896,36 +902,7 @@ impl NativeEmbeddedBatch {
             let requested: HashSet<_> = table.rows.iter().enumerate()
                 .filter(|(index, _)| !batch.supplemental.contains(index))
                 .map(|(_, row)| path_key(row.path())).collect();
-            let mut by_path: HashMap<String, Vec<usize>> = HashMap::new();
-            let mut keep = vec![false; groups.len()];
-            let mut work = Vec::new();
-            for (index, group) in groups.iter().enumerate() {
-                for path in group.related_paths() {
-                    let key = path_key(path);
-                    if requested.contains(&key) && !keep[index] {
-                        keep[index] = true;
-                        work.push(index);
-                    }
-                    by_path.entry(key).or_default().push(index);
-                }
-            }
-            let mut owned = HashSet::new();
-            while let Some(index) = work.pop() {
-                for path in groups[index].related_paths() {
-                    let key = path_key(path);
-                    if let Some(peers) = by_path.remove(&key) {
-                        owned.insert(key);
-                        for peer in peers {
-                            if !keep[peer] {
-                                keep[peer] = true;
-                                work.push(peer);
-                            }
-                        }
-                    }
-                }
-            }
-            let mut index = 0;
-            groups.retain(|_| { let retain = keep[index]; index += 1; retain });
+            let owned = crate::relations::retain_connected_groups(&mut groups, &requested);
             fallback.retain(|row| !batch.supplemental.contains(&row.index())
                 || owned.contains(&path_key(table.rows[row.index()].path())));
         }
@@ -970,6 +947,7 @@ impl NativeEmbeddedBatch {
 impl NativeCandidateTable {
     pub(crate) fn extend(&mut self, other: &mut Self) {
         self.rows.append(&mut other.rows);
+        self.read_scopes.append(&mut other.read_scopes);
         for snapshot in other.relation_sources.drain(..) {
             if self.relation_sources.last().is_none_or(|last| !last.same_view(&snapshot)) {
                 self.relation_sources.push(snapshot);
@@ -979,13 +957,14 @@ impl NativeCandidateTable {
         self.volume_entry_peers.append(&mut other.volume_entry_peers);
     }
 
+    #[cfg(test)]
     pub(crate) fn from_directory(
         raw: &NativeDirectorySnapshot,
         filtered: &NativeDirectorySnapshot,
         targets: Option<&FileTargets>,
         deep: bool,
     ) -> Self {
-        Self::from_directory_with_shared_zip_scan(raw, filtered, targets, deep, false)
+        Self::from_directory_with_shared_zip_scan(raw, filtered, targets, deep, false, false)
     }
 
     pub(crate) fn from_directory_with_shared_zip_scan(
@@ -994,6 +973,7 @@ impl NativeCandidateTable {
         targets: Option<&FileTargets>,
         deep: bool,
         reuse_embedded: bool,
+        opaque_peers: bool,
     ) -> Self {
         debug_assert!(raw.rows().zip(raw.rows().skip(1)).all(|(a, b)| a < b));
         let mut table = Self::default();
@@ -1019,8 +999,8 @@ impl NativeCandidateTable {
             .map(|row| Candidate::File(Arc::clone(&selected.table), row)));
         if let Some(targets) = targets {
             targets.retain(&mut table.rows);
-            if deep {
-                table.find_volume_entry_peers(filtered, targets);
+            if deep || opaque_peers {
+                table.find_volume_entry_peers(filtered, targets, opaque_peers);
             }
         }
         if !deep {
@@ -1031,9 +1011,9 @@ impl NativeCandidateTable {
     }
 
     // An explicitly selected raw continuation may have no signature. Use
-    // existing split-entry evidence to open the same Embedded peer frontier
-    // from the other end, within this target's original scope.
-    fn find_volume_entry_peers(&mut self, filtered: &NativeDirectorySnapshot, targets: &FileTargets) {
+    // existing split-entry evidence, plus eligible opaque peers when a
+    // configured view can hide the other disk, within the targeted stem.
+    fn find_volume_entry_peers(&mut self, filtered: &NativeDirectorySnapshot, targets: &FileTargets, opaque_peers: bool) {
         if self.rows.is_empty() || self.rows.len() >= filtered.rows().len() {
             return;
         }
@@ -1047,8 +1027,8 @@ impl NativeCandidateTable {
         }
         let facts = &filtered.table;
         for row in filtered.rows() {
-            if !facts.relation_anchors[row].as_ref().and_then(CheapAnchor::anchor)
-                .is_some_and(|anchor| anchor.multivolume && anchor.is_volume_entry())
+            let anchor = facts.relation_anchors[row].as_ref().and_then(CheapAnchor::anchor);
+            if !facts.relation_member_eligible(row) || !anchor.map_or(opaque_peers, |a| a.multivolume && a.is_volume_entry())
             {
                 continue;
             }
@@ -1213,7 +1193,6 @@ impl NativeCandidateTable {
                 CandidateProjection::File {
                     path,
                     format_hint: anchor.map_or("", |anchor| anchor.format),
-                    logical_name: filesystem_logical_name(path),
                     standalone_truncated: anchor.is_some_and(VolumeAnchor::standalone_truncated),
                 }
             }
@@ -1259,9 +1238,9 @@ impl NativeCandidateTable {
                     || (data.multivolume && (data.is_split || data.structural_non_head)))
             {
                 routes.relations.push((index, false));
-            } else if data.relation_confirmed && matches!(data.format_hint, "rar" | "7z" | "zip") {
+            } else if data.relation_confirmed && crate::formats::supports_volume_relations(data.format_hint) {
                 routes.relations.push((index, true));
-            } else {
+            } else if super::root::RootRoute::from_facts(group.entry_anchor(), None) != super::root::RootRoute::PeImage {
                 relation_residual.push(index);
             }
         }
@@ -1298,14 +1277,8 @@ impl NativeCandidateTable {
                 continue;
             }
             cancellation.check_io()?;
-            let accepted = table.relation_anchors[*file_index]
-                .as_ref()
-                .and_then(CheapAnchor::anchor)
-                .is_some_and(|anchor| {
-                    anchor.standalone
-                        && matches!(anchor.format, "tar" | "gzip" | "bzip2" | "xz" | "zstd" | "lz4" | "enc")
-                });
-            if accepted {
+            let anchor = table.relation_anchors[*file_index].as_ref().and_then(CheapAnchor::anchor);
+            if super::root::RootRoute::from_facts(anchor, None) == super::root::RootRoute::Detection {
                 let key = path_key(&table.paths[*file_index]);
                 if !blocked.contains(&key) && claimed.insert(key) {
                     routes.detected.push(index);
@@ -1361,23 +1334,23 @@ impl NativeCandidateTable {
         Ok(routes)
     }
 
-    pub(crate) fn prepare_deep(&mut self, recursive: bool, recursive_ratio: f64) -> NativeEmbeddedBatch {
-        if recursive {
-            // Deep changes the discovery producer, not the nested scan budget.
-            // Reuse selection and row compaction before any full-file I/O.
-            let mut routes = NativeDiscoveryRoutes {
-                embedded: (0..self.rows.len()).collect(),
-                ..NativeDiscoveryRoutes::default()
-            };
-            let mut batch = self.prepare_embedded(&mut routes, true, true, recursive_ratio);
-            batch.force_scan = true;
-            return batch;
-        }
-        let mut batch = NativeEmbeddedBatch {
-            ids: (0..self.rows.len()).collect(),
-            force_scan: true,
-            ..NativeEmbeddedBatch::default()
-        };
+    pub(crate) fn deep_routes(&self) -> NativeDiscoveryRoutes {
+        NativeDiscoveryRoutes { embedded: (0..self.rows.len()).collect(), ..Default::default() }
+    }
+
+    fn embedded_size(&self, index: usize) -> u64 {
+        match &self.rows[index] {
+            Candidate::File(table, row) => table.sizes[*row],
+            Candidate::Relation(group) => group.entry_size(),
+        }.unwrap_or(0)
+    }
+
+    pub(crate) fn residual_files<'a>(&'a self, routes: &'a NativeDiscoveryRoutes)
+        -> impl Iterator<Item = (&'a str, u64)> + 'a {
+        routes.embedded.iter().map(|&i| (self.rows[i].path(), self.embedded_size(i)))
+    }
+
+    fn append_entry_peers(&mut self, batch: &mut NativeEmbeddedBatch) {
         if !self.volume_entry_peers.is_empty() {
             let mut seen: HashSet<_> = self.rows.iter().map(|row| path_key(row.path())).collect();
             for (facts, row) in std::mem::take(&mut self.volume_entry_peers) {
@@ -1389,45 +1362,37 @@ impl NativeCandidateTable {
                 }
             }
         }
-        batch
     }
 
     /// Finish primary projection before calling: only embedded/relation rows survive.
     pub(crate) fn prepare_embedded(
         &mut self,
         routes: &mut NativeDiscoveryRoutes,
-        recursive: bool,
-        enabled: bool,
-        recursive_ratio: f64,
+        admission: EmbeddedAdmission,
+        deep: bool,
     ) -> NativeEmbeddedBatch {
         let mut ids = std::mem::take(&mut routes.embedded);
-        let scan_candidates = enabled && (!recursive || recursive_ratio < 1.0);
-        if !scan_candidates {
-            ids.clear();
-        } else if recursive && recursive_ratio > 0.0 {
-            let mut sizes = Vec::with_capacity(ids.len());
-            let mut total = 0.0;
-            for &index in &ids {
-                let size = match &self.rows[index] {
-                    Candidate::File(table, row) => table.sizes[*row],
-                    Candidate::Relation(group) => group.logical_size(),
-                }
-                .unwrap_or(0);
-                sizes.push(size);
-                total += size as f64;
+        match admission {
+            EmbeddedAdmission::Disabled => ids.clear(),
+            EmbeddedAdmission::MinimumBytes(_) => ids.retain(|&i| admission.accepts(self.embedded_size(i))),
+            EmbeddedAdmission::All if deep => {
+                let mut batch = NativeEmbeddedBatch { ids, force_scan: true, ..Default::default() };
+                self.append_entry_peers(&mut batch);
+                return batch;
             }
-            let threshold = total * recursive_ratio;
-            // Sizes follow the candidate order, so selection needs no hash set.
-            let mut sizes = sizes.into_iter();
-            ids.retain(|_| {
-                let size = sizes.next().unwrap();
-                size > 0 && size as f64 >= threshold
-            });
+            EmbeddedAdmission::All => {}
         }
         if ids.is_empty() && self.volume_seeds.is_empty() {
-            // This root has no remaining I/O. Its primary
-            // decisions are already owned by the caller; no recovery can use it.
-            *self = Self::default();
+            // Physical discovery has finished. Exact read views can still
+            // contribute independent archives and mixed-volume proposals.
+            let read_scopes = std::mem::take(&mut self.read_scopes);
+            let mut plain_volume_anchors = std::mem::take(&mut self.plain_volume_anchors);
+            if !read_scopes.is_empty() {
+                for (key, anchor) in self.relation_cache().anchors {
+                    plain_volume_anchors.entry(key).or_default().push(anchor);
+                }
+            }
+            *self = Self { read_scopes, plain_volume_anchors, ..Self::default() };
             return NativeEmbeddedBatch::default();
         }
         let mut excluded = HashSet::new();
@@ -1440,6 +1405,11 @@ impl NativeCandidateTable {
         // and their execution metadata from every root. Raw snapshots still
         // supply all eligible peers; primary decisions have been projected.
         let relation_cache = self.relation_cache();
+        if !self.read_scopes.is_empty() {
+            for (key,anchor) in &relation_cache.anchors {
+                self.plain_volume_anchors.entry(key.clone()).or_default().push(anchor.clone());
+            }
+        }
         let mut claimed_ranges = HashMap::new();
         let mut scanned_paths = None;
         let mut seen_facts = HashSet::new();
@@ -1507,13 +1477,21 @@ impl NativeCandidateTable {
             nominated: 0,
             peer_rows: None,
             seen_paths: HashSet::new(),
-            force_scan: false,
+            force_scan: deep,
         };
-        if scan_candidates {
+        if !matches!(admission, EmbeddedAdmission::Disabled) {
+            self.append_entry_peers(&mut batch);
             batch.enqueue_volume_peers(self);
         }
         batch
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScanRetention {
+    Archives,
+    ViewEvidence,
+    Peer,
 }
 
 fn scan_embedded_candidate(
@@ -1522,6 +1500,7 @@ fn scan_embedded_candidate(
     pe_state: Option<PeState>,
     parallel_files: usize,
     prepared_zip_scan: Option<&PreparedZipScan>,
+    retention: ScanRetention,
 ) -> EmbeddedOutcome {
     if path.is_empty() {
         return EmbeddedOutcome::Residual;
@@ -1542,8 +1521,13 @@ fn scan_embedded_candidate(
             return EmbeddedOutcome::Residual;
         }
     }
+    let keep_scan = |scan: &NativeScanResult| scan.has_candidates() || match retention {
+        ScanRetention::Archives => false,
+        ScanRetention::ViewEvidence => scan.empty_middle.is_some(),
+        ScanRetention::Peer => true,
+    };
     if let Some(scan) = prepared_zip_scan.and_then(|prepared| prepared.reuse(path)) {
-        return if scan.has_candidates() { EmbeddedOutcome::Scan(scan) } else { EmbeddedOutcome::Residual };
+        return if keep_scan(&scan) { EmbeddedOutcome::Scan(scan) } else { EmbeddedOutcome::Residual };
     }
     let metadata = match std::fs::metadata(path) {
         Ok(metadata) => metadata,
@@ -1554,8 +1538,9 @@ fn scan_embedded_candidate(
     }
     #[cfg(test)]
     peer_scan_tests::record_scan(path);
-    match scan_embedded_path(path, parallel_files) {
-        Ok(scan) if scan.has_candidates() => EmbeddedOutcome::Scan(Arc::new(scan)),
+    let result = if retention != ScanRetention::Archives { super::embedded::scan_physical_for_views(path, parallel_files) } else { scan_embedded_path(path, parallel_files) };
+    match result {
+        Ok(scan) if keep_scan(&scan) => EmbeddedOutcome::Scan(Arc::new(scan)),
         Ok(_) => EmbeddedOutcome::Residual,
         Err(error) => EmbeddedOutcome::read_error(path, Arc::new(error)),
     }

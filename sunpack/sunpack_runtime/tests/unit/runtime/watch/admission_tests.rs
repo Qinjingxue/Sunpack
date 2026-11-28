@@ -25,7 +25,7 @@ pub(super) fn audit_scheduler(base: &Path, worker: PathBuf) -> Scheduler {
     let journal = Arc::new(journal::Journal::open(&base.join("state"), 7).unwrap());
     Scheduler {
         dedup_rebuild: None, dedup_job_id: 0,
-        dedup: Arc::new(Mutex::new(dedup::Index::open(&base.join("state"), crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root).unwrap())),
+        dedup: Arc::new(Mutex::new(dedup::Index::open(&base.join("state"), crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root, Default::default()).unwrap())),
         resuming: false, baseline_roots: HashSet::new(),
         candidate_diagnostics: CandidateDiagnostics::default(), admission_checkpoint: None,
         root_scope_records: HashMap::new(),
@@ -82,7 +82,7 @@ fn dedup_rebuild_keeps_current_baseline_and_replaces_stale_generation() {
     let stamps = |generation| [("scope".into(), "volume".into(), generation)];
     let generation = {
         let mut index = scheduler.dedup.lock().unwrap();
-        index.reset(mode, config::WatchDeduplicationScope::Root).unwrap();
+        index.reset(mode, config::WatchDeduplicationScope::Root, Default::default()).unwrap();
         assert!(index.reconcile_journals(&stamps(1)).unwrap());
         index.begin_rebuild().unwrap();
         index.generation()
@@ -446,7 +446,7 @@ fn checkpoint_submits_the_first_ready_generation() {
             let journal = Arc::new(journal::Journal::open(&directory.join("state"), 7).unwrap());
             let mut scheduler = Scheduler {
                 dedup_rebuild: None, dedup_job_id: 0,
-                dedup: Arc::new(Mutex::new(dedup::Index::open(&base.join("state"), crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root).unwrap())),
+                dedup: Arc::new(Mutex::new(dedup::Index::open(&base.join("state"), crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root, Default::default()).unwrap())),
                 resuming: false, baseline_roots: HashSet::new(),
                 candidate_diagnostics: CandidateDiagnostics::default(),
                 root_scope_records: HashMap::new(),
@@ -605,7 +605,7 @@ fn watch_discovery_read_failure_retries_only_its_archive() {
     options.catalog_refresh(&catalog, &scope, None).unwrap();
     let mut scheduler = Scheduler {
         dedup_rebuild: None, dedup_job_id: 0,
-        dedup: Arc::new(Mutex::new(dedup::Index::open(&base.join("state"), crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root).unwrap())),
+        dedup: Arc::new(Mutex::new(dedup::Index::open(&base.join("state"), crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root, Default::default()).unwrap())),
         resuming: false, baseline_roots: HashSet::new(),
         candidate_diagnostics: CandidateDiagnostics::default(),
         root_scope_records: HashMap::new(),
@@ -678,7 +678,7 @@ fn recovery_scans_surviving_outputs_while_requeueing_missing_output_owner() {
             let journal = Arc::new(journal::Journal::open(&directory.join("state"), 7).unwrap());
             let mut scheduler = Scheduler {
                 dedup_rebuild: None, dedup_job_id: 0,
-                dedup: Arc::new(Mutex::new(dedup::Index::open(&base.join("state"), crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root).unwrap())),
+                dedup: Arc::new(Mutex::new(dedup::Index::open(&base.join("state"), crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root, Default::default()).unwrap())),
                 resuming: false, baseline_roots: HashSet::new(),
                 admission_checkpoint: None,
                 candidate_diagnostics: CandidateDiagnostics::default(),
@@ -777,7 +777,7 @@ fn semantic_reload_recovers_pending_after_output_unlock() {
             let lease = BrokerLease::acquire().unwrap();
             let mut scheduler = Scheduler {
                 dedup_rebuild: None, dedup_job_id: 0,
-                dedup: Arc::new(Mutex::new(dedup::Index::open(&base.join("state"), crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root).unwrap())),
+                dedup: Arc::new(Mutex::new(dedup::Index::open(&base.join("state"), crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root, Default::default()).unwrap())),
                 resuming: false, baseline_roots: HashSet::new(),
                 admission_checkpoint: None,
                 candidate_diagnostics: CandidateDiagnostics::default(),
@@ -907,7 +907,7 @@ fn password_retry_keeps_existing_quiet_and_checks_failure_snapshot() {
         let journal = Arc::new(journal::Journal::open(&directory.join("state"), 7).unwrap());
         let mut scheduler = Scheduler {
             dedup_rebuild: None, dedup_job_id: 0,
-            dedup: Arc::new(Mutex::new(dedup::Index::open(&base.join("state"), crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root).unwrap())),
+            dedup: Arc::new(Mutex::new(dedup::Index::open(&base.join("state"), crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root, Default::default()).unwrap())),
             resuming: false, baseline_roots: HashSet::new(),
             candidate_diagnostics: CandidateDiagnostics::default(),
             root_scope_records: HashMap::new(),
@@ -1041,7 +1041,7 @@ fn native_event_provenance_survives_ordinary_and_checkpoint_admission() {
         let journal = Arc::new(journal::Journal::open(&directory.join("state"), 7).unwrap());
         let mut scheduler = Scheduler {
             dedup_rebuild: None, dedup_job_id: 0,
-            dedup: Arc::new(Mutex::new(dedup::Index::open(&base.join("state"), crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root).unwrap())),
+            dedup: Arc::new(Mutex::new(dedup::Index::open(&base.join("state"), crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root, Default::default()).unwrap())),
             resuming: false, baseline_roots: HashSet::new(),
             candidate_diagnostics: CandidateDiagnostics::default(),
             root_scope_records: HashMap::new(),

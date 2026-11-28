@@ -14,8 +14,10 @@ use super::{
 use crate::collections::{CacheOrder, SmallOrderedSet};
 use crate::core::config::{CleanupMode, ContentRequirement, ProcessMode, Recursion, WorkerConfig};
 use crate::io::archive_state::{
-    ArchiveInput, OpenMode, VolumeCompleteness, VolumeSelection,
+    ArchiveInput, VolumeCompleteness, VolumeSelection,
 };
+#[cfg(test)]
+use crate::io::archive_state::OpenMode;
 use crate::io::cancellation::is_cancellation;
 use crate::io::directory_errors::DirectoryReadErrors;
 use crate::io::reader::{
@@ -230,11 +232,8 @@ impl Engine {
             &self.recent_passwords,
             request.password_scope.as_deref(),
         );
-        let unfiltered = || {
-            NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new())
-        };
         let options = OnceLock::new();
-        let deep_options = request.deep.then(unfiltered).transpose()?;
+        let deep_options = request.deep.then(|| discovery::scan_options(&request.config, true)).transpose()?;
         let output_base = request
             .output_root
             .as_ref()
@@ -299,9 +298,7 @@ impl Engine {
                     let candidates = CandidateSet::new(Arc::clone(&request.passwords),
                         request.password_snapshot.clone(), &engine.recent_passwords,
                         request.password_scope.as_deref());
-                    let options = if request.deep {
-                        NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new())?
-                    } else { discovery::scan_options(&request.config)? };
+                    let options = discovery::scan_options(&request.config, request.deep)?;
                     // The dedup visitor consumes projected inputs only. Drop the
                     // discovery inventories as each table finishes projecting.
                     let mut discovered = discovery::discover(&request, &options, &candidates, false)?;
@@ -456,7 +453,8 @@ impl<O> std::ops::Deref for ObserverRef<'_, O> {
 }
 
 type RecoveryCheckpointIndex = HashMap<Arc<str>, HashMap<CheckpointKey, usize>>;
-type RecoveryAnchorIndex = HashMap<String, HashMap<(String, u64), Vec<(Arc<str>, usize)>>>;
+type RecoveryAnchor = (String, u64, Option<Arc<crate::io::view::ReadView>>);
+type RecoveryAnchorIndex = HashMap<String, HashMap<RecoveryAnchor, Vec<(Arc<str>, usize)>>>;
 type SourceGenerations = HashMap<String, PhysicalFileGeneration>;
 type WatchGenerations = BTreeMap<String, PhysicalFileGeneration>;
 
@@ -1425,7 +1423,7 @@ impl<'run, O: Observer> Run<'run, O> {
         // Deep discovery does not use configured filters. Compile them only
         // when a recursive output actually enters ordinary discovery, sharing
         // the same result across concurrently completed archive outputs.
-        self.options.get_or_init(|| discovery::scan_options(&self.request.config))
+        self.options.get_or_init(|| discovery::scan_options(&self.request.config, false))
             .as_ref().map_err(|error| io::Error::new(error.kind(), error.to_string()))
     }
 
@@ -2059,7 +2057,7 @@ impl<'run, O: Observer> Run<'run, O> {
                         this.notify(|| Event::ResolvingVolumes { id });
                         stage("missing_volume", cancel).await?;
                         let replacement = discovery::retry_volume(
-                            &executed.result,
+                            &executed.input, &executed.result.source_paths,
                             &missing,
                             &context,
                             this.options_at(depth)?,
@@ -2797,16 +2795,22 @@ impl<'run, O: Observer> Run<'run, O> {
             owner.and_then(|owner| self.checkpoints.get_key_value(owner.as_ref()))
         });
         let Some((owner, group)) = group else { return vec![None; inputs.len()]; };
-        let mut used = HashSet::new();
-        inputs.iter().map(|logical| {
+        // A fallback anchor can be shared by several views or directories.
+        // Reserve exact identities first so input order cannot steal a receipt.
+        let exact: Vec<_> = inputs.iter().map(|logical|
+            group.get(&CheckpointKey::for_input(&logical.input)).copied()).collect();
+        let mut used: HashSet<_> = exact.iter().flatten().copied().collect();
+        inputs.iter().zip(exact).map(|(logical, exact)| {
             let input = &logical.input;
-            let previous = group.get(&CheckpointKey::for_input(input)).copied().or_else(|| {
+            let previous = exact.or_else(|| {
                 let anchors = self.checkpoint_anchor_index().get(&input.format_hint)?;
                 let mut matched = None;
                 for anchor in recovery_anchors(input) {
                     for (candidate_owner, candidate) in anchors.get(&anchor).into_iter().flatten() {
                         let candidate = *candidate;
                         if used.contains(&candidate) || candidate_owner != owner { continue; }
+                        let saved = &self.request.checkpoints[candidate].input().analysis;
+                        if !saved.compatible_directory(&input.analysis) { continue; }
                         if matched.is_some_and(|previous| previous != candidate) { return None; }
                         matched = Some(candidate);
                     }
@@ -3100,7 +3104,6 @@ impl<'run, O: Observer> Run<'run, O> {
         }
         let codepage = if self.request.mode == Mode::Extract
             && input.format_hint == "zip"
-            && input.volume_attempts.is_none()
         {
             crate::formats::zip::analyze_zip_filename_encoding(&input)
                 .ok()
@@ -3235,8 +3238,7 @@ impl<'run, O: Observer> Run<'run, O> {
                     let completeness = input.analysis.volume_completeness;
                     match selected.and_then(|selected| Arc::make_mut(&mut input).select_volumes(&selected)) {
                         Ok(()) => {
-                            result.source_paths =
-                                input.physical_paths().map(PathBuf::from).collect();
+                            record_selected_layout(&input, &mut result);
                             if scan_selection {
                                 // A unique composition can still be missing archive data.
                                 Arc::make_mut(&mut input).analysis.volume_completeness = completeness;
@@ -3824,17 +3826,21 @@ fn complete_verified_scan_layout(input: &mut ArchiveInput, result: &mut ArchiveR
         let Some(parts) = plan.sole_parts().filter(|parts| complete(parts)) else { return false; };
         input.parts = parts;
         input.volume_attempts = None;
-        result.source_paths = input.physical_paths().map(PathBuf::from).collect();
+        record_selected_layout(input, result);
         return true;
     }
     !input.mode.structured() || complete(&input.parts)
 }
 
+fn record_selected_layout(input: &ArchiveInput, result: &mut ArchiveResult) {
+    let head = input.physical_extents().next();
+    result.offset = head.map_or(0, |extent| extent.start);
+    result.end_offset = head.and_then(|extent| extent.end);
+    result.source_paths = input.physical_paths().map(PathBuf::from).collect();
+}
+
 fn receipt(input: &ArchiveInput, source: DiscoverySource, depth: usize) -> ArchiveResult {
-    let extent = input.physical_extents().next();
-    let mut source_paths: Vec<_> = input.physical_paths().map(PathBuf::from).collect();
-    dedup_paths(&mut source_paths);
-    ArchiveResult {
+    let mut result = ArchiveResult {
         path: PathBuf::from(&input.entry_path),
         format: input.format_hint.clone(),
         output: None,
@@ -3843,11 +3849,11 @@ fn receipt(input: &ArchiveInput, source: DiscoverySource, depth: usize) -> Archi
         bytes: 0,
         encrypted: input.analysis.password_required.then_some(true),
         depth,
-        offset: extent.map_or(0, |extent| extent.start),
-        end_offset: extent.and_then(|extent| extent.end),
+        offset: 0,
+        end_offset: None,
         volume_attempts: None,
         volume_completeness: input.analysis.volume_completeness,
-        source_paths,
+        source_paths: Vec::new(),
         password: None,
         discovery_source: source,
         partial: false,
@@ -3855,16 +3861,17 @@ fn receipt(input: &ArchiveInput, source: DiscoverySource, depth: usize) -> Archi
         recovered_complete_files: 0,
 
         scan_layout: super::ScanLayout::default(),
-    }
+    };
+    record_selected_layout(input, &mut result);
+    dedup_paths(&mut result.source_paths);
+    result
 }
 
-fn recovery_anchors(input: &ArchiveInput) -> impl Iterator<Item = (String, u64)> + '_ {
+fn recovery_anchors(input: &ArchiveInput) -> impl Iterator<Item = RecoveryAnchor> + '_ {
     let plan = input.volume_attempts.as_ref();
-    let extents = plan.into_iter().flat_map(|plan| plan.sources.iter())
-        .chain(input.physical_extents().filter(move |_| plan.is_none()));
     let empty = plan.map_or(input.parts.is_empty(), |plan| plan.sources.is_empty());
-    extents.map(|extent| (path_key(&extent.path), extent.start))
-        .chain(empty.then(|| (path_key(&input.entry_path), 0)))
+    input.source_extents().map(|extent| (path_key(&extent.path), extent.start, extent.view.clone()))
+        .chain(empty.then(|| (path_key(&input.entry_path), 0, None)))
 }
 
 fn output_create_failure(error: io::Error, path: &Path) -> Failure {
@@ -4343,7 +4350,7 @@ fn cleanup_boundaries(request: &Request) -> HashSet<String> {
 fn dedup_resolved_plans(tasks: &mut Vec<Task>) -> HashMap<String, Arc<str>> {
     // Alias paths can have different scan filters. Resolve them after discovery
     // so the path that actually supplied a plan stays eligible for extraction.
-    type Extent = (Arc<str>, u64, Option<u64>);
+    type Extent = (Arc<str>, crate::io::archive_state::PhysicalRanges);
     let mut paths = HashMap::<String, Arc<str>>::new();
     let mut resolved = |path: &str| {
         if let Some(key) = paths.get(path) {
@@ -4353,22 +4360,28 @@ fn dedup_resolved_plans(tasks: &mut Vec<Task>) -> HashMap<String, Arc<str>> {
         paths.insert(path.to_owned(), Arc::clone(&key));
         key
     };
-    let mut plans = HashSet::<(OpenMode, String, Box<[Extent]>)>::new();
+    // Borrow layout/domain metadata while indexing, including the unresolved
+    // choices. Resolving an alias changes physical spelling only.
+    let mut plans = HashSet::new();
+    let mut keep = Vec::new();
+    for logical in tasks.iter().flat_map(|task| &task.inputs) {
+        let input = &logical.input;
+        let key = |extent: &crate::io::archive_state::InputExtent| {
+            (resolved(&extent.path), extent.physical_ranges())
+        };
+        let mut extents: Box<[Extent]> = input.source_extents().map(key).collect();
+        if extents.is_empty() {
+            extents = Box::new([(resolved(&input.entry_path), crate::io::archive_state::PhysicalRanges::Forward(0, None))]);
+        }
+        let domains = input.volume_attempts.as_ref().map(|plan| (
+            &plan.layouts, &plan.domains, plan.head_size_from_total, plan.minimum_size, &plan.tail_totals,
+        ));
+        keep.push(plans.insert((input.mode, input.format_hint.as_str(), extents, domains)));
+    }
+    drop(plans);
+    let mut keep = keep.into_iter();
     tasks.retain_mut(|task| {
-        task.inputs.retain(|logical| {
-            let input = &logical.input;
-            // Main claims every physical plan, including unresolved volume
-            // candidates and preflight failures. Leases only serialize aliases;
-            // they do not prevent the second alias from executing afterwards.
-            let mut extents: Box<[Extent]> = input
-                .physical_extents()
-                .map(|extent| (resolved(&extent.path), extent.start, extent.end))
-                .collect();
-            if extents.is_empty() {
-                extents = Box::new([(resolved(&input.entry_path), 0, None)]);
-            }
-            plans.insert((input.mode, input.format_hint.clone(), extents))
-        });
+        task.inputs.retain(|_| keep.next().unwrap());
         !task.inputs.is_empty()
     });
     paths

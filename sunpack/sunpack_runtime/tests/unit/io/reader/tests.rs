@@ -140,7 +140,7 @@ fn directory_walk_releases_its_windows_without_populating_shared_blocks() {
     let mut count = 0;
     let before = THREAD_PHYSICAL_READS.with(std::cell::Cell::get);
     assert!(
-        visit_relation_directory(&path.to_string_lossy(), directory, |_, _| count += 1)
+        visit_relation_directory(&ManagedReader::open(&path).unwrap(), directory, |_, _| count += 1)
             .unwrap()
     );
     let reads = THREAD_PHYSICAL_READS.with(std::cell::Cell::get) - before;

@@ -176,7 +176,7 @@ pub(crate) fn verify(
     }
     let path = match (input.mode, parts) {
         (OpenMode::File, _) | (_, []) => input.entry_path.as_str(),
-        (_, [part]) if part.extent.start == 0 && part.extent.end.is_none() => part.extent.path.as_str(),
+        (_, [part]) if part.extent.view.is_none() && part.extent.start == 0 && part.extent.end.is_none() => part.extent.path.as_str(),
         _ => {
             let ranges: Vec<_> = parts.iter().map(|part| &part.extent).collect();
             return match format {

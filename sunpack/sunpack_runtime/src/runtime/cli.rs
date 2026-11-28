@@ -2136,6 +2136,11 @@ fn report_scan(
                 let format = language.translate("cli.scan.format", &[("format", &entry.format)]);
                 line(session, Stream::Out, &format!("{prefix}{format}"))?;
             }
+            if !entry.scan_layout.views.is_empty() {
+                let views = entry.scan_layout.views.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
+                let text = language.translate("cli.scan.views", &[("views", &views)]);
+                line(session, Stream::Out, &format!("{prefix}{text}"))?;
+            }
             if let Some(plan) = plan {
                 report_volume_plan(plan, prefix, language, session)?;
             } else if show_parts {

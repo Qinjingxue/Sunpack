@@ -321,7 +321,7 @@ fn report_archive(path: &str, offset: u64) -> ArchiveResult {
         end_offset: None, volume_completeness: None, volume_attempts: None,
         source_paths: vec![], password: None, discovery_source: crate::pipeline::DiscoverySource::Embedded,
         partial: false, retained: false, recovered_complete_files: 0,
-          scan_layout: crate::pipeline::ScanLayout { range: offset != 0, volumes: false },
+          scan_layout: crate::pipeline::ScanLayout { range: offset != 0, ..Default::default() },
     }
 }
 
@@ -621,7 +621,7 @@ fn scan_sparse_layout_is_shared_by_text_and_json() {
         descriptor.mode = mode;
         descriptor.analysis.origin = origin;
         descriptor.parts = vec![InputPart {
-            role: InputRole::Main, extent: InputExtent { path: "carrier.bin".into(), start, end: Some(100) },
+            role: InputRole::Main, extent: InputExtent { view: None, path: "carrier.bin".into(), start, end: Some(100) },
             volume_number: None, canonical_name: String::new(),
         }].into_boxed_slice();
         for json in [false, true] {

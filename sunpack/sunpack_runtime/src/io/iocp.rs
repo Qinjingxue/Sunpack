@@ -342,10 +342,11 @@ impl Drop for PendingReads<'_> {
 struct OrderedReads {
     next_offset: u64,
     ready: [Option<Box<IocpSlot>>; 2],
+    reversed: bool,
 }
 impl OrderedReads {
-    fn new(offset: u64) -> Self {
-        Self { next_offset: offset, ready: [None, None] }
+    fn new(offset: u64, reversed: bool) -> Self {
+        Self { next_offset: offset, ready: [None, None], reversed }
     }
     fn completed(&mut self, slot: Box<IocpSlot>) {
         let vacant = self.ready.iter_mut().find(|ready| ready.is_none())
@@ -354,10 +355,13 @@ impl OrderedReads {
     }
     fn next(&mut self) -> Option<Box<IocpSlot>> {
         let offset = self.next_offset;
+        let reversed = self.reversed;
         let slot = self.ready.iter_mut()
-            .find(|ready| ready.as_ref().is_some_and(|slot| slot.read_start == offset))?
+            .find(|ready| ready.as_ref().is_some_and(|slot| {
+                slot.read_start + if reversed { slot.bytes_read as u64 } else { 0 } == offset
+            }))?
             .take()?;
-        self.next_offset += slot.bytes_read as u64;
+        self.next_offset = if reversed { slot.read_start } else { offset + slot.bytes_read as u64 };
         Some(slot)
     }
 }
@@ -372,6 +376,7 @@ pub(crate) fn read_range_ordered(
     path: &Path,
     offset: u64,
     len: u64,
+    reversed: bool,
     validate_generation: impl FnOnce(&PhysicalFileGeneration) -> io::Result<()>,
     mut consume: impl FnMut(&[u8]) -> io::Result<()>,
 ) -> io::Result<()> {
@@ -406,13 +411,23 @@ pub(crate) fn read_range_ordered(
         PostQueuedCompletionStatus(wake_handles.port, 0, WORKER_COMPLETION_KEY, null_mut());
     });
     let mut pending = PendingReads { handles: &handles, slots: HashMap::with_capacity(2) };
-    let mut next_read = offset;
+    let (first, last) = if reversed { (end, offset) } else { (offset, end) };
+    let mut next_read = first;
+    let mut submit = |pending: &mut PendingReads<'_>, slot| {
+        if reversed {
+            let stop = next_read;
+            let mut start = stop.saturating_sub(CHUNK as u64).max(offset);
+            next_read = start;
+            submit_next_slot(pending, &mut start, stop, CHUNK, 0, slot)
+        } else {
+            submit_next_slot(pending, &mut next_read, end, CHUNK, 0, slot)
+        }
+    };
     for _ in 0..len.div_ceil(CHUNK as u64).min(2) {
-        submit_next_slot(&mut pending, &mut next_read, end, CHUNK, 0,
-            Box::new(IocpSlot::new(CHUNK.min(len as usize))))?;
+        submit(&mut pending, Box::new(IocpSlot::new(CHUNK.min(len as usize))))?;
     }
-    let mut ordered = OrderedReads::new(offset);
-    while ordered.next_offset < end {
+    let mut ordered = OrderedReads::new(first, reversed);
+    while ordered.next_offset != last {
         cancellation.check_io()?;
         let mut bytes = 0;
         let mut key = 0;
@@ -433,10 +448,12 @@ pub(crate) fn read_range_ordered(
         }
         slot.bytes_read = bytes as usize;
         ordered.completed(slot);
-        while let Some(slot) = ordered.next() {
-            consume(&slot.buffer[..slot.bytes_read])?;
+        while let Some(mut slot) = ordered.next() {
+            let bytes = &mut slot.buffer[..slot.bytes_read];
+            if reversed { bytes.reverse(); }
+            consume(bytes)?;
             cancellation.check_io()?;
-            submit_next_slot(&mut pending, &mut next_read, end, CHUNK, 0, slot)?;
+            submit(&mut pending, slot)?;
         }
     }
     if before != physical_file_generation(&file)? {

@@ -362,6 +362,14 @@ void warm_volume_waves_reuse_proofs(const std::filesystem::path& archive) {
         geometry.file_size_queries == 1,
         "interleaved layouts read shared geometry more than once");
 
+    // Same physical EOF, but the selected logical slice runs past its view.
+    auto short_view = std::make_shared<ReadView>();
+    short_view->physical_size = std::filesystem::file_size(archive);
+    short_view->spans.push_back({2, 4, true});
+    interleaved.sources.back().view = short_view;
+    require(!CompleteVolumeGeometry{}.known(interleaved, 0),
+        "a range beyond restored EOF admitted a reusable rejection");
+
     VolumeProbeCache cache(plan);
     PasswordTestResult rejection;
     rejection.status = PasswordTestStatus::WrongPassword;

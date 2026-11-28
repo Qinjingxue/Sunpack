@@ -41,7 +41,7 @@ pub(crate) const FILE_ROUTE_RELATIONS: u8 = 1;
 pub(crate) const FILE_ROUTE_DETECTION: u8 = 2;
 pub(crate) const FILE_ROUTE_RESIDUAL: u8 = 3;
 const RELATION_ELIGIBLE: u8 = 1 << 2;
-const FORMAT_REJECT_TAR: u32 = 1 << 3;
+pub(super) const FORMAT_REJECT_TAR: u32 = 1 << 3;
 
 impl DirectorySnapshotTable {
     pub(crate) fn file_route(&self, row: usize) -> u8 {
@@ -196,32 +196,7 @@ fn filesystem_file_route(is_dir: bool, fact: Option<&CheapAnchor>) -> u8 {
     if is_dir {
         return DIRECTORY_ROUTE;
     }
-    let Some(fact) = fact else {
-        return FILE_ROUTE_RESIDUAL;
-    };
-    let Some(anchor) = fact.anchor() else {
-        return if fact.bytes_read() >= 512 && fact.reject_mask() & FORMAT_REJECT_TAR == 0 {
-            FILE_ROUTE_DETECTION
-        } else {
-            FILE_ROUTE_RESIDUAL
-        };
-    };
-    // PE facts authorize Relations refinement; they never terminate discovery.
-    if anchor.pe_state != crate::scan::pe_overlay::PeState::None
-        || matches!(anchor.format, "rar" | "7z" | "zip")
-    {
-        return FILE_ROUTE_RELATIONS;
-    }
-    if matches!(
-        anchor.format,
-        "tar" | "gzip" | "bzip2" | "xz" | "zstd" | "lz4" | "enc"
-    ) {
-        return FILE_ROUTE_DETECTION;
-    }
-    if anchor.bytes_read >= 512 && anchor.format_reject_mask & FORMAT_REJECT_TAR == 0 {
-        return FILE_ROUTE_DETECTION;
-    }
-    FILE_ROUTE_RESIDUAL
+    super::root::RootRoute::directory_stage(fact)
 }
 
 pub(crate) fn filesystem_logical_name(path: &str) -> String {
@@ -386,7 +361,7 @@ impl NativeOutputInventory {
             &options.options,
             deduplicate_paths,
         );
-        populate_relation_anchors_cached(&mut files, &[], Some(&self.root));
+        options.populate_anchors(&mut files, &[], Some(&self.root), true);
         Ok(NativeDirectorySnapshot::from_views(
             filtered,
             // Directory rows precede files in both views. Consume the two
@@ -493,10 +468,21 @@ impl DirectoryScanOptions {
 
 #[derive(Clone)]
 pub(crate) struct NativeDirectoryScanOptions {
+    pub(crate) probe_plain: bool,
+    pub(crate) probe_views: crate::io::view::ViewProbes,
     options: DirectoryScanOptions,
 }
 
 impl NativeDirectoryScanOptions {
+    fn populate_anchors(
+        &self, records: &mut [DirectoryEntryRecord], cells: &[Option<CheapAnchorCell>],
+        root: Option<&str>, full_directory: bool,
+    ) {
+        if self.probe_plain {
+            populate_relation_anchors_cached(records, cells, root, if full_directory { self.probe_views } else { Default::default() });
+        }
+    }
+
     pub(crate) fn can_share_recursive_context(&self) -> bool {
         self.options.size_ranges.is_empty() && !self.options.has_directory_rules()
     }
@@ -508,6 +494,8 @@ impl NativeDirectoryScanOptions {
         whitelist_rules: Vec<NativePathRule>,
     ) -> std::io::Result<Self> {
         Ok(Self {
+            probe_plain: true,
+            probe_views: Default::default(),
             options: DirectoryScanOptions::new(
                 blacklist_rules,
                 size_ranges,
@@ -592,7 +580,7 @@ impl NativeDirectoryScanOptions {
                                     &self.options.mtime_ranges,
                                     record.mtime_ns,
                                 );
-                                cells.push(record.relation_member_eligible.then(|| {
+                                cells.push((self.probe_plain && record.relation_member_eligible).then(|| {
                                     Arc::clone(row.cheap_anchor.get_or_insert_with(Default::default))
                                 }));
                                 records.push(record);
@@ -631,7 +619,7 @@ impl NativeDirectoryScanOptions {
                 })
                 .map(|(index, _)| index)
                 .collect();
-            populate_relation_anchors_cached(&mut raw, &cells, Some(&scope.root));
+            self.populate_anchors(&mut raw, &cells, Some(&scope.root), true);
             NativeDirectorySnapshot::from_views(filtered, raw, DirectoryReadErrors::report(), cells)
         })();
         Ok((filtered, raw))
@@ -662,6 +650,9 @@ impl NativeDirectoryScanOptions {
             let mut records = scan_directory_views(&scope.root, scope.max_depth, &options)?;
             if watch {
                 records.exclude_unready_watch_peers(&is_target);
+            }
+            if !self.probe_plain {
+                return Ok(NativeDirectorySnapshot::from_views(records.filtered, records.raw, records.errors, Vec::new()));
             }
             let live_paths: HashSet<&str> = records
                 .raw
@@ -697,12 +688,14 @@ impl NativeDirectoryScanOptions {
                             })
                             .or_else(|| previous.table.relation_anchors[row]
                                 .as_ref()
-                                .filter(|anchor| anchor.reusable())
+                                // Equal size and mtime do not identify a replacement.
+                                // Re-read a rejected footer unless its generation was proved above.
+                                .filter(|anchor| anchor.reusable() && !crate::io::view::ViewProbes::has_view_rejection(anchor.reject_mask()))
                                 .cloned());
                     }
                 }
             }
-            populate_relation_anchors(&mut records.raw);
+            self.populate_anchors(&mut records.raw, &[], Some(&scope.root), true);
             Ok::<_, std::io::Error>(NativeDirectorySnapshot::from_views(
                 records.filtered,
                 records.raw,
@@ -717,6 +710,7 @@ impl NativeDirectoryScanOptions {
         &self,
         scope: &crate::scan::scope::NativeDiscoveryScope,
         watch_target: Option<&dyn Fn(&str) -> bool>,
+        full_directory: bool,
     ) -> std::io::Result<(NativeDirectorySnapshot, NativeDirectorySnapshot)> {
         let mut options = self.options.clone();
         options.scope = Some(scope.clone());
@@ -724,7 +718,7 @@ impl NativeDirectoryScanOptions {
         if let Some(is_target) = watch_target {
             records.exclude_unready_watch_peers(is_target);
         }
-        populate_relation_anchors_cached(&mut records.raw, &[], Some(&scope.root));
+        self.populate_anchors(&mut records.raw, &[], Some(&scope.root), full_directory);
         Ok(NativeDirectorySnapshot::from_views(
             records.filtered,
             records.raw,
@@ -1144,14 +1138,11 @@ pub(crate) fn is_reparse_point(metadata: &fs::Metadata) -> bool {
     metadata.file_type().is_symlink()
 }
 
-fn populate_relation_anchors(records: &mut [DirectoryEntryRecord]) {
-    populate_relation_anchors_cached(records, &[], None);
-}
-
 fn populate_relation_anchors_cached(
     records: &mut [DirectoryEntryRecord],
     cells: &[Option<CheapAnchorCell>],
     root: Option<&str>,
+    probe_views: crate::io::view::ViewProbes,
 ) {
     let needs_anchor = |record: &DirectoryEntryRecord| {
         !record.is_dir && record.relation_member_eligible && record.relation_anchor.is_none()
@@ -1177,6 +1168,7 @@ fn populate_relation_anchors_cached(
                         size,
                         cells.get(index).and_then(Option::as_ref),
                         scope.as_ref(),
+                        probe_views,
                     ),
                     // Without a size column the full anchor owns the probed size.
                     None => CheapAnchor::Full(Arc::new(probe_volume_anchor_path_cheap(&record.path))),

@@ -98,12 +98,25 @@ namespace sunpack::sevenzip
 
         constexpr std::size_t large_zip_directory_entries = 2048;
 
-        bool may_have_large_zip_directory(const std::wstring& path) {
+        bool may_have_large_zip_directory(const std::wstring& path, ArchiveOpenMode mode,
+                                          const std::vector<ExtractInputRange>& ranges) {
             // A central-directory record has at least 46 bytes. A short
             // archive can use the existing parallel path immediately.
+            constexpr auto minimum = 46 * large_zip_directory_entries;
+            if (!ranges.empty()) {
+                if (mode != ArchiveOpenMode::FileRange || ranges.size() != 1) return false;
+                const auto& range = ranges.front();
+                if (range.has_end) return range.start <= range.end && range.end - range.start >= minimum;
+                if (range.view) {
+                    UInt64 length = 0;
+                    return SUCCEEDED(visit_view_range(range, range.view->physical_size,
+                        [&](auto, auto n, bool) { length += n; return true; })) && length >= minimum;
+                }
+            }
             std::error_code error;
-            const auto size = std::filesystem::file_size(win32_extended_path(path), error);
-            return !error && size >= 46 * large_zip_directory_entries;
+            const auto size = std::filesystem::file_size(win32_extended_path(ranges.empty() ? path : ranges.front().path), error);
+            const auto start = ranges.empty() ? 0 : ranges.front().start;
+            return !error && size >= start && size - start >= minimum;
         }
 
         enum class MemberVolumeMatch : unsigned char { Fixed, Possible, Covered };
@@ -699,7 +712,7 @@ namespace sunpack::sevenzip
 
         const std::vector<std::wstring> &part_paths,
 
-        const ExtractionFormats &selection_formats,
+        const ExtractionFormats &formats,
 
         const std::vector<ExtractInputRange> &input_ranges,
 
@@ -778,9 +791,8 @@ namespace sunpack::sevenzip
         HRESULT last_open_hr = E_FAIL;
         bool last_encryption_evidence = false;
 
-        const auto &formats = selection_formats.handlers;
         const UInt64 start_only = 0;
-        for (std::size_t attempt_index = 0; attempt_index < formats.size() * 2; ++attempt_index)
+        for (std::size_t attempt_index = 0; attempt_index < formats.count * 2; ++attempt_index)
         {
             if (frontier.passed()) return {};
             if (native_job_cancelled()) {
@@ -788,8 +800,8 @@ namespace sunpack::sevenzip
                 result.message = "password probe cancelled";
                 return result;
             }
-            const GUID &format = formats[attempt_index % formats.size()];
-            const UInt64 *search_limit = attempt_index < formats.size() ? &start_only : nullptr;
+            const GUID &format = formats[attempt_index % formats.count];
+            const UInt64 *search_limit = attempt_index < formats.count ? &start_only : nullptr;
 
             CMyComPtr<IInArchive> archive;
 
@@ -1039,7 +1051,7 @@ namespace sunpack::sevenzip
     {
 #ifdef _WIN32
         const auto formats = extraction_formats_for_hint(format_hint);
-        const bool enc = formats.handlers.size() == 1 && formats.handlers.front().Data4[5] == kEncFormatId;
+        const bool enc = formats.count == 1 && formats.ids[0] == kEncFormatId;
         if (enc && !final_read_only) {
             // Open would run the same quick-block proof as Rust. The ENC
             // handler has no additional bounded member proof.
@@ -1086,7 +1098,7 @@ namespace sunpack::sevenzip
         // Give it the first decode before other lanes duplicate the archive's
         // directory. Keep the same lane and handler when more keys are needed.
         const bool prioritized = !volume_plan && !final_read_only && format_hint == L"zip" && count >= 8 &&
-            part_paths.empty() && input_ranges.empty() && may_have_large_zip_directory(archive_path);
+            part_paths.empty() && may_have_large_zip_directory(archive_path, mode, input_ranges);
         PasswordProbeCache primary_cache;
         std::optional<PasswordTestResult> first;
         bool deferred = false;

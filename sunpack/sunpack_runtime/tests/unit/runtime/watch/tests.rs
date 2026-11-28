@@ -1553,7 +1553,7 @@ fn admission_counts_unfinished_candidates_not_batches_or_claimed_members() {
     let settings = Arc::new(Config::default());
     let mut scheduler = Scheduler {
         dedup_rebuild: None, dedup_job_id: 0,
-        dedup: Arc::new(Mutex::new(dedup::Index::open(&base.join("state"), crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root).unwrap())),
+        dedup: Arc::new(Mutex::new(dedup::Index::open(&base.join("state"), crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root, Default::default()).unwrap())),
         resuming: false, baseline_roots: HashSet::new(),
         candidate_diagnostics: CandidateDiagnostics::default(), admission_checkpoint: None,
         root_scope_records: HashMap::new(),
@@ -1761,7 +1761,7 @@ fn root_handoff_preserves_alias_aggregates_and_live_shared_tail_owners() {
     let hub = Arc::new(Hub::new());
     let mut observer = WatchObserver {
         dedup_enabled: false,
-        dedup: Arc::new(Mutex::new(dedup::Index::open(&directory, crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root).unwrap())),
+        dedup: Arc::new(Mutex::new(dedup::Index::open(&directory, crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root, Default::default()).unwrap())),
         dedup_scope: NativeDiscoveryScope::new(directory.to_string_lossy().into_owned(), None, Vec::new()),
         deep: false,
         catalog: Arc::new(NativeWatchCatalog::new(&crate::watch_store::NativeWatchState::new(), None)),
@@ -1963,7 +1963,7 @@ fn restored_checkpoint_routes_nested_outputs_to_the_durable_owner() {
         assert_eq!(checkpoints.len(), 1);
         let observer = WatchObserver {
             dedup_enabled: false,
-            dedup: Arc::new(Mutex::new(dedup::Index::open(&directory, crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root).unwrap())),
+            dedup: Arc::new(Mutex::new(dedup::Index::open(&directory, crate::core::config::WatchDeduplication::None, crate::core::config::WatchDeduplicationScope::Root, Default::default()).unwrap())),
             dedup_scope: NativeDiscoveryScope::new(directory.to_string_lossy().into_owned(), None, Vec::new()),
             deep: false,
             catalog: Arc::new(NativeWatchCatalog::new(journal.state(), None)),

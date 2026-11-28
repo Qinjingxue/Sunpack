@@ -318,7 +318,7 @@ pub(super) fn prepare_fixed(volumes: &VolumeSet, parts: &[InputPart], sessions: 
 pub(super) fn prepare(head: &InputExtent, plan: &Arc<VolumeAttemptPlan>, sessions: &[NativeArchiveSession], native_volume: bool)
     -> Result<Option<PasswordContext>, PreparedStatus> {
     let cancel = Cancellation::current();
-    let Some(head_index) = plan.sources.iter().position(|s| s.path == head.path && s.start == head.start &&
+    let Some(head_index) = plan.sources.iter().position(|s| s.path == head.path && s.view == head.view && s.start == head.start &&
         (s.end == head.end || head.end.is_none())) else { return Ok(None); };
     let readers = InputReaders::new(sessions);
     let inspect = |extent: &InputExtent, check_data: bool| {

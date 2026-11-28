@@ -37,8 +37,16 @@ fn zip_retry_reuses_negative_tail_only_for_the_same_physical_generation() {
     incomplete[eocd..].fill(0);
     std::fs::write(&archive, incomplete).unwrap();
     let scope = NativeDiscoveryScope::new(root.to_string_lossy().into_owned(), Some(0), Vec::new());
-    let options = NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap();
-    let (filtered, raw) = options.scan_scope(&scope, None).unwrap();
+    let peer = root.join("item.blob");
+    std::fs::write(&peer, b"bad footer").unwrap();
+    let mut options = NativeDirectoryScanOptions::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()).unwrap();
+    options.probe_views = crate::io::view::ConfiguredViews::parse([Some("apate:1")].into_iter()).unwrap().probes();
+    let (filtered, raw) = options.scan_scope(&scope, None, true).unwrap();
+    let rejects_peer = |snapshot: &NativeDirectorySnapshot| {
+        let index = snapshot.rows().find(|&i| Path::new(&snapshot.table.paths[i]) == peer).unwrap();
+        crate::io::view::ViewProbes::has_view_rejection(snapshot.table.relation_anchors[index].as_ref().unwrap().reject_mask())
+    };
+    assert!(rejects_peer(&raw));
     let _ = NativeCandidateTable::from_directory(&raw, &filtered, None, false);
     let refresh = || {
         options.refresh_relation_bucket(&scope, archive.to_str().unwrap(), &raw, None, false).unwrap()
@@ -58,8 +66,13 @@ fn zip_retry_reuses_negative_tail_only_for_the_same_physical_generation() {
     std::fs::remove_file(&archive).unwrap();
     std::fs::rename(&replacement, &archive).unwrap();
     assert_eq!(std::fs::metadata(&archive).unwrap().modified().unwrap(), previous_time);
+    let peer_time = std::fs::metadata(&peer).unwrap().modified().unwrap();
+    std::fs::write(&peer, b"abcdef\x01\x00\x00\x00").unwrap();
+    std::fs::OpenOptions::new().write(true).open(&peer).unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(peer_time)).unwrap();
     let (filtered, current) = refresh();
     assert!(!has_negative(&current));
+    assert!(!rejects_peer(&current));
     let replacement = NativeCandidateTable::from_directory(&current, &filtered, None, false);
     assert_eq!(replacement.resolve().unwrap().resolved_relations().count(), 1);
     std::fs::remove_dir_all(root).unwrap();
@@ -217,9 +230,9 @@ fn shared_walk_keeps_child_rows_and_retry_scope_local() {
             .unwrap();
     let mut snapshots = HashMap::new();
     let (_, outer_raw) =
-        scan_discovery_scope(&options, &outer, &roots, &mut snapshots).unwrap();
+        scan_discovery_scope(&options, &outer, true, &roots, &mut snapshots).unwrap();
     let (_, inner_raw) =
-        scan_discovery_scope(&options, &inner, &roots, &mut snapshots).unwrap();
+        scan_discovery_scope(&options, &inner, true, &roots, &mut snapshots).unwrap();
     assert_eq!(snapshots.len(), 1);
     assert!(Arc::ptr_eq(&outer_raw.table, &inner_raw.table));
     let paths: Vec<_> = inner_raw

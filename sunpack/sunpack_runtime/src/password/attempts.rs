@@ -54,7 +54,7 @@ impl Key {
             _ => (input.entry_path.as_str(), 0, None),
         };
         let session = sessions.iter().find(|session| session.path() == path)?;
-        let (generation, compound): (_, Option<Arc<[u8]>>) = if input.volume_attempts.is_some()
+        let (generation, compound): (_, Option<Arc<[u8]>>) = if input.volume_attempts.is_some() || input.parts.first().is_some_and(|p| p.extent.view.is_some())
             || !matches!(input.mode, OpenMode::File | OpenMode::FileRange) {
             // Iteration follows the descriptor, not HashMap order. Binding all
             // candidate sources prevents stale proof reuse after a volume edit.

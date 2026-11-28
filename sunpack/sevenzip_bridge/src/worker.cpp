@@ -178,6 +178,21 @@ bool read_extent_field(wire::RequestReader& reader, std::string_view key,
     else if (key == "end") {
         range.end = reader.number();
         range.has_end = true;
+    } else if (key == "view") {
+        auto view = std::make_shared<sunpack::sevenzip::ReadView>();
+        read_object(reader, [&](auto field) {
+            if (field == "physical_size") view->physical_size = reader.number();
+            else if (field == "spans") read_array(reader, [&] {
+                auto& span = view->spans.emplace_back();
+                read_object(reader, [&](auto attr) {
+                    if (attr == "start") span.start = reader.number();
+                    else if (attr == "end") span.end = reader.number();
+                    else if (attr == "reverse") span.reverse = reader.boolean();
+                    else reader.skip();
+                });
+            }); else reader.skip();
+        });
+        range.view = std::move(view);
     } else return false;
     return true;
 }
@@ -308,7 +323,7 @@ void read_input_parts(wire::RequestReader& reader, WorkerArchiveInput& input) {
             if (!input.missing_volume_number && number != previous + 1)
                 input.missing_volume_number = static_cast<int>(previous + 1);
             previous = number;
-            has_ranges |= range.start != 0 || range.has_end;
+            has_ranges |= range.start != 0 || range.has_end || bool(range.view);
             input.ranges.push_back(std::move(range));
             input.canonical_names.push_back(std::move(name));
         }
@@ -754,7 +769,10 @@ class CompleteVolumeGeometry {
                         size->second = std::filesystem::file_size(source.path, error);
                         if (error) { state = State::Incomplete; return false; }
                     }
-                    const bool covered = size->second >= source.end;
+                    const bool covered = source.view
+                        ? SUCCEEDED(sunpack::sevenzip::visit_view_range(source, size->second,
+                            [](auto, auto, bool) { return true; }))
+                        : size->second >= source.end;
                     state = covered ? State::Complete : State::Incomplete;
                     return covered;
                 });

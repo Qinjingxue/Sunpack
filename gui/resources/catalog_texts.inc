@@ -1627,6 +1627,16 @@ constexpr Message setting_messages[] = {
         "完全な出力のみ",
         "완전한 결과만 허용",
     }},
+    {"fields/filesystem/read_views/description", {
+        "添加 plain 读取原文件，或使用 方法:层数 选择恰好还原到指定层数的视图。可用方法：",
+        "Add plain to read the original file, or method:depth to select exactly that many restoration layers. Available methods:",
+        "加入 plain 讀取原檔，或使用 方法:層數 選擇恰好還原至指定層數的視圖。可用方法：",
+        "元ファイルには plain を、指定した層数の復元には メソッド:層数 を追加します。使用可能なメソッド：",
+        "원본 파일은 plain을 추가하고 정확한 복원 깊이는 방법:깊이로 지정하세요. 사용 가능한 방법:",
+    }},
+    {"fields/filesystem/read_views/label", {
+        "文件读取视图", "File read views", "檔案讀取視圖", "ファイル読み取りビュー", "파일 읽기 보기",
+    }},
     {"fields/filesystem/scan_filters/@blacklist/enabled/label", {
         "黑名单",
         "Block list",

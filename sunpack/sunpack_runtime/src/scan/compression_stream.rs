@@ -6,10 +6,8 @@ use std::io;
 
 const BUFFER_SIZE: usize = 64 * 1024;
 const INITIAL_PROBE_BYTES: usize = 256;
-const GZIP_MAGIC: &[u8] = b"\x1f\x8b\x08";
-const BZIP2_MAGIC: &[u8] = b"BZh";
+use crate::formats::signatures::{GZIP as GZIP_MAGIC, BZIP2 as BZIP2_MAGIC, XZ as XZ_MAGIC};
 const BZIP2_END_MARKER: u64 = 0x1772_4538_5090;
-const XZ_MAGIC: &[u8] = b"\xfd7zXZ\x00";
 const XZ_STREAM_HEADER_SIZE: usize = 12;
 pub(crate) const MAX_XZ_PREFIX_SIZE: usize = XZ_STREAM_HEADER_SIZE + 1024;
 
@@ -1271,22 +1269,29 @@ pub(crate) fn parse_xz_footer(footer: &[u8], end: u64) -> ValidationResult<XzFoo
     Ok(footer)
 }
 
-pub(crate) fn check_xz_footer(footer: &[u8], end: u64) -> ValidationResult<()> {
+pub(crate) fn check_xz_footer(footer: &[u8], end: u64) -> ValidationResult<XzFooter> {
     let footer = xz_footer_fields(footer, end)?;
     // The final stream may follow other streams. Its Index must still fit
     // between its minimum possible header position and this footer.
     if footer.index_size < 8 || footer.index_size + 24 > end {
         return invalid("xz_backward_size_out_of_range");
     }
-    Ok(())
+    Ok(footer)
 }
 
 pub(crate) fn xz_has_terminal_footer<B: AsRef<[u8]>>(
     size: u64,
-    mut read: impl FnMut(u64, usize) -> io::Result<B>,
+    read: impl FnMut(u64, usize) -> io::Result<B>,
 ) -> io::Result<bool> {
+    Ok(xz_terminal_footer(size, read)?.is_some())
+}
+
+fn xz_terminal_footer<B: AsRef<[u8]>>(
+    size: u64,
+    mut read: impl FnMut(u64, usize) -> io::Result<B>,
+) -> io::Result<Option<XzFooter>> {
     if size < 32 || size % 4 != 0 {
-        return Ok(false);
+        return Ok(None);
     }
     let mut end = size;
     let mut window = 12;
@@ -1307,17 +1312,34 @@ pub(crate) fn xz_has_terminal_footer<B: AsRef<[u8]>>(
         };
         end = start + last as u64 + 1;
         if end < 32 || end % 4 != 0 {
-            return Ok(false);
+            return Ok(None);
         }
         let before_padding = &tail[..=last];
         if let Some(start) = before_padding.len().checked_sub(12) {
-            return Ok(check_xz_footer(&before_padding[start..], end).is_ok());
+            return Ok(check_xz_footer(&before_padding[start..], end).ok());
         }
         let footer = read(end - 12, 12)?;
         if footer.as_ref().len() != 12 {
             return Err(io::ErrorKind::UnexpectedEof.into());
         }
-        return Ok(check_xz_footer(footer.as_ref(), end).is_ok());
+        return Ok(check_xz_footer(footer.as_ref(), end).ok());
+    }
+    Ok(None)
+}
+
+// Validate concatenation backwards using only each stream's footer, Index and header.
+pub(crate) fn xz_streams_fill(reader: &ManagedReader, offset: u64, mut end: u64) -> io::Result<bool> {
+    while end > offset {
+        let Some(mut footer) = xz_terminal_footer(end - offset,
+            |at, size| reader.read_cached_at(offset + at, size))? else { break };
+        footer.end += offset;
+        if xz_check_size(footer.flags[1] & 0x0f).is_err() { break; }
+        match read_xz_index_boundary(reader, footer, offset) {
+            Ok(start) if start == offset => return Ok(true),
+            Ok(start) if start < end => end = start,
+            Err(ValidationError::Io(e)) => return Err(e),
+            _ => break,
+        }
     }
     Ok(false)
 }

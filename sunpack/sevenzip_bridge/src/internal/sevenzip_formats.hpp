@@ -4,7 +4,7 @@
 
 #ifdef _WIN32
 
-#include <vector>
+#include <string_view>
 
 #endif
 
@@ -15,13 +15,16 @@ namespace sunpack::sevenzip
 
     struct ExtractionFormats
     {
-        std::vector<GUID> handlers;
-        bool encrypted_headers = false;
+        const unsigned char *ids;
+        std::size_t count;
+        bool encrypted_headers;
+
+        GUID operator[](std::size_t index) const noexcept { return format_guid(ids[index]); }
     };
 
     // Map the analyzed Rust hint to a handler order and header probe policy.
     ExtractionFormats extraction_formats_for_hint(
-        const std::wstring &format_hint);
+        std::wstring_view format_hint) noexcept;
 
     // Return the canonical archive type represented by a successfully opened
     // handler GUID, or an empty string when the GUID is not recognized.

@@ -1,5 +1,5 @@
 /// Disk-relative directory coordinates retained once with the terminal fact.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct RelationDirectory {
     pub disk: u32,
     pub cd_disk: u32,
@@ -13,13 +13,13 @@ pub(crate) struct RelationDirectory {
 /// Read one directory record at a time. No payload reads or directory-sized
 /// allocation; callers discard tentative matches if the extent is incomplete.
 pub(crate) fn visit_relation_directory(
-    path: &str,
+    reader: &crate::io::reader::ManagedReader,
     directory: RelationDirectory,
     mut visit: impl FnMut(&super::CentralDirectoryRecord<'_>, super::zip64::CentralValues),
 ) -> std::io::Result<bool> {
     // Directory walks are transient. Reuse the bounded analysis window so
     // each record does not populate the process-wide physical block cache.
-    let reader = crate::io::reader::ManagedReader::open(path)?.windowed_probe_reader();
+    let reader = reader.windowed_probe_reader();
     let count = directory.disk_entries;
     let start = if directory.cd_disk == directory.disk {
         let Some(start) = directory.end.checked_sub(directory.size) else {
@@ -69,7 +69,7 @@ pub(crate) fn visit_relation_directory(
     })
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct RelationLocalKey {
     pub name: Vec<u8>,
     pub fields: RelationLocalFields,
@@ -105,9 +105,10 @@ impl RelationLocalFields {
 
 pub(crate) fn relation_local_key(
     path: &str,
+    view: Option<&std::sync::Arc<crate::io::view::ReadView>>,
     offset: u64,
 ) -> std::io::Result<Option<RelationLocalKey>> {
-    let reader = crate::io::reader::ManagedReader::open(path)?;
+    let reader = crate::io::reader::ManagedReader::open(path)?.with_view(view)?;
     let fixed = reader.read_cached_at(offset, 30)?;
     if fixed.len() < 30 || !fixed.starts_with(b"PK\x03\x04") {
         return Ok(None);

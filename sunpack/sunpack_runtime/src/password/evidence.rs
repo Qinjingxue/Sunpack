@@ -674,7 +674,9 @@ pub(crate) fn remove_scan_paths(
     let mut edges = HashMap::new();
     let mut members = DomainMembers::default();
     if let Some(first) = first {
-        plan.selected_parts_indexed(first, &mut members)?;
+        // A scan frontier is an ordered cursor, even when the first
+        // remaining composition cannot yet yield a complete carrier.
+        plan.visit_selection(first, &mut members, |_, _| {})?;
     }
     let mut nodes = 0;
     let mut node = || { nodes += 1; nodes };

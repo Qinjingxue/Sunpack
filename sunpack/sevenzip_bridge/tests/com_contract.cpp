@@ -343,6 +343,15 @@ void check_open_archive_stream_ownership()
         check(input.opened && input.callback_path == names.front() &&
               input.stream->Read(bytes, sizeof(bytes), &read) == S_OK && read == 1 && bytes[0] == 'a',
               "SFX mode opens the head and gives the canonical name to the volume callback");
+        auto view = std::make_shared<ReadView>();
+        view->physical_size = 1;
+        view->spans.push_back({0, 1, true});
+        std::vector<ExtractInputRange> ranges{{head, 0, 1, true}, {tail, 0, 1, true}};
+        ranges.front().view = view;
+        auto mapped = open_archive_stream(head, {}, nullptr, names, InputPrefetchConfig{false},
+                                          ranges, nullptr, ArchiveOpenMode::SfxWithVolumes);
+        check(mapped.opened && mapped.stream->Read(bytes, sizeof(bytes), &read) == S_OK &&
+              read == 1 && bytes[0] == 'a', "a mapped SFX head ends before its named continuation");
     }
     {
         auto input = open_archive_stream(head, parts, nullptr, names, InputPrefetchConfig{false},
@@ -635,6 +644,18 @@ void check_prefetch_virtual_inputs()
         }
         check(correct && !std::memcmp(bytes, payload + 3, 248) && !std::memcmp(bytes + 248, payload + 264, 243),
               "range prefetch respects embedded payload offsets and clipped range ends");
+        auto view = std::make_shared<ReadView>();
+        view->physical_size = 257;
+        view->spans.push_back({0, 257, true});
+        a.view = view;
+        CMyComPtr<IInStream> mapped(new MultiRangeInStream({a, b}, nullptr, {true, 64}));
+        for (unsigned offset = 0; offset < sizeof(bytes); offset += 17) {
+            const UInt32 size = (std::min)(17u, static_cast<unsigned>(sizeof(bytes) - offset));
+            correct &= mapped->Read(bytes + offset, size, &read) == S_OK && read == size;
+        }
+        check(correct && std::equal(bytes, bytes + 248, std::make_reverse_iterator(payload + 254))
+              && !std::memcmp(bytes + 248, payload + 264, 243),
+              "reversed ranges preserve logical order across partial reads and the next volume");
     }
     {
         ExtractInputTrace trace;

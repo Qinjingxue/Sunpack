@@ -70,6 +70,7 @@ fn encrypted_relation_headers_keep_volume_identity_at_declared_extents() {
     let offset = prepare_rar4_encrypted_headers(&reader, 37).unwrap().unwrap();
     let path = crate::test_support::temp_file("rar4_hp_carrier", &data);
     let range = InputExtent {
+        view: None,
         path: path.to_string_lossy().into_owned(), start: 37, end: Some(data.len() as u64),
     };
     let ranges = parse_ranges(std::iter::once(&range), &[]).unwrap();
@@ -135,10 +136,12 @@ fn encrypted_relation_headers_keep_volume_identity_at_declared_extents() {
     let split_head = [RAR4_SIGNATURE, &rar4_block(0x73, RAR4_MAIN_HEADER_PASSWORD, &[0; 6]), &data[offset as usize..]].concat();
     let head = crate::test_support::temp_file("rar4_split_short_header", &split_head);
     let mut sources = vec![InputExtent {
+        view: None,
         path: head.to_string_lossy().into_owned(), start: 0, end: Some(split_head.len() as u64),
     }];
     for length in [17, 71] {
         sources.push(InputExtent {
+            view: None,
             path: head.with_extension(format!("missing-{length}")).to_string_lossy().into_owned(),
             start: 0, end: Some(length),
         });
@@ -261,10 +264,11 @@ fn encrypted_relation_headers_keep_volume_identity_at_declared_extents() {
     let paths = [crate::test_support::temp_file("rar5_split_head", &first_disk[..split]),
         crate::test_support::temp_file("rar5_split_ciphertext", &first_disk[split..])];
     let mut sources: Vec<_> = paths.iter().map(|path| InputExtent {
+        view: None,
         path: path.to_string_lossy().into_owned(), start: 0, end: Some(path.metadata().unwrap().len()),
     }).collect();
     for len in [17, 431] {
-        sources.push(InputExtent { path: paths[0].with_extension(format!("missing-{len}")).to_string_lossy().into_owned(),
+        sources.push(InputExtent { view: None, path: paths[0].with_extension(format!("missing-{len}")).to_string_lossy().into_owned(),
             start: 0, end: Some(len) });
     }
     let plan = Arc::new(VolumeAttemptPlan {
@@ -303,7 +307,7 @@ fn encrypted_relation_headers_keep_volume_identity_at_declared_extents() {
         crate::test_support::temp_file("rar5_active_bad_successor", &bad_successor),
         crate::test_support::temp_file("rar5_active_body_b", &[body.as_slice(), &[0xa5]].concat()),
     ];
-    let sources: Vec<_> = paths.iter().map(|path| InputExtent { path: path.to_string_lossy().into_owned(),
+    let sources: Vec<_> = paths.iter().map(|path| InputExtent { view: None, path: path.to_string_lossy().into_owned(),
         start: 0, end: Some(path.metadata().unwrap().len()) }).collect();
     let cut = Arc::new(VolumeAttemptPlan {
         sources: sources.into_boxed_slice(),
@@ -390,6 +394,7 @@ fn rar5_no_check_stream_prefix_is_weak_and_requires_a_real_start() {
         .map(|(data, number)| {
             let path = crate::test_support::temp_file("rar5_missing_native_cipher_block", &data);
             let mut part = InputPart::range(InputExtent {
+                view: None,
                 path: path.to_string_lossy().into_owned(), start: 0, end: Some(data.len() as u64),
             });
             part.volume_number = Some(number);
@@ -575,6 +580,7 @@ fn rar5_successor_blocks_and_first_level_table_filter_different_sources() {
             crate::test_support::temp_file(&format!("rar5_successor_block_{i}"), data)).collect();
         let plan = Arc::new(VolumeAttemptPlan {
             sources: paths.iter().map(|path| InputExtent {
+                view: None,
                 path: path.to_string_lossy().into_owned(), start: 0, end: Some(path.metadata().unwrap().len()),
             }).collect(),
             layouts: vec![VolumeLayout { minimum_slots: 0, slots: (0..2).map(|i| VolumeSlot {
@@ -675,7 +681,7 @@ fn rar5_packed_blake2sp_prunes_only_complete_nonfinal_fragments() {
     let paths: Vec<_> = [head, damaged, good, tail].into_iter().enumerate().map(|(i, bytes)|
         crate::test_support::temp_file(&format!("rar5_blake_{i}"), &bytes)).collect();
     let plan = Arc::new(VolumeAttemptPlan {
-        sources: paths.iter().map(|path| InputExtent { path: path.to_string_lossy().into_owned(),
+        sources: paths.iter().map(|path| InputExtent { view: None, path: path.to_string_lossy().into_owned(),
             start: 0, end: Some(path.metadata().unwrap().len()) }).collect(),
         layouts: vec![VolumeLayout { minimum_slots: 0, slots: (0..3).map(|i| VolumeSlot {
             number: i as u32 + 1, canonical_name: format!("part.{}", i + 1), domain: i,
